@@ -141,7 +141,10 @@ fn parse_ipv6(data: &[u8]) -> Option<FlowEvent> {
                 next_header = nh;
             }
             _ => {
-                l4 = parse_l4(next_header, data.get(offset..)?);
+                // A truncated capture may cut the transport header off; the
+                // L3 facts (addresses, protocol, bytes) are still valid, so
+                // degrade to portless info rather than dropping the packet.
+                l4 = parse_l4(next_header, data.get(offset..).unwrap_or(&[]));
                 break;
             }
         }
@@ -255,6 +258,34 @@ mod tests {
         arp.extend_from_slice(&0x0806u16.to_be_bytes()); // ARP
         arp.extend_from_slice(&[0u8; 28]);
         assert!(parse_packet(linktype::ETHERNET, &arp).is_none());
+    }
+
+    #[test]
+    fn ipv6_with_truncated_extension_header_keeps_l3_facts() {
+        // Regression: a hop-by-hop header whose length points past the
+        // captured bytes used to drop the whole packet; L3 facts survive.
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0u8; 12]); // MACs
+        f.extend_from_slice(&0x86DDu16.to_be_bytes());
+        f.push(0x60); // version 6
+        f.extend_from_slice(&[0, 0, 0]);
+        f.extend_from_slice(&100u16.to_be_bytes()); // payload length
+        f.push(0); // next header: hop-by-hop
+        f.push(64); // hop limit
+        f.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        f.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        // Hop-by-hop header: next = TCP, ext len 3 (= 32 bytes total), but
+        // the capture ends right after these 8 bytes.
+        f.push(6); // next header: TCP
+        f.push(3); // hdr ext len
+        f.extend_from_slice(&[0; 6]);
+
+        let e = parse_packet(linktype::ETHERNET, &f).expect("packet dropped");
+        assert_eq!(e.src_ip.to_string(), "2001:db8::1");
+        assert_eq!(e.dst_ip.to_string(), "2001:db8::2");
+        assert_eq!(e.protocol, 6);
+        assert_eq!((e.src_port, e.dst_port), (0, 0)); // ports unknowable
+        assert_eq!(e.bytes, 140);
     }
 
     #[test]
