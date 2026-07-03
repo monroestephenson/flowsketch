@@ -18,11 +18,13 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
     }
     let mut blobs = Vec::with_capacity(files.len());
     let mut algo_ids = Vec::new();
+    let mut windows = Vec::new();
     for f in files {
         let bytes = std::fs::read(f).with_context(|| format!("cannot read {}", f.display()))?;
         let (header, _, _) =
             read_snapshot(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
         algo_ids.push(header.algorithm_id);
+        windows.push((header.window_start_nanos, header.window_end_nanos));
         blobs.push(bytes);
     }
     let algo = algo_ids[0];
@@ -30,6 +32,21 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
         bail!(
             "snapshots use different algorithms ({algo_ids:?}); only same-algorithm \
              snapshots can merge"
+        );
+    }
+    // Sketch compatibility covers algorithm/params/hash, but time ranges
+    // come from the snapshot header: merging different windows would
+    // silently combine different time ranges into one estimate.
+    let window = windows[0];
+    if windows.iter().any(|&w| w != window) {
+        let detail: Vec<String> = files
+            .iter()
+            .zip(&windows)
+            .map(|(f, (s, e))| format!("  {} covers [{s}, {e})", f.display()))
+            .collect();
+        bail!(
+            "snapshots cover different time windows; merging them would mix time ranges:\n{}",
+            detail.join("\n")
         );
     }
 
