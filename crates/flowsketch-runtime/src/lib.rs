@@ -288,7 +288,17 @@ impl RunningQuery {
         if target > back && (target - back) / slide > self.bucket_count() as u64 {
             self.flush_window(back + slide)?;
             self.buckets.clear();
-            self.buckets.push_back(self.new_bucket(target)?);
+            // Rebuild the full (empty) trailing ring at the target time, not
+            // just the target bucket, so slightly out-of-order events that
+            // are still inside the new window land in a bucket instead of
+            // being counted late — identical to what the slow path leaves.
+            let ring = self.bucket_count() as u64;
+            let first = target - slide * (ring - 1).min(target / slide);
+            let mut start = first;
+            while start <= target {
+                self.buckets.push_back(self.new_bucket(start)?);
+                start += slide;
+            }
             return Ok(());
         }
         while self.buckets.back().unwrap().start_nanos < target {
@@ -806,6 +816,36 @@ mod tests {
             assert_eq!(e.group[0].1, "10.0.0.9");
         }
         assert!(est.iter().any(|e| e.group[0].1 == "10.0.0.1"));
+    }
+
+    #[test]
+    fn out_of_order_event_after_gap_fast_forward_is_not_dropped() {
+        // After a fast-forward, an event slightly older than the latest one
+        // but still inside the window must land in a (rebuilt) trailing
+        // bucket, exactly as the slow path would have handled it.
+        let mut eng = engine_for(
+            "name: gap2\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
+             measure: {type: heavy_hitters, value: bytes, limit: 10}\n",
+        );
+        eng.process(&event(1, "10.0.0.1", "10.0.0.2", 80, 100))
+            .unwrap();
+        let t = 1_000_000u64; // seconds; far beyond the window
+        eng.process(&event(t, "10.0.0.7", "10.0.0.2", 80, 700))
+            .unwrap();
+        // One slide earlier than t: out of order but within the 60s window.
+        eng.process(&event(t - 10, "10.0.0.8", "10.0.0.2", 80, 800))
+            .unwrap();
+        eng.finish().unwrap();
+        assert_eq!(eng.late_events(), 0, "in-window event counted as late");
+        let est = eng.take_estimates();
+        let last_end = est.iter().map(|e| e.window_end_nanos).max().unwrap();
+        let final_hosts: Vec<&str> = est
+            .iter()
+            .filter(|e| e.window_end_nanos == last_end)
+            .map(|e| e.group[0].1.as_str())
+            .collect();
+        assert!(final_hosts.contains(&"10.0.0.7"), "{final_hosts:?}");
+        assert!(final_hosts.contains(&"10.0.0.8"), "{final_hosts:?}");
     }
 
     #[test]
