@@ -5,20 +5,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
-use flowsketch_core::hash::{splitmix64, HashSpec};
+use flowsketch_core::hash::{HashSpec, SplitMixRng};
 use flowsketch_core::FlowEvent;
 use flowsketch_ir::parse_query_yaml;
 use flowsketch_planner::plan;
 use flowsketch_runtime::QueryEngine;
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        splitmix64(self.0)
-    }
-}
 
 fn event(ts_nanos: u64, src: [u8; 4], dst: [u8; 4], bytes: u32) -> FlowEvent {
     FlowEvent {
@@ -46,11 +37,11 @@ fn heavy_hitter_bounds_hold_against_exact_truth() {
     let planned = plan(q, &HashSpec::new(3)).unwrap();
     let mut engine = QueryEngine::new(vec![planned], HashSpec::new(3)).unwrap();
 
-    let mut rng = Rng(99);
+    let mut rng = SplitMixRng::new(99);
     let mut exact: HashMap<(String, String), u64> = HashMap::new();
     for i in 0..200_000u64 {
         // Zipf-ish source popularity: key k chosen with weight ~ 1/(k+1).
-        let r = rng.next() % 1_000;
+        let r = rng.next_u64() % 1_000;
         let k = if r < 300 {
             0
         } else if r < 500 {
@@ -58,11 +49,11 @@ fn heavy_hitter_bounds_hold_against_exact_truth() {
         } else if r < 650 {
             2
         } else {
-            3 + rng.next() % 500
+            3 + rng.next_u64() % 500
         } as u8;
         let src = [10, 0, (k / 250), k];
         let dst = [10, 1, 0, (k % 7)];
-        let bytes = 100 + (rng.next() % 1_400) as u32;
+        let bytes = 100 + (rng.next_u64() % 1_400) as u32;
         let ts = 1 + i * 250_000; // all inside one 60s window
         engine.process(&event(ts, src, dst, bytes)).unwrap();
 
@@ -162,11 +153,11 @@ fn counter_estimates_never_underestimate() {
     let planned = plan(q, &HashSpec::new(11)).unwrap();
     let mut engine = QueryEngine::new(vec![planned], HashSpec::new(11)).unwrap();
 
-    let mut rng = Rng(4);
+    let mut rng = SplitMixRng::new(4);
     let mut exact: HashMap<String, u64> = HashMap::new();
     let mut total = 0u64;
     for i in 0..100_000u64 {
-        let port = (rng.next() % 200) as u16;
+        let port = (rng.next_u64() % 200) as u16;
         let mut ev = event(1 + i * 500_000, [10, 0, 0, 1], [10, 0, 0, 2], 100);
         ev.dst_port = port;
         engine.process(&ev).unwrap();

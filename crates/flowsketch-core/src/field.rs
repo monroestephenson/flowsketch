@@ -131,11 +131,6 @@ impl From<Field> for String {
     }
 }
 
-/// A materialized field value (currently always carried as its canonical
-/// string form; see `Field::extract`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FieldValue(pub String);
-
 /// Separator used when encoding a multi-field group key into bytes.
 pub const GROUP_KEY_SEP: u8 = 0x1F; // ASCII unit separator
 

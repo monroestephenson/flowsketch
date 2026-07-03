@@ -25,10 +25,6 @@ impl WindowSpec {
     pub fn bucket_count(&self) -> usize {
         (self.size_nanos / self.slide_nanos).max(1) as usize
     }
-
-    pub fn describe(&self) -> String {
-        humanize_nanos(self.size_nanos).to_string()
-    }
 }
 
 /// Human-friendly duration rendering for labels/explain output.
@@ -78,9 +74,9 @@ pub enum Measure {
     HeavyHitters { value: Field, limit: usize },
     /// Approximate number of distinct `field` values per group.
     DistinctCount { field: Field },
-    /// Empirical entropy of `field`'s distribution (not yet planned in v0).
+    /// Empirical entropy (bits) of `field`'s distribution; ungrouped only.
     Entropy { field: Field },
-    /// Quantile of a numeric field (not yet planned in v0).
+    /// Quantile of a numeric field; ungrouped only.
     Quantile { field: Field, q: f64 },
 }
 

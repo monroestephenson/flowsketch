@@ -13,6 +13,6 @@ pub mod snapshot;
 pub use error::SketchError;
 pub use estimate::SketchEstimate;
 pub use event::{Direction, FlowEvent};
-pub use field::{Field, FieldValue};
-pub use hash::{hash64, splitmix64, HashFamily, HashSpec, RowHashes};
+pub use field::Field;
+pub use hash::{hash64, splitmix64, HashFamily, HashSpec, RowHashes, SplitMixRng};
 pub use sketch::{Sketch, SketchCompatibility};

@@ -89,14 +89,15 @@ pub fn render(
         }
     }
 
-    // Health metrics: make the guardrail itself observable.
+    // Health metrics: make the guardrail itself observable. This is
+    // recomputed per exposition (not monotonic), so it is a gauge.
     out.push_str(
-        "# HELP flowsketch_export_series_dropped_total Series dropped by the per-query export cap.\n",
+        "# HELP flowsketch_export_series_dropped Series dropped by the per-query export cap in this exposition.\n",
     );
-    out.push_str("# TYPE flowsketch_export_series_dropped_total counter\n");
+    out.push_str("# TYPE flowsketch_export_series_dropped gauge\n");
     for (query, n) in &dropped {
         out.push_str(&format!(
-            "flowsketch_export_series_dropped_total{{query=\"{}\"}} {}\n",
+            "flowsketch_export_series_dropped{{query=\"{}\"}} {}\n",
             escape_label_value(query),
             n
         ));
@@ -192,7 +193,8 @@ mod tests {
         // Largest survive, smallest do not.
         assert!(text.contains("src_ip=\"10.0.0.99\""));
         assert!(!text.contains("src_ip=\"10.0.0.1\","));
-        assert!(text.contains("flowsketch_export_series_dropped_total{query=\"q\"} 95"));
+        assert!(text.contains("# TYPE flowsketch_export_series_dropped gauge"));
+        assert!(text.contains("flowsketch_export_series_dropped{query=\"q\"} 95"));
     }
 
     #[test]
