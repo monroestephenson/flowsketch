@@ -1,8 +1,8 @@
-# Operator guide (v0: offline replay)
+# Operator guide
 
-v0 is the offline/replay milestone from README §26: prove the query model
-on traces before shipping a live agent. Everything below runs from a
-single static binary.
+Everything runs from a single static binary: offline replay (README §26),
+the live userspace agent (Phase 3), and cross-process sketch merge (the
+Phase 7 primitive).
 
 ## Build
 
@@ -39,9 +39,43 @@ table; only the planted scanners (`10.66.0.x`) cross the scanner alert.
 | `flowsketch validate q.yaml...` | parse + plan check; nonzero exit on failure |
 | `flowsketch bench --algo count-min --events 10000000` | throughput + accuracy vs exact |
 | `flowsketch synth --out t.pcap ...` | reproducible synthetic traces |
+| `flowsketch agent --config agent.yaml` | live agent: capture + HTTP endpoints |
+| `flowsketch replay ... --snapshot-out DIR` | dump final sketch state as FSK1 files |
+| `flowsketch merge-snapshots a.fsk1 b.fsk1 [--out m.fsk1]` | merge sketches across nodes/processes |
 
 `--format prometheus` prints text exposition for the final window — the
 same rendering the live agent will serve at `/metrics`.
+
+## Live agent
+
+```bash
+flowsketch synth --out demo.pcap --packets 200000
+flowsketch agent --config examples/agent.yaml   # pcap demo source
+curl -s localhost:9464/metrics | head            # estimates + agent health
+curl -s localhost:9464/healthz                   # capture-source health
+curl -s localhost:9464/v1/queries | jq           # plans, memory, error contracts
+```
+
+For live capture, set `source.kind: af_packet` with an `interface` — this
+opens an AF_PACKET raw socket and needs CAP_NET_RAW (or root). The agent
+is a capture thread feeding a bounded channel into the engine thread;
+when the engine falls behind, capture drops events and counts them in
+`flowsketch_agent_dropped_events_total` rather than blocking the NIC path.
+A capture failure flips `/healthz` to 503 while `/metrics` keeps serving
+the last good state.
+
+## Distributed merge (two-node demo)
+
+```bash
+# "node A" and "node B" replay different traffic with the SAME --seed:
+flowsketch replay a.pcap --query q.yaml --seed 9 --snapshot-out snaps-a
+flowsketch replay b.pcap --query q.yaml --seed 9 --snapshot-out snaps-b
+# combine into cluster-wide estimates:
+flowsketch merge-snapshots snaps-a/*.fsk1 snaps-b/*.fsk1
+```
+
+Merges validate algorithm, parameters, hash family, and seed from the
+FSK1 headers; mismatches are rejected loudly, never silently merged.
 
 ## Cardinality guardrails
 

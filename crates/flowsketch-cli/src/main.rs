@@ -2,6 +2,7 @@
 //! benchmarks, and synthetic trace generation.
 
 mod bench;
+mod merge;
 mod replay;
 mod synth;
 
@@ -45,6 +46,26 @@ enum Command {
         /// Hash seed (must match across nodes for mergeable sketches)
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Also write each query's final sketch state as FSK1 snapshot
+        /// files into this directory (for merge-snapshots)
+        #[arg(long)]
+        snapshot_out: Option<PathBuf>,
+    },
+    /// Run the live agent: capture packets, serve /metrics, /healthz, /v1/queries
+    Agent {
+        /// Agent config YAML (see examples/agent.yaml)
+        #[arg(long, short)]
+        config: PathBuf,
+    },
+    /// Merge FSK1 sketch snapshots from different processes/nodes and print
+    /// the combined estimates (merge compatibility is validated)
+    MergeSnapshots {
+        /// Snapshot files produced by `replay --snapshot-out`
+        #[arg(required = true)]
+        snapshots: Vec<PathBuf>,
+        /// Optionally write the merged snapshot here
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Show the physical plan, memory estimate, and error contract for a query
     Explain {
@@ -120,13 +141,29 @@ fn main() -> Result<()> {
             queries,
             format,
             seed,
+            snapshot_out,
         } => {
             let plans: Vec<Plan> = queries
                 .iter()
                 .map(|p| load_plan(p, seed))
                 .collect::<Result<_>>()?;
-            replay::run(&pcap, plans, format, seed)
+            replay::run(&pcap, plans, format, seed, snapshot_out.as_deref())
         }
+        Command::Agent { config } => {
+            let cfg = flowsketch_agent::AgentConfig::from_file(&config)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            eprintln!(
+                "flowsketch agent starting: node={} queries={} source={:?}",
+                cfg.node_name,
+                cfg.query_files.len(),
+                cfg.source
+            );
+            flowsketch_agent::run(cfg, |addr| {
+                eprintln!("listening on http://{addr} (/metrics /healthz /readyz /v1/queries)");
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        Command::MergeSnapshots { snapshots, out } => merge::run(&snapshots, out.as_deref()),
         Command::Explain { query } => {
             let planned = load_plan(&query, 0)?;
             print!("{}", explain(&planned));

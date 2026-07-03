@@ -49,6 +49,24 @@ is evicted, so **low-fan-out groups may be dropped under pressure**;
 high-fan-out groups — the ones fan-out queries exist to find — are
 strongly favored. Evictions are counted and exposed.
 
+### `rank-error` (KLL: `quantile`)
+
+The returned value's true rank is within `~2.3/k * n` of the requested
+quantile with high probability, where `k` is chosen from the query's
+`epsilon` (interpreted as a normalized rank error). Emitted bounds are the
+values at the neighboring quantiles `q - eps` and `q + eps`, translating
+rank uncertainty into value units.
+
+### `heuristic` (SpaceSaving + HLL: `entropy`)
+
+Entropy (bits) is estimated from the guaranteed counts of the SpaceSaving
+head plus a uniform-tail correction whose support size comes from an HLL
+distinct count. There is no formal single-number bound: the head terms are
+exact-ish, the tail assumption is uniformity. The planner and every
+exported sample label this `error_kind="heuristic"`; validate against your
+own traffic shape before alerting on absolute values (trends and shifts
+are the intended use).
+
 ## Merge compatibility
 
 Sketches merge only if algorithm, version, hash family, seed, and all
