@@ -111,16 +111,12 @@ impl AfPacketSocket {
     fn open(interface: &str) -> Result<Self, AgentError> {
         use std::os::fd::FromRawFd;
 
-        let eth_p_all: u16 = 0x0003; // ETH_P_ALL
-                                     // SAFETY: plain socket(2) call; the fd is checked and wrapped in
-                                     // OwnedFd immediately so it cannot leak.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW,
-                (eth_p_all as u32).to_be() as i32,
-            )
-        };
+        // ETH_P_ALL in network byte order (htons), as socket(2) and
+        // sockaddr_ll.sll_protocol both expect a 16-bit big-endian value.
+        let proto_be: u16 = 0x0003u16.to_be();
+        // SAFETY: plain socket(2) call; the fd is checked and wrapped in
+        // OwnedFd immediately so it cannot leak.
+        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto_be as i32) };
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return Err(AgentError::Source(format!(
@@ -144,7 +140,7 @@ impl AfPacketSocket {
         let rc = unsafe {
             let mut addr: libc::sockaddr_ll = std::mem::zeroed();
             addr.sll_family = libc::AF_PACKET as u16;
-            addr.sll_protocol = (eth_p_all as u32).to_be() as u16;
+            addr.sll_protocol = proto_be;
             addr.sll_ifindex = ifindex as i32;
             libc::bind(
                 std::os::fd::AsRawFd::as_raw_fd(&fd),

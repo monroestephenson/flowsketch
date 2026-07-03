@@ -223,6 +223,55 @@ fn snapshots_from_separate_processes_merge() {
     assert!(text.contains("10.66.0.1"), "{text}");
     assert!(merged_out.exists());
 
+    // Snapshots covering different time windows must be rejected: merging
+    // them would silently mix time ranges into one estimate.
+    let short_pcap = dir.join("short.pcap");
+    assert!(flowsketch()
+        .args([
+            "synth",
+            "--out",
+            short_pcap.to_str().unwrap(),
+            "--packets",
+            "5000",
+            "--scanners",
+            "1",
+            "--duration-secs",
+            "30",
+            "--seed",
+            "5",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let short_snaps = dir.join("snaps-short");
+    assert!(flowsketch()
+        .args([
+            "replay",
+            short_pcap.to_str().unwrap(),
+            "--query",
+            query.to_str().unwrap(),
+            "--seed",
+            "9",
+            "--snapshot-out",
+            short_snaps.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+    let out = flowsketch()
+        .arg("merge-snapshots")
+        .arg(&snapshot_files[0])
+        .arg(short_snaps.join("suspected_scanners.hllmap.fsk1"))
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "window-mismatched merge was accepted"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("different time windows"), "{err}");
+
     // Mismatched seeds must be rejected, not silently merged.
     let snap_dir = dir.join("snaps-badseed");
     let pcap = dir.join("node-a.pcap");
