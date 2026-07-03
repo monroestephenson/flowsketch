@@ -1,0 +1,15 @@
+# Packet size distribution: the p99 packet size per window.
+# Ungrouped quantile -> a single KLL sketch per window bucket.
+name: packet_size_p99
+window:
+  size: 60s
+  slide: 10s
+measure:
+  type: quantile
+  field: bytes
+  q: 0.99
+  error:
+    epsilon: 0.01
+export:
+  prometheus: true
+  maxSeries: 1

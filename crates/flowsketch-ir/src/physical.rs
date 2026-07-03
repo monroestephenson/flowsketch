@@ -28,6 +28,9 @@ pub enum PhysicalSketch {
         max_keys: usize,
         precision: u8,
     },
+    Kll {
+        k: usize,
+    },
     Composite {
         stages: Vec<PhysicalSketch>,
     },
@@ -43,6 +46,7 @@ impl PhysicalSketch {
             PhysicalSketch::MisraGries { .. } => "misra-gries".to_string(),
             PhysicalSketch::HyperLogLog { .. } => "hll".to_string(),
             PhysicalSketch::HllMap { .. } => "hllmap".to_string(),
+            PhysicalSketch::Kll { .. } => "kll".to_string(),
             PhysicalSketch::Composite { stages } => stages
                 .iter()
                 .map(|s| s.algorithm_name())
@@ -70,6 +74,8 @@ impl PhysicalSketch {
                     * ((1u64 << precision) + avg_key_bytes as u64 + HASH_ENTRY_OVERHEAD)
                     + 64
             }
+            // KLL stores ~3k items across geometrically-capped levels.
+            PhysicalSketch::Kll { k } => *k as u64 * 3 * 8 + 64,
             PhysicalSketch::Composite { stages } => stages
                 .iter()
                 .map(|s| s.estimated_memory_bytes(avg_key_bytes))
@@ -103,6 +109,7 @@ impl PhysicalSketch {
                 max_keys,
                 precision,
             } => format!("HLLMap(max_keys={max_keys}, precision={precision})"),
+            PhysicalSketch::Kll { k } => format!("KLL(k={k})"),
             PhysicalSketch::Composite { stages } => {
                 let inner: Vec<String> = stages.iter().map(|s| s.describe()).collect();
                 format!("Composite[{}]", inner.join(" + "))

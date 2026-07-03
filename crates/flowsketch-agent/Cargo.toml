@@ -1,27 +1,23 @@
 [package]
-name = "flowsketch-cli"
-description = "FlowSketch CLI: replay pcaps against sketch queries, explain plans, validate queries, benchmark algorithms, generate synthetic traces"
+name = "flowsketch-agent"
+description = "FlowSketch live agent: packet capture sources feeding the sketch engine, with an embedded HTTP server for /metrics, /healthz, /readyz, and /v1/queries"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "flowsketch"
-path = "src/main.rs"
-
 [dependencies]
 flowsketch-core = { workspace = true }
-flowsketch-algos = { workspace = true }
 flowsketch-ir = { workspace = true }
 flowsketch-planner = { workspace = true }
 flowsketch-runtime = { workspace = true }
 flowsketch-pcap = { workspace = true }
 flowsketch-prometheus = { workspace = true }
-flowsketch-agent = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 
-[dev-dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

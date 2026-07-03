@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, SpaceSaving};
+use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, KllSketch, SpaceSaving};
 use flowsketch_core::field::group_key;
 use flowsketch_core::hash::HashSpec;
 use flowsketch_core::{FlowEvent, Sketch, SketchError, SketchEstimate};
@@ -28,6 +28,10 @@ enum QueryState {
     DistinctPerKey { map: HllMap },
     /// distinct_count without grouping: single HLL.
     DistinctGlobal { hll: HyperLogLog },
+    /// quantile (ungrouped): KLL over the measured field's values.
+    Quantile { kll: KllSketch },
+    /// entropy (ungrouped): SpaceSaving head + HLL tail-support estimator.
+    Entropy { ss: SpaceSaving, hll: HyperLogLog },
 }
 
 impl QueryState {
@@ -45,6 +49,9 @@ impl QueryState {
             PhysicalSketch::HyperLogLog { precision } => Ok(QueryState::DistinctGlobal {
                 hll: HyperLogLog::new(*precision, *hash)?,
             }),
+            PhysicalSketch::Kll { k } => Ok(QueryState::Quantile {
+                kll: KllSketch::new(*k, *hash)?,
+            }),
             PhysicalSketch::Composite { stages } => match stages.as_slice() {
                 [PhysicalSketch::SpaceSaving { capacity }, PhysicalSketch::CountMin {
                     width,
@@ -54,6 +61,12 @@ impl QueryState {
                     cm: CountMinSketch::new(*width, *depth, *conservative_update, *hash)?,
                     keys: SpaceSaving::new(*capacity, *hash)?,
                 }),
+                [PhysicalSketch::SpaceSaving { capacity }, PhysicalSketch::HyperLogLog { precision }] => {
+                    Ok(QueryState::Entropy {
+                        ss: SpaceSaving::new(*capacity, *hash)?,
+                        hll: HyperLogLog::new(*precision, *hash)?,
+                    })
+                }
                 other => Err(SketchError::InvalidParam(format!(
                     "runtime cannot execute composite plan {other:?}"
                 ))),
@@ -73,6 +86,11 @@ impl QueryState {
             }
             QueryState::DistinctPerKey { map } => map.insert(key, distinct_item),
             QueryState::DistinctGlobal { hll } => hll.insert(distinct_item),
+            QueryState::Quantile { kll } => kll.insert(weight),
+            QueryState::Entropy { ss, hll } => {
+                ss.add(distinct_item, 1);
+                hll.insert(distinct_item);
+            }
         }
     }
 
@@ -91,6 +109,11 @@ impl QueryState {
             (QueryState::DistinctGlobal { hll: a }, QueryState::DistinctGlobal { hll: b }) => {
                 a.merge_from(b)
             }
+            (QueryState::Quantile { kll: a }, QueryState::Quantile { kll: b }) => a.merge_from(b),
+            (QueryState::Entropy { ss: a, hll: ha }, QueryState::Entropy { ss: b, hll: hb }) => {
+                a.merge_from(b)?;
+                ha.merge_from(hb)
+            }
             _ => Err(SketchError::IncompatibleMerge(
                 "mismatched query state kinds".into(),
             )),
@@ -103,6 +126,8 @@ impl QueryState {
             QueryState::Counter { cm, keys } => cm.memory_bytes() + keys.memory_bytes(),
             QueryState::DistinctPerKey { map } => map.memory_bytes(),
             QueryState::DistinctGlobal { hll } => hll.memory_bytes(),
+            QueryState::Quantile { kll } => kll.memory_bytes(),
+            QueryState::Entropy { ss, hll } => ss.memory_bytes() + hll.memory_bytes(),
         }
     }
 
@@ -112,8 +137,76 @@ impl QueryState {
             QueryState::Counter { cm, .. } => cm.update_count(),
             QueryState::DistinctPerKey { map } => map.update_count(),
             QueryState::DistinctGlobal { hll } => hll.update_count(),
+            QueryState::Quantile { kll } => kll.update_count(),
+            QueryState::Entropy { ss, .. } => ss.update_count(),
         }
     }
+
+    /// FSK1 snapshots for every component sketch of this state, tagged
+    /// with a component name for multi-sketch states.
+    fn to_snapshots(&self, ws: u64, we: u64) -> Vec<(String, Vec<u8>)> {
+        match self {
+            QueryState::HeavyHitters { ss } => {
+                vec![("spacesaving".into(), ss.to_snapshot(ws, we))]
+            }
+            QueryState::Counter { cm, keys } => vec![
+                ("count-min".into(), cm.to_snapshot(ws, we)),
+                ("keys-spacesaving".into(), keys.to_snapshot(ws, we)),
+            ],
+            QueryState::DistinctPerKey { map } => {
+                vec![("hllmap".into(), map.to_snapshot(ws, we))]
+            }
+            QueryState::DistinctGlobal { hll } => vec![("hll".into(), hll.to_snapshot(ws, we))],
+            QueryState::Quantile { kll } => vec![("kll".into(), kll.to_snapshot(ws, we))],
+            QueryState::Entropy { ss, hll } => vec![
+                ("head-spacesaving".into(), ss.to_snapshot(ws, we)),
+                ("tail-hll".into(), hll.to_snapshot(ws, we)),
+            ],
+        }
+    }
+}
+
+/// One serialized component sketch exported from a running engine.
+#[derive(Debug, Clone)]
+pub struct SnapshotExport {
+    pub query_name: String,
+    pub component: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Empirical entropy (bits) of a distribution summarized by a SpaceSaving
+/// head and an HLL support estimate for the tail.
+///
+/// The tracked keys' guaranteed counts contribute exact `-p log2 p` terms;
+/// the residual mass is treated as uniform over the remaining support
+/// (HLL distinct count minus tracked keys). This is a heuristic estimator —
+/// the planner labels it `error_kind="heuristic"`.
+fn estimate_entropy_bits(ss: &SpaceSaving, hll: &HyperLogLog) -> Option<f64> {
+    let n = ss.total_weight() as f64;
+    if n <= 0.0 {
+        return None;
+    }
+    let tracked = ss.top_k(ss.capacity());
+    let mut head_mass = 0.0f64;
+    let mut entropy = 0.0f64;
+    for (_, entry) in &tracked {
+        let g = entry.guaranteed() as f64;
+        if g > 0.0 {
+            let p = g / n;
+            entropy -= p * p.log2();
+            head_mass += g;
+        }
+    }
+    let tail_mass = (n - head_mass).max(0.0);
+    if tail_mass > 0.0 {
+        let tail_support = (hll.cardinality() - tracked.len() as f64).max(1.0);
+        // Uniform tail: support * (m/support/n) * log2(n*support/m).
+        let p_each = tail_mass / tail_support / n;
+        if p_each > 0.0 {
+            entropy -= tail_mass / n * p_each.log2();
+        }
+    }
+    Some(entropy.max(0.0))
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +236,10 @@ impl RunningQuery {
             Measure::Sum { value } => (None, Some(*value)),
             Measure::HeavyHitters { value, .. } => (None, Some(*value)),
             Measure::DistinctCount { field } => (Some(*field), None),
-            Measure::Entropy { field } | Measure::Quantile { field, .. } => (Some(*field), None),
+            // Entropy consumes the field as a distinct item; quantile
+            // consumes it as the numeric value fed to KLL.
+            Measure::Entropy { field } => (Some(*field), None),
+            Measure::Quantile { field, .. } => (None, Some(*field)),
         };
         Ok(RunningQuery {
             group_fields: plan.query.group_by.clone(),
@@ -330,6 +426,30 @@ impl RunningQuery {
                 e.confidence = Some(0.95);
                 vec![e]
             }
+
+            QueryState::Quantile { kll } => {
+                let Measure::Quantile { q: quantile, .. } = &q.measure else {
+                    return Vec::new();
+                };
+                let Some(value) = kll.quantile(*quantile) else {
+                    return Vec::new();
+                };
+                let eps = kll.rank_error();
+                let mut e = base(Vec::new(), value as f64);
+                // Rank error translates to value bounds by querying the
+                // neighboring quantiles.
+                e.lower_bound = kll.quantile((quantile - eps).max(0.0)).map(|v| v as f64);
+                e.upper_bound = kll.quantile((quantile + eps).min(1.0)).map(|v| v as f64);
+                e.confidence = Some(0.99);
+                vec![e]
+            }
+
+            QueryState::Entropy { ss, hll } => {
+                let Some(entropy_bits) = estimate_entropy_bits(ss, hll) else {
+                    return Vec::new();
+                };
+                vec![base(Vec::new(), entropy_bits)]
+            }
         };
 
         if !q.alert.is_empty() {
@@ -416,6 +536,32 @@ impl QueryEngine {
     /// The plans this engine is executing.
     pub fn plans(&self) -> impl Iterator<Item = &Plan> {
         self.queries.iter().map(|q| &q.plan)
+    }
+
+    /// Serialize each query's current window state to FSK1 snapshots (one
+    /// per component sketch), for cross-process merge. The window covers
+    /// all currently open buckets.
+    pub fn export_snapshots(&self) -> Result<Vec<SnapshotExport>, SketchError> {
+        let mut out = Vec::new();
+        for q in &self.queries {
+            if q.buckets.is_empty() {
+                continue;
+            }
+            let mut merged = q.buckets[0].state.clone();
+            for b in q.buckets.iter().skip(1) {
+                merged.merge_from(&b.state)?;
+            }
+            let ws = q.buckets.front().unwrap().start_nanos;
+            let we = q.buckets.back().unwrap().start_nanos + q.slide_nanos();
+            for (component, bytes) in merged.to_snapshots(ws, we) {
+                out.push(SnapshotExport {
+                    query_name: q.plan.query.name.clone(),
+                    component,
+                    bytes,
+                });
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -559,6 +705,65 @@ mod tests {
         }
         eng.finish().unwrap();
         assert!(eng.take_estimates().is_empty());
+    }
+
+    #[test]
+    fn quantile_measure_tracks_packet_size_distribution() {
+        let mut eng = engine_for(
+            "name: psize\nwindow: {size: 60s}\n\
+             measure: {type: quantile, field: bytes, q: 0.5, error: {epsilon: 0.01}}\n",
+        );
+        // Packet sizes 1..=10000 in scrambled order: true median 5000.
+        let mut sizes: Vec<u32> = (1..=10_000).collect();
+        sizes.sort_by_key(|&v| flowsketch_core::hash::splitmix64(v as u64));
+        for (i, bytes) in sizes.into_iter().enumerate() {
+            eng.process(&event((i / 200) as u64, "10.0.0.1", "10.0.0.2", 443, bytes))
+                .unwrap();
+        }
+        eng.finish().unwrap();
+        let est = eng.take_estimates();
+        assert_eq!(est.len(), 1);
+        let e = &est[0];
+        assert_eq!(e.algorithm, "kll");
+        assert!(
+            (e.estimate - 5_000.0).abs() < 300.0,
+            "median estimate {} too far from 5000",
+            e.estimate
+        );
+        assert!(e.lower_bound.unwrap() <= e.estimate);
+        assert!(e.upper_bound.unwrap() >= e.estimate);
+    }
+
+    #[test]
+    fn entropy_measure_separates_uniform_from_concentrated() {
+        let run = |concentrated: bool| -> f64 {
+            let mut eng = engine_for(
+                "name: ent\nwindow: {size: 60s}\n\
+                 measure: {type: entropy, field: src.ip}\n",
+            );
+            for i in 0..10_000u32 {
+                let src = if concentrated {
+                    "10.0.0.1".to_string() // all traffic from one host
+                } else {
+                    format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256)
+                };
+                eng.process(&event((i / 200) as u64, &src, "10.9.9.9", 80, 100))
+                    .unwrap();
+            }
+            eng.finish().unwrap();
+            let est = eng.take_estimates();
+            assert_eq!(est.len(), 1);
+            est[0].estimate
+        };
+        let concentrated = run(true);
+        let uniform = run(false);
+        // One host => ~0 bits; 10k uniform hosts => ~log2(10000) ~ 13.3 bits.
+        assert!(concentrated < 0.5, "concentrated entropy {concentrated}");
+        assert!(
+            (uniform - 13.29).abs() < 1.0,
+            "uniform entropy {uniform} (expected ~13.3 bits)"
+        );
+        assert!(uniform > concentrated + 10.0);
     }
 
     #[test]

@@ -318,10 +318,18 @@ impl RawQuery {
             "entropy" => Measure::Entropy {
                 field: parse_field(&self.measure.field, "a `field`")?,
             },
-            "quantile" => Measure::Quantile {
-                field: parse_field(&self.measure.field, "a numeric `field`")?,
-                q: self.measure.q.unwrap_or(0.5),
-            },
+            "quantile" => {
+                let field = parse_field(&self.measure.field, "a numeric `field`")?;
+                if !field.is_numeric_measure() {
+                    return Err(QueryParseError::Invalid(format!(
+                        "quantile requires a numeric field (bytes or packets), got {field}"
+                    )));
+                }
+                Measure::Quantile {
+                    field,
+                    q: self.measure.q.unwrap_or(0.5),
+                }
+            }
             other => {
                 return Err(QueryParseError::Invalid(format!(
                     "unknown measure type {other:?}; expected count, sum, heavy_hitters, \
@@ -570,6 +578,11 @@ resources:
         // Unknown measure
         assert!(parse_query_yaml(
             "name: q\nwindow: {size: 10s}\ngroupBy: [src.ip]\nmeasure: {type: median}\n"
+        )
+        .is_err());
+        // Non-numeric quantile field (would silently produce zero quantiles)
+        assert!(parse_query_yaml(
+            "name: q\nwindow: {size: 10s}\nmeasure: {type: quantile, field: src.ip, q: 0.9}\n"
         )
         .is_err());
         // Unknown top-level key
