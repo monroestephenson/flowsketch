@@ -1,0 +1,13 @@
+[package]
+name = "flowsketch-planner"
+description = "FlowSketch query planner: compiles logical queries into bounded-memory physical sketch plans with explicit error contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }
+flowsketch-ir = { workspace = true }
+thiserror = { workspace = true }

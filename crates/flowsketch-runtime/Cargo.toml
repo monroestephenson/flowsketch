@@ -1,0 +1,15 @@
+[package]
+name = "flowsketch-runtime"
+description = "FlowSketch runtime: windowed sketch execution, bucket merging, and estimate emission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }
+flowsketch-algos = { workspace = true }
+flowsketch-ir = { workspace = true }
+flowsketch-planner = { workspace = true }
+thiserror = { workspace = true }
