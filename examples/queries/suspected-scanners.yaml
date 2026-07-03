@@ -1,0 +1,23 @@
+# Scanner detection: sources touching an unusually high number of distinct
+# destinations on common service ports.
+name: suspected_scanners
+window:
+  size: 60s
+  slide: 10s
+match:
+  protocol: tcp
+  dst.port: [22, 80, 443, 5432, 6379]
+groupBy:
+  - src.ip
+measure:
+  type: distinct_count
+  field: dst.ip
+  error:
+    epsilon: 0.02
+alertIf:
+  gt: 500
+export:
+  prometheus: true
+  maxSeries: 500
+resources:
+  maxMemory: 64MiB

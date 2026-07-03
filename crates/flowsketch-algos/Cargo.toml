@@ -1,0 +1,11 @@
+[package]
+name = "flowsketch-algos"
+description = "FlowSketch sketch algorithms: Count-Min, CountSketch, HyperLogLog, HLLMap, SpaceSaving, Misra-Gries, exact baseline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }

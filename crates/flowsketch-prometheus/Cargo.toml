@@ -1,0 +1,12 @@
+[package]
+name = "flowsketch-prometheus"
+description = "FlowSketch Prometheus text exposition: estimates as gauges with algorithm/error metadata and hard cardinality caps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }
+flowsketch-ir = { workspace = true }
