@@ -105,8 +105,8 @@ pub enum OutputFormat {
 fn load_plan(path: &PathBuf, seed: u64) -> Result<Plan> {
     let yaml = fs::read_to_string(path)
         .with_context(|| format!("cannot read query file {}", path.display()))?;
-    let query = parse_query_yaml(&yaml)
-        .with_context(|| format!("invalid query in {}", path.display()))?;
+    let query =
+        parse_query_yaml(&yaml).with_context(|| format!("invalid query in {}", path.display()))?;
     let planned = plan(query, &HashSpec::new(seed))
         .with_context(|| format!("planning failed for {}", path.display()))?;
     Ok(planned)
@@ -157,7 +157,10 @@ fn main() -> Result<()> {
                 }
             }
             if failures > 0 {
-                anyhow::bail!("{failures} of {} query file(s) failed validation", queries.len());
+                anyhow::bail!(
+                    "{failures} of {} query file(s) failed validation",
+                    queries.len()
+                );
             }
             Ok(())
         }

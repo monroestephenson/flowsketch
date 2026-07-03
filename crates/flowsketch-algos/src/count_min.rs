@@ -63,7 +63,7 @@ impl CountMinSketch {
     }
 
     pub fn dimensions_for_error(epsilon: f64, delta: f64) -> Result<(usize, usize), SketchError> {
-        if !(epsilon > 0.0 && epsilon < 1.0) || !(delta > 0.0 && delta < 1.0) {
+        if !(epsilon > 0.0 && epsilon < 1.0 && delta > 0.0 && delta < 1.0) {
             return Err(SketchError::InvalidParam(
                 "epsilon and delta must be in (0, 1)".into(),
             ));
@@ -174,17 +174,16 @@ impl Sketch for CountMinSketch {
         self.updates += 1;
         if self.conservative {
             // Conservative update: raise each row only up to the new point
-            // estimate, never past it.
+            // estimate, never past it. Two passes over the rows so every
+            // depth is handled (index derivation is cheap arithmetic).
             let mut min = u64::MAX;
-            let mut idxs = [0usize; 64];
-            let depth = self.depth.min(64);
-            for row in 0..depth {
+            for row in 0..self.depth {
                 let idx = row * self.width + rh.index(row, self.width);
-                idxs[row] = idx;
                 min = min.min(self.table[idx]);
             }
             let target = min + value;
-            for &idx in &idxs[..depth] {
+            for row in 0..self.depth {
+                let idx = row * self.width + rh.index(row, self.width);
                 if self.table[idx] < target {
                     self.table[idx] = target;
                 }
@@ -202,7 +201,8 @@ impl Sketch for CountMinSketch {
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
-        self.compatibility().ensure_matches(&other.compatibility())?;
+        self.compatibility()
+            .ensure_matches(&other.compatibility())?;
         for (a, b) in self.table.iter_mut().zip(other.table.iter()) {
             *a += *b;
         }
@@ -276,6 +276,22 @@ mod tests {
     }
 
     #[test]
+    fn conservative_update_handles_depth_beyond_64() {
+        // Regression: conservative update used a fixed 64-row scratch buffer
+        // and left deeper rows at zero, underestimating.
+        let mut s = CountMinSketch::new(128, 80, true, HashSpec::new(1)).unwrap();
+        for i in 0..500u32 {
+            s.update(format!("k{}", i % 20).as_bytes(), 1);
+        }
+        for i in 0..20u32 {
+            assert!(
+                s.estimate_u64(format!("k{i}").as_bytes()) >= 25,
+                "deep conservative sketch underestimated"
+            );
+        }
+    }
+
+    #[test]
     fn merge_equals_single_stream() {
         let mut a = cm(false);
         let mut b = cm(false);
@@ -292,7 +308,10 @@ mod tests {
         a.merge_from(&b).unwrap();
         for i in 0..700u32 {
             let key = format!("k{i}");
-            assert_eq!(a.estimate_u64(key.as_bytes()), whole.estimate_u64(key.as_bytes()));
+            assert_eq!(
+                a.estimate_u64(key.as_bytes()),
+                whole.estimate_u64(key.as_bytes())
+            );
         }
     }
 
@@ -315,7 +334,10 @@ mod tests {
         let s2 = CountMinSketch::from_snapshot(&bytes).unwrap();
         for i in 0..100u32 {
             let key = format!("k{i}");
-            assert_eq!(s.estimate_u64(key.as_bytes()), s2.estimate_u64(key.as_bytes()));
+            assert_eq!(
+                s.estimate_u64(key.as_bytes()),
+                s2.estimate_u64(key.as_bytes())
+            );
         }
         assert_eq!(s.update_count(), s2.update_count());
     }

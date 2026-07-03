@@ -216,7 +216,7 @@ mod tests {
         f.extend_from_slice(&[0, 0]); // checksum
         f.extend_from_slice(&[192, 168, 1, 2]); // src
         f.extend_from_slice(&[10, 0, 0, 9]); // dst
-        // TCP header, 20 bytes
+                                             // TCP header, 20 bytes
         f.extend_from_slice(&12345u16.to_be_bytes());
         f.extend_from_slice(&443u16.to_be_bytes());
         f.extend_from_slice(&[0; 8]); // seq, ack

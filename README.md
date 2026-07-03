@@ -1,5 +1,27 @@
 # FlowSketch: complete implementation plan
 
+> ## Implementation status
+>
+> The **minimum credible v0** (§26, build order §30) is implemented as a Rust
+> workspace: `flowsketch-core`, `flowsketch-algos` (Count-Min, CountSketch,
+> HyperLogLog, HLLMap, SpaceSaving, Misra-Gries + exact baseline),
+> `flowsketch-ir`, `flowsketch-planner`, `flowsketch-runtime`,
+> `flowsketch-pcap`, `flowsketch-prometheus`, and `flowsketch-cli`.
+>
+> ```bash
+> cargo build --release
+> target/release/flowsketch synth --out demo.pcap --packets 200000
+> target/release/flowsketch explain examples/queries/suspected-scanners.yaml
+> target/release/flowsketch replay demo.pcap \
+>   --query examples/queries/top-talkers.yaml \
+>   --query examples/queries/suspected-scanners.yaml
+> ```
+>
+> See `docs/operator-guide.md`, `docs/query-language.md`,
+> `docs/accuracy-contracts.md`, and `docs/algorithm-notes.md`. Everything
+> below this block is the original design plan; later phases (live agent,
+> OTLP, Kubernetes, eBPF, gateway) are not yet built.
+
 ## 0. Core thesis
 
 Build **FlowSketch** as a **portable sketch-based network telemetry runtime**, not as a generic sketch library.

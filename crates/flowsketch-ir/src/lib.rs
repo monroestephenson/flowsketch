@@ -8,8 +8,6 @@ pub mod logical;
 pub mod physical;
 pub mod yaml;
 
-pub use logical::{
-    AlertSpec, ErrorSpec, ExportSpec, LogicalQuery, Measure, Predicate, WindowSpec,
-};
+pub use logical::{AlertSpec, ErrorSpec, ExportSpec, LogicalQuery, Measure, Predicate, WindowSpec};
 pub use physical::PhysicalSketch;
 pub use yaml::{parse_query_yaml, QueryParseError};

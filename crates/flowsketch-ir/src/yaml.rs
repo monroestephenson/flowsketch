@@ -209,9 +209,11 @@ impl RawQuery {
             Some(m) => {
                 let proto = match m.protocol {
                     None => None,
-                    Some(serde_yaml::Value::String(s)) => Some(protocol::parse(&s).ok_or_else(
-                        || QueryParseError::Invalid(format!("unknown protocol {s:?}")),
-                    )?),
+                    Some(serde_yaml::Value::String(s)) => {
+                        Some(protocol::parse(&s).ok_or_else(|| {
+                            QueryParseError::Invalid(format!("unknown protocol {s:?}"))
+                        })?)
+                    }
                     Some(serde_yaml::Value::Number(n)) => {
                         let v = n.as_u64().ok_or_else(|| {
                             QueryParseError::Invalid("protocol number must be 0-255".into())
@@ -238,12 +240,24 @@ impl RawQuery {
             }
         };
 
-        let default_error = ErrorSpec::default();
+        // Defaults depend on the measure family: counting sketches read
+        // epsilon as an additive fraction of total weight (0.001), while
+        // cardinality sketches read it as a relative standard error, where
+        // 0.0163 corresponds to HLL precision 12. An explicitly provided
+        // epsilon is always honored as written.
+        let default_epsilon = if self.measure.r#type == "distinct_count" {
+            0.0163
+        } else {
+            ErrorSpec::default().epsilon
+        };
         let error = match &self.measure.error {
-            None => default_error,
+            None => ErrorSpec {
+                epsilon: default_epsilon,
+                ..ErrorSpec::default()
+            },
             Some(e) => ErrorSpec {
-                epsilon: e.epsilon.unwrap_or(default_error.epsilon),
-                delta: e.delta.unwrap_or(default_error.delta),
+                epsilon: e.epsilon.unwrap_or(default_epsilon),
+                delta: e.delta.unwrap_or(ErrorSpec::default().delta),
             },
         };
         if !(error.epsilon > 0.0 && error.epsilon < 1.0) {
@@ -486,11 +500,34 @@ resources:
         .unwrap();
         assert_eq!(q.filter.protocol, Some(proto::TCP));
         assert_eq!(q.filter.dst_ports, vec![22, 80, 443, 5432, 6379]);
-        assert_eq!(q.measure, Measure::DistinctCount { field: Field::DstIp });
+        assert_eq!(
+            q.measure,
+            Measure::DistinctCount {
+                field: Field::DstIp
+            }
+        );
         assert_eq!(q.alert.gt, Some(5000.0));
         assert_eq!(q.export.max_series, 500);
         assert_eq!(q.max_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(q.error.epsilon, 0.02);
+    }
+
+    #[test]
+    fn distinct_count_gets_cardinality_default_epsilon() {
+        let q = parse_query_yaml(
+            "name: d\nwindow: {size: 60s}\ngroupBy: [src.ip]\n\
+             measure: {type: distinct_count, field: dst.ip}\n",
+        )
+        .unwrap();
+        assert_eq!(q.error.epsilon, 0.0163);
+
+        // Explicit epsilon survives as written, even when very tight.
+        let q = parse_query_yaml(
+            "name: d\nwindow: {size: 60s}\ngroupBy: [src.ip]\n\
+             measure: {type: distinct_count, field: dst.ip, error: {epsilon: 0.0005}}\n",
+        )
+        .unwrap();
+        assert_eq!(q.error.epsilon, 0.0005);
     }
 
     #[test]

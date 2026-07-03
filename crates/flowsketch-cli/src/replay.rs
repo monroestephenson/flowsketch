@@ -50,7 +50,10 @@ pub fn run(pcap_path: &Path, plans: Vec<Plan>, format: OutputFormat, seed: u64) 
 
     match format {
         OutputFormat::Prometheus => {
-            let (text, _) = flowsketch_prometheus::render(&estimates, &info);
+            // A scrape exposes one sample per series: render only each
+            // query's final window (earlier windows would duplicate series).
+            let finals = latest_window_only(&estimates);
+            let (text, _) = flowsketch_prometheus::render(&finals, &info);
             print!("{text}");
         }
         OutputFormat::Json => {
@@ -71,6 +74,20 @@ pub fn run(pcap_path: &Path, plans: Vec<Plan>, format: OutputFormat, seed: u64) 
         }
     }
     Ok(())
+}
+
+/// Keep only each query's most recent window.
+fn latest_window_only(estimates: &[SketchEstimate]) -> Vec<SketchEstimate> {
+    let mut last_end: std::collections::BTreeMap<&str, u64> = Default::default();
+    for e in estimates {
+        let entry = last_end.entry(e.query_name.as_str()).or_insert(0);
+        *entry = (*entry).max(e.window_end_nanos);
+    }
+    estimates
+        .iter()
+        .filter(|e| last_end[e.query_name.as_str()] == e.window_end_nanos)
+        .cloned()
+        .collect()
 }
 
 fn print_tables(plan_meta: &[(String, String, u64)], estimates: &[SketchEstimate]) {
@@ -113,7 +130,10 @@ fn print_tables(plan_meta: &[(String, String, u64)], estimates: &[SketchEstimate
             .map(|(k, _)| format!("{k:<18}"))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("rank {label_header} {:>16} {:>16} {:>16}", "estimate", "low", "high");
+        println!(
+            "rank {label_header} {:>16} {:>16} {:>16}",
+            "estimate", "low", "high"
+        );
         for (i, e) in rows.iter().take(50).enumerate() {
             let labels = e
                 .group

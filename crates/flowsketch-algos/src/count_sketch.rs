@@ -135,7 +135,8 @@ impl Sketch for CountSketch {
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
-        self.compatibility().ensure_matches(&other.compatibility())?;
+        self.compatibility()
+            .ensure_matches(&other.compatibility())?;
         for (a, b) in self.table.iter_mut().zip(other.table.iter()) {
             *a += *b;
         }
@@ -213,7 +214,10 @@ mod tests {
         a.merge_from(&b).unwrap();
         for i in 0..500u32 {
             let key = format!("k{i}");
-            assert_eq!(a.estimate_signed(key.as_bytes()), whole.estimate_signed(key.as_bytes()));
+            assert_eq!(
+                a.estimate_signed(key.as_bytes()),
+                whole.estimate_signed(key.as_bytes())
+            );
         }
     }
 
@@ -226,7 +230,10 @@ mod tests {
         let s2 = CountSketch::from_snapshot(&s.to_snapshot(0, 1)).unwrap();
         for i in 0..40u32 {
             let key = format!("k{i}");
-            assert_eq!(s.estimate_signed(key.as_bytes()), s2.estimate_signed(key.as_bytes()));
+            assert_eq!(
+                s.estimate_signed(key.as_bytes()),
+                s2.estimate_signed(key.as_bytes())
+            );
         }
     }
 }

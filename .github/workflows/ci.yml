@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Build release CLI
+        run: cargo build --release -p flowsketch-cli
+      - name: End-to-end smoke (synth -> validate -> explain -> replay)
+        run: |
+          BIN=target/release/flowsketch
+          $BIN synth --out /tmp/ci.pcap --packets 50000 --scanners 2 --heavy-talkers 3
+          $BIN validate examples/queries/*.yaml
+          $BIN explain examples/queries/suspected-scanners.yaml
+          $BIN replay /tmp/ci.pcap \
+            --query examples/queries/top-talkers.yaml \
+            --query examples/queries/suspected-scanners.yaml \
+            --format prometheus | head -20

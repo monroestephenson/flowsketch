@@ -142,7 +142,8 @@ impl Sketch for HyperLogLog {
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
-        self.compatibility().ensure_matches(&other.compatibility())?;
+        self.compatibility()
+            .ensure_matches(&other.compatibility())?;
         for (a, b) in self.registers.iter_mut().zip(other.registers.iter()) {
             if *b > *a {
                 *a = *b;
