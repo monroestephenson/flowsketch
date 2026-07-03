@@ -27,10 +27,7 @@ impl WindowSpec {
     }
 
     pub fn describe(&self) -> String {
-        format!(
-            "{}",
-            humanize_nanos(self.size_nanos)
-        )
+        humanize_nanos(self.size_nanos).to_string()
     }
 }
 
@@ -152,8 +149,7 @@ pub struct AlertSpec {
 
 impl AlertSpec {
     pub fn fires(&self, value: f64) -> bool {
-        self.gt.map(|t| value > t).unwrap_or(false)
-            || self.lt.map(|t| value < t).unwrap_or(false)
+        self.gt.map(|t| value > t).unwrap_or(false) || self.lt.map(|t| value < t).unwrap_or(false)
     }
 
     pub fn is_empty(&self) -> bool {

@@ -19,12 +19,21 @@ use crate::hll::HyperLogLog;
 
 pub const ALGORITHM: &str = "hllmap";
 
+/// One tracked key: its HLL plus a lazily refreshed cardinality estimate,
+/// so eviction scans do not recompute every registers array every time.
+#[derive(Debug, Clone)]
+struct Slot {
+    hll: HyperLogLog,
+    cached_cardinality: f64,
+    dirty: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct HllMap {
     max_keys: usize,
     precision: u8,
     hash: HashSpec,
-    map: HashMap<Vec<u8>, HyperLogLog>,
+    map: HashMap<Vec<u8>, Slot>,
     evicted_keys: u64,
     updates: u64,
 }
@@ -71,18 +80,26 @@ impl HllMap {
     /// Record that `key` saw distinct `item`.
     pub fn insert(&mut self, key: &[u8], item: &[u8]) {
         self.updates += 1;
-        if let Some(h) = self.map.get_mut(key) {
-            h.insert(item);
+        if let Some(slot) = self.map.get_mut(key) {
+            slot.hll.insert(item);
+            slot.dirty = true;
             return;
         }
         if self.map.len() >= self.max_keys {
-            // Evict the key with the smallest estimated cardinality.
+            // Refresh only the estimates that changed since the last scan,
+            // then evict the key with the smallest estimated cardinality.
+            for slot in self.map.values_mut() {
+                if slot.dirty {
+                    slot.cached_cardinality = slot.hll.cardinality();
+                    slot.dirty = false;
+                }
+            }
             if let Some(evict) = self
                 .map
                 .iter()
                 .min_by(|a, b| {
-                    a.1.cardinality()
-                        .partial_cmp(&b.1.cardinality())
+                    a.1.cached_cardinality
+                        .partial_cmp(&b.1.cached_cardinality)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(k, _)| k.clone())
@@ -91,13 +108,20 @@ impl HllMap {
                 self.evicted_keys += 1;
             }
         }
-        let mut h = HyperLogLog::new(self.precision, self.hash).expect("validated params");
-        h.insert(item);
-        self.map.insert(key.to_vec(), h);
+        let mut hll = HyperLogLog::new(self.precision, self.hash).expect("validated params");
+        hll.insert(item);
+        self.map.insert(
+            key.to_vec(),
+            Slot {
+                hll,
+                cached_cardinality: 1.0,
+                dirty: false,
+            },
+        );
     }
 
     pub fn cardinality(&self, key: &[u8]) -> Option<f64> {
-        self.map.get(key).map(|h| h.cardinality())
+        self.map.get(key).map(|s| s.hll.cardinality())
     }
 
     /// All tracked keys with estimated cardinality, sorted descending.
@@ -105,10 +129,13 @@ impl HllMap {
         let mut all: Vec<(Vec<u8>, f64)> = self
             .map
             .iter()
-            .map(|(k, h)| (k.clone(), h.cardinality()))
+            .map(|(k, s)| (k.clone(), s.hll.cardinality()))
             .collect();
-        all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0)));
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         all
     }
 
@@ -131,7 +158,9 @@ impl HllMap {
         keys.sort();
         for k in keys {
             payload.lp_bytes(k);
-            let inner = self.map[k].to_snapshot(window_start_nanos, window_end_nanos);
+            let inner = self.map[k]
+                .hll
+                .to_snapshot(window_start_nanos, window_end_nanos);
             payload.lp_bytes(&inner);
         }
         write_snapshot(
@@ -162,8 +191,16 @@ impl HllMap {
         let mut map = HashMap::with_capacity(n);
         for _ in 0..n {
             let key = r.lp_bytes()?.to_vec();
-            let inner = HyperLogLog::from_snapshot(r.lp_bytes()?)?;
-            map.insert(key, inner);
+            let hll = HyperLogLog::from_snapshot(r.lp_bytes()?)?;
+            let cached_cardinality = hll.cardinality();
+            map.insert(
+                key,
+                Slot {
+                    hll,
+                    cached_cardinality,
+                    dirty: false,
+                },
+            );
         }
         Ok(HllMap {
             max_keys,
@@ -190,12 +227,16 @@ impl Sketch for HllMap {
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
-        self.compatibility().ensure_matches(&other.compatibility())?;
-        for (k, h) in &other.map {
+        self.compatibility()
+            .ensure_matches(&other.compatibility())?;
+        for (k, theirs) in &other.map {
             match self.map.get_mut(k) {
-                Some(mine) => mine.merge_from(h)?,
+                Some(mine) => {
+                    mine.hll.merge_from(&theirs.hll)?;
+                    mine.dirty = true;
+                }
                 None => {
-                    self.map.insert(k.clone(), h.clone());
+                    self.map.insert(k.clone(), theirs.clone());
                 }
             }
         }
@@ -204,7 +245,7 @@ impl Sketch for HllMap {
             let mut all: Vec<(Vec<u8>, f64)> = self
                 .map
                 .iter()
-                .map(|(k, h)| (k.clone(), h.cardinality()))
+                .map(|(k, s)| (k.clone(), s.hll.cardinality()))
                 .collect();
             all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (k, _) in all.into_iter().skip(self.max_keys) {
@@ -221,7 +262,7 @@ impl Sketch for HllMap {
         let inner: usize = self
             .map
             .iter()
-            .map(|(k, h)| k.len() + h.memory_bytes() + 32)
+            .map(|(k, s)| k.len() + s.hll.memory_bytes() + 48)
             .sum();
         inner + std::mem::size_of::<Self>()
     }
@@ -256,7 +297,10 @@ mod tests {
         for src in 0..10u32 {
             let fanout = (src + 1) * 100;
             for dst in 0..fanout {
-                m.insert(format!("10.0.0.{src}").as_bytes(), format!("d{dst}").as_bytes());
+                m.insert(
+                    format!("10.0.0.{src}").as_bytes(),
+                    format!("d{dst}").as_bytes(),
+                );
             }
         }
         for src in 0..10u32 {

@@ -50,11 +50,8 @@ impl ExactCounter {
     }
 
     pub fn top_k(&self, limit: usize) -> Vec<(Vec<u8>, u64)> {
-        let mut all: Vec<(Vec<u8>, u64)> = self
-            .counts
-            .iter()
-            .map(|(k, &c)| (k.clone(), c))
-            .collect();
+        let mut all: Vec<(Vec<u8>, u64)> =
+            self.counts.iter().map(|(k, &c)| (k.clone(), c)).collect();
         all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         all.truncate(limit);
         all

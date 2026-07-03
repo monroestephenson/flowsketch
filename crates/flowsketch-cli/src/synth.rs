@@ -29,8 +29,7 @@ pub fn run(
     duration_secs: u64,
     seed: u64,
 ) -> Result<()> {
-    let file =
-        File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
+    let file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
     let mut w = PcapWriter::new(BufWriter::new(file)).context("cannot write pcap header")?;
     let mut rng = Rng(seed);
 

@@ -38,7 +38,9 @@ pub fn render(
     let mut out = String::new();
     let mut dropped: BTreeMap<String, usize> = BTreeMap::new();
 
-    out.push_str("# HELP flowsketch_estimate Approximate query result from a bounded-memory sketch.\n");
+    out.push_str(
+        "# HELP flowsketch_estimate Approximate query result from a bounded-memory sketch.\n",
+    );
     out.push_str("# TYPE flowsketch_estimate gauge\n");
 
     for (query, mut es) in by_query {
@@ -66,10 +68,7 @@ pub fn render(
                 ("error_kind".to_string(), qi.error_kind.clone()),
             ];
             if qi.window_size_nanos > 0 {
-                labels.push((
-                    "window".to_string(),
-                    humanize_nanos(qi.window_size_nanos),
-                ));
+                labels.push(("window".to_string(), humanize_nanos(qi.window_size_nanos)));
             }
             for (name, value) in &e.group {
                 labels.push((sanitize_label_name(name), value.clone()));
@@ -110,7 +109,13 @@ pub fn render(
 pub fn sanitize_label_name(name: &str) -> String {
     let mut s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         s.insert(0, '_');
@@ -120,7 +125,9 @@ pub fn sanitize_label_name(name: &str) -> String {
 
 /// Escape backslash, double-quote, and newline per the exposition format.
 pub fn escape_label_value(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn format_value(v: f64) -> String {

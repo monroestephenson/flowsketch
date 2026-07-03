@@ -143,7 +143,10 @@ pub fn run(algo: Algo, events: u64, keys: u64, dist: Dist) -> Result<()> {
                 .iter()
                 .filter(|(k, _)| sketch.estimate(k) > 0.0)
                 .count();
-            println!("accuracy: precision@100 (truth top-100 tracked) = {}/100", hits);
+            println!(
+                "accuracy: precision@100 (truth top-100 tracked) = {}/100",
+                hits
+            );
             let (are, samples) = avg_relative_error(&*sketch, &exact, &truth_top);
             println!("accuracy: ARE over truth top-{samples} = {are:.4}");
         }

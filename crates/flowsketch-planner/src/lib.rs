@@ -88,8 +88,8 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
 
     let (sketch, error_kind, error_contract, series_bound) = match &query.measure {
         Measure::Count | Measure::Sum { .. } => {
-            let (width, depth) = count_min_dimensions(query.error.epsilon, query.error.delta)
-                .map_err(&reject)?;
+            let (width, depth) =
+                count_min_dimensions(query.error.epsilon, query.error.delta).map_err(&reject)?;
             // Track key identities alongside the counter sketch so results
             // can be enumerated; retention capacity scales with the export
             // cap so the guardrail, not the sketch, bounds series.
@@ -111,7 +111,12 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
                  only the top {} groups by weight are enumerated",
                 query.error.epsilon, query.error.delta, tracker_capacity
             );
-            (sketch, ErrorKind::AdditiveOverestimate, contract, max_series)
+            (
+                sketch,
+                ErrorKind::AdditiveOverestimate,
+                contract,
+                max_series,
+            )
         }
 
         Measure::HeavyHitters { limit, .. } => {
@@ -141,22 +146,21 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
         }
 
         Measure::DistinctCount { .. } => {
-            // For distinct counts the epsilon is interpreted as a relative
-            // standard error; the counting default (0.001) would demand an
-            // enormous HLL, so use a cardinality-appropriate default.
-            let eps = if query.error.epsilon <= 0.001 {
-                warnings.push(format!(
-                    "epsilon {} interpreted as relative std error is very tight for \
-                     distinct_count; using 0.0163 (precision 12). Set measure.error.epsilon \
-                     explicitly to override.",
-                    query.error.epsilon
-                ));
-                0.0163
-            } else {
-                query.error.epsilon
-            };
+            // Epsilon is a relative standard error here (the YAML layer
+            // applies the cardinality-appropriate default). Honor it as
+            // written; if it is tighter than the largest supported HLL can
+            // deliver, plan at max precision and say so.
+            let eps = query.error.epsilon;
             let precision = hll_precision_for_error(eps);
             let rel = 1.04 / ((1u64 << precision) as f64).sqrt();
+            if rel > eps {
+                warnings.push(format!(
+                    "requested epsilon {} is tighter than the best supported HLL precision \
+                     ({precision}) can deliver; plan achieves ~{:.3}% relative standard error",
+                    eps,
+                    rel * 100.0
+                ));
+            }
 
             if query.group_by.is_empty() {
                 let sketch = PhysicalSketch::HyperLogLog { precision };
@@ -210,11 +214,12 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
         )));
     }
 
-    if query
-        .group_by
-        .iter()
-        .any(|f| matches!(f, flowsketch_core::Field::SrcIp | flowsketch_core::Field::DstIp))
-    {
+    if query.group_by.iter().any(|f| {
+        matches!(
+            f,
+            flowsketch_core::Field::SrcIp | flowsketch_core::Field::DstIp
+        )
+    }) {
         warnings.push(
             "raw IP labels can create high series cardinality in Prometheus; \
              export.maxSeries caps this query's output"
@@ -237,7 +242,7 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
 }
 
 fn count_min_dimensions(epsilon: f64, delta: f64) -> Result<(usize, usize), String> {
-    if !(epsilon > 0.0 && epsilon < 1.0) || !(delta > 0.0 && delta < 1.0) {
+    if !(epsilon > 0.0 && epsilon < 1.0 && delta > 0.0 && delta < 1.0) {
         return Err("epsilon and delta must be in (0, 1)".into());
     }
     let width = (std::f64::consts::E / epsilon).ceil() as usize;
@@ -404,6 +409,45 @@ mod tests {
             PhysicalSketch::HyperLogLog { .. }
         ));
         assert_eq!(p.physical.export_series_upper_bound, 1);
+    }
+
+    #[test]
+    fn explicit_tight_distinct_epsilon_is_honored() {
+        // Regression: an explicit epsilon used to be silently replaced with
+        // the default when it was <= 0.001.
+        let p = plan_yaml(
+            "name: d\nwindow: {size: 60s}\ngroupBy: [src.ip]\n\
+             measure: {type: distinct_count, field: dst.ip, error: {epsilon: 0.004}}\n\
+             resources: {maxMemory: 2GiB}\n",
+        )
+        .unwrap();
+        match p.physical.sketch {
+            PhysicalSketch::HllMap { precision, .. } => {
+                // 1.04/sqrt(2^17) ~ 0.29% <= 0.4% < 1.04/sqrt(2^16)
+                assert_eq!(precision, 17, "explicit epsilon not honored");
+            }
+            other => panic!("expected hllmap, got {other:?}"),
+        }
+        assert!(p.physical.warnings.iter().all(|w| !w.contains("tighter")));
+    }
+
+    #[test]
+    fn unachievable_distinct_epsilon_plans_max_precision_with_warning() {
+        let p = plan_yaml(
+            "name: d\nwindow: {size: 60s}\n\
+             measure: {type: distinct_count, field: dst.ip, error: {epsilon: 0.0005}}\n\
+             resources: {maxMemory: 2GiB}\n",
+        )
+        .unwrap();
+        match p.physical.sketch {
+            PhysicalSketch::HyperLogLog { precision } => assert_eq!(precision, 18),
+            other => panic!("expected hll, got {other:?}"),
+        }
+        assert!(
+            p.physical.warnings.iter().any(|w| w.contains("tighter")),
+            "missing achievability warning: {:?}",
+            p.physical.warnings
+        );
     }
 
     #[test]

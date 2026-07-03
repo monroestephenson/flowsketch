@@ -90,11 +90,8 @@ impl MisraGries {
 
     /// Candidates sorted by (under)count descending.
     pub fn candidates(&self) -> Vec<(Vec<u8>, u64)> {
-        let mut all: Vec<(Vec<u8>, u64)> = self
-            .counters
-            .iter()
-            .map(|(k, &c)| (k.clone(), c))
-            .collect();
+        let mut all: Vec<(Vec<u8>, u64)> =
+            self.counters.iter().map(|(k, &c)| (k.clone(), c)).collect();
         all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         all
     }
@@ -181,7 +178,8 @@ impl Sketch for MisraGries {
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
-        self.compatibility().ensure_matches(&other.compatibility())?;
+        self.compatibility()
+            .ensure_matches(&other.compatibility())?;
         for (k, &c) in &other.counters {
             *self.counters.entry(k.clone()).or_insert(0) += c;
         }
@@ -192,11 +190,7 @@ impl Sketch for MisraGries {
     }
 
     fn memory_bytes(&self) -> usize {
-        let entry_bytes: usize = self
-            .counters
-            .keys()
-            .map(|k| k.len() + 8 + 32)
-            .sum();
+        let entry_bytes: usize = self.counters.keys().map(|k| k.len() + 8 + 32).sum();
         entry_bytes + std::mem::size_of::<Self>()
     }
 

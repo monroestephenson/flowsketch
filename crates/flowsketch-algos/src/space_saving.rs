@@ -202,7 +202,8 @@ impl Sketch for SpaceSaving {
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
-        self.compatibility().ensure_matches(&other.compatibility())?;
+        self.compatibility()
+            .ensure_matches(&other.compatibility())?;
         let self_min = if self.entries.len() >= self.capacity {
             self.entries.values().map(|e| e.count).min().unwrap_or(0)
         } else {
@@ -345,7 +346,11 @@ mod tests {
         for (key, e) in a.top_k(20) {
             let k = String::from_utf8(key).unwrap();
             let truth = exact.get(&k).copied().unwrap_or(0);
-            assert!(e.count >= truth, "{k}: merged count {} < truth {truth}", e.count);
+            assert!(
+                e.count >= truth,
+                "{k}: merged count {} < truth {truth}",
+                e.count
+            );
         }
         assert_eq!(a.total_weight(), exact.values().sum::<u64>());
     }

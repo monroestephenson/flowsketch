@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, SpaceSaving};
 use flowsketch_core::field::group_key;
 use flowsketch_core::hash::HashSpec;
-use flowsketch_core::{FlowEvent, Sketch, SketchEstimate, SketchError};
+use flowsketch_core::{FlowEvent, Sketch, SketchError, SketchEstimate};
 use flowsketch_ir::logical::Measure;
 use flowsketch_ir::physical::PhysicalSketch;
 use flowsketch_planner::{ErrorKind, Plan};
@@ -81,10 +81,7 @@ impl QueryState {
             (QueryState::HeavyHitters { ss: a }, QueryState::HeavyHitters { ss: b }) => {
                 a.merge_from(b)
             }
-            (
-                QueryState::Counter { cm: a, keys: ka },
-                QueryState::Counter { cm: b, keys: kb },
-            ) => {
+            (QueryState::Counter { cm: a, keys: ka }, QueryState::Counter { cm: b, keys: kb }) => {
                 a.merge_from(b)?;
                 ka.merge_from(kb)
             }
@@ -253,12 +250,7 @@ impl RunningQuery {
         Ok(())
     }
 
-    fn emit(
-        &self,
-        state: &QueryState,
-        window_start: u64,
-        window_end: u64,
-    ) -> Vec<SketchEstimate> {
+    fn emit(&self, state: &QueryState, window_start: u64, window_end: u64) -> Vec<SketchEstimate> {
         let q = &self.plan.query;
         let p = &self.plan.physical;
         let algorithm = p.sketch.algorithm_name();
@@ -514,8 +506,14 @@ mod tests {
         }
         for h in 0..50u32 {
             for d in 0..3u32 {
-                eng.process(&event(5, &format!("10.1.0.{h}"), &format!("10.2.0.{d}"), 443, 500))
-                    .unwrap();
+                eng.process(&event(
+                    5,
+                    &format!("10.1.0.{h}"),
+                    &format!("10.2.0.{d}"),
+                    443,
+                    500,
+                ))
+                .unwrap();
             }
         }
         eng.finish().unwrap();
@@ -542,7 +540,10 @@ mod tests {
         eng.finish().unwrap();
         let est = eng.take_estimates();
         assert_eq!(est.len(), 1);
-        assert_eq!(est[0].group, vec![("protocol".to_string(), "tcp".to_string())]);
+        assert_eq!(
+            est[0].group,
+            vec![("protocol".to_string(), "tcp".to_string())]
+        );
         assert_eq!(est[0].estimate, 1_000_000.0);
     }
 
@@ -568,15 +569,20 @@ mod tests {
         );
         // Burst in [0s, 10s), then silence until [100s, 110s).
         for _ in 0..10 {
-            eng.process(&event(1, "10.0.0.1", "10.0.0.2", 80, 1_000)).unwrap();
+            eng.process(&event(1, "10.0.0.1", "10.0.0.2", 80, 1_000))
+                .unwrap();
         }
-        eng.process(&event(105, "10.0.0.9", "10.0.0.2", 80, 1)).unwrap();
+        eng.process(&event(105, "10.0.0.9", "10.0.0.2", 80, 1))
+            .unwrap();
         eng.finish().unwrap();
         let est = eng.take_estimates();
         // The final window (ending 110s) must not contain the old burst.
         let last_end = est.iter().map(|e| e.window_end_nanos).max().unwrap();
         for e in est.iter().filter(|e| e.window_end_nanos == last_end) {
-            assert_ne!(e.group[0].1, "10.0.0.1", "expired traffic leaked into final window");
+            assert_ne!(
+                e.group[0].1, "10.0.0.1",
+                "expired traffic leaked into final window"
+            );
         }
     }
 }
