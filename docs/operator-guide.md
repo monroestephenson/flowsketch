@@ -80,9 +80,9 @@ FSK1 headers; mismatches are rejected loudly, never silently merged.
 ## Cardinality guardrails
 
 Every query has a hard `export.maxSeries` cap (default 1000). When the cap
-truncates output, `flowsketch_export_series_dropped_total{query=...}` says
-so. Raw-IP group-by labels produce an explicit plan warning. The planner
-rejects queries whose sketch memory exceeds `resources.maxMemory`.
+truncates output, the `flowsketch_export_series_dropped{query=...}` gauge
+says so. Raw-IP group-by labels produce an explicit plan warning. The
+planner rejects queries whose sketch memory exceeds `resources.maxMemory`.
 
 ## Privacy posture
 
