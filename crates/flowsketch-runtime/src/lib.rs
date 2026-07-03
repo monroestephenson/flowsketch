@@ -280,6 +280,17 @@ impl RunningQuery {
             self.buckets.push_back(self.new_bucket(target)?);
             return Ok(());
         }
+        // If the jump exceeds the whole window, every open bucket expires at
+        // once: flush what we have and restart at the target time. Without
+        // this, a single far-future timestamp (corrupt capture, long-idle
+        // live agent) would spin one iteration per slide across the gap.
+        let back = self.buckets.back().unwrap().start_nanos;
+        if target > back && (target - back) / slide > self.bucket_count() as u64 {
+            self.flush_window(back + slide)?;
+            self.buckets.clear();
+            self.buckets.push_back(self.new_bucket(target)?);
+            return Ok(());
+        }
         while self.buckets.back().unwrap().start_nanos < target {
             let next = self.buckets.back().unwrap().start_nanos + slide;
             // The bucket that just ended closes a window ending at `next`.
@@ -764,6 +775,37 @@ mod tests {
             "uniform entropy {uniform} (expected ~13.3 bits)"
         );
         assert!(uniform > concentrated + 10.0);
+    }
+
+    #[test]
+    fn far_future_timestamp_does_not_spin() {
+        // Regression: a single corrupt/far-future timestamp made advance_to
+        // iterate once per slide interval across the whole gap.
+        let mut eng = engine_for(
+            "name: gap\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
+             measure: {type: heavy_hitters, value: bytes, limit: 10}\n",
+        );
+        eng.process(&event(1, "10.0.0.1", "10.0.0.2", 80, 100))
+            .unwrap();
+        // ~year 2200 in nanos: billions of slides ahead.
+        let mut far = event(0, "10.0.0.9", "10.0.0.2", 80, 55);
+        far.ts_nanos = 7_300_000_000 * 1_000_000_000;
+        let started = std::time::Instant::now();
+        eng.process(&far).unwrap();
+        eng.finish().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "gap advance took {:?}",
+            started.elapsed()
+        );
+        let est = eng.take_estimates();
+        // The pre-gap window flushed with the old host; the final window
+        // contains only the post-gap event.
+        let last_end = est.iter().map(|e| e.window_end_nanos).max().unwrap();
+        for e in est.iter().filter(|e| e.window_end_nanos == last_end) {
+            assert_eq!(e.group[0].1, "10.0.0.9");
+        }
+        assert!(est.iter().any(|e| e.group[0].1 == "10.0.0.1"));
     }
 
     #[test]

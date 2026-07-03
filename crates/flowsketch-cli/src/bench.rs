@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use flowsketch_algos::{
     CountMinSketch, CountSketch, ExactCounter, HyperLogLog, MisraGries, SpaceSaving,
 };
-use flowsketch_core::hash::{splitmix64, HashSpec};
+use flowsketch_core::hash::{HashSpec, SplitMixRng};
 use flowsketch_core::Sketch;
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -25,20 +25,6 @@ pub enum Algo {
 pub enum Dist {
     Uniform,
     Zipf,
-}
-
-/// Deterministic RNG (SplitMix64 stream).
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        splitmix64(self.0)
-    }
-
-    fn next_f64(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
 }
 
 /// Zipf(s=1) sampler over `n` keys via inverse-CDF on a precomputed table.
@@ -61,7 +47,7 @@ impl Zipf {
         Zipf { cdf }
     }
 
-    fn sample(&self, rng: &mut Rng) -> u64 {
+    fn sample(&self, rng: &mut SplitMixRng) -> u64 {
         let u = rng.next_f64();
         self.cdf.partition_point(|&c| c < u) as u64
     }
@@ -84,12 +70,12 @@ pub fn run(algo: Algo, events: u64, keys: u64, dist: Dist) -> Result<()> {
     // Pre-generate the key stream so generation cost is excluded from the
     // measured update loop.
     let zipf = matches!(dist, Dist::Zipf).then(|| Zipf::new(keys));
-    let mut rng = Rng(12345);
+    let mut rng = SplitMixRng::new(12345);
     let mut key_ids: Vec<u64> = Vec::with_capacity(events as usize);
     for _ in 0..events {
         let id = match &zipf {
             Some(z) => z.sample(&mut rng),
-            None => rng.next() % keys,
+            None => rng.next_u64() % keys,
         };
         key_ids.push(id);
     }
@@ -147,23 +133,19 @@ pub fn run(algo: Algo, events: u64, keys: u64, dist: Dist) -> Result<()> {
                 "accuracy: precision@100 (truth top-100 tracked) = {}/100",
                 hits
             );
-            let (are, samples) = avg_relative_error(&*sketch, &exact, &truth_top);
+            let (are, samples) = avg_relative_error(&*sketch, &truth_top);
             println!("accuracy: ARE over truth top-{samples} = {are:.4}");
         }
         Algo::CountMin | Algo::CountSketch => {
             let truth_top: Vec<(Vec<u8>, u64)> = exact.top_k(1000);
-            let (are, samples) = avg_relative_error(&*sketch, &exact, &truth_top);
+            let (are, samples) = avg_relative_error(&*sketch, &truth_top);
             println!("accuracy: ARE over truth top-{samples} = {are:.4}");
         }
     }
     Ok(())
 }
 
-fn avg_relative_error(
-    sketch: &dyn Sketch,
-    _exact: &ExactCounter,
-    truth: &[(Vec<u8>, u64)],
-) -> (f64, usize) {
+fn avg_relative_error(sketch: &dyn Sketch, truth: &[(Vec<u8>, u64)]) -> (f64, usize) {
     let mut total = 0.0;
     for (k, t) in truth {
         let est = sketch.estimate(k);

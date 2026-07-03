@@ -58,6 +58,30 @@ impl Default for HashSpec {
     }
 }
 
+/// Deterministic RNG over the SplitMix64 stream. Used for reproducible
+/// synthetic traffic, benchmarks, and sketch-internal randomness — not for
+/// anything security-sensitive.
+#[derive(Debug, Clone)]
+pub struct SplitMixRng(u64);
+
+impl SplitMixRng {
+    pub fn new(seed: u64) -> Self {
+        SplitMixRng(seed)
+    }
+
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        splitmix64(self.0)
+    }
+
+    /// Uniform in [0, 1).
+    #[inline]
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
 /// SplitMix64 finalizer/mixer. Deterministic, well-distributed, cheap.
 #[inline]
 pub fn splitmix64(mut x: u64) -> u64 {

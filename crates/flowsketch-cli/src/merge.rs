@@ -56,7 +56,7 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
             let merged = merge_all(&blobs, HyperLogLog::from_snapshot)?;
             println!("algorithm: hll");
             println!("merged distinct count: {:.0}", merged.cardinality());
-            merged.to_snapshot(0, 0)
+            merged.to_snapshot(window.0, window.1)
         }
         algorithm_id::SPACE_SAVING => {
             let merged = merge_all(&blobs, SpaceSaving::from_snapshot)?;
@@ -72,7 +72,7 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
                     entry.guaranteed()
                 );
             }
-            merged.to_snapshot(0, 0)
+            merged.to_snapshot(window.0, window.1)
         }
         algorithm_id::HLL_MAP => {
             let merged = merge_all(&blobs, HllMap::from_snapshot)?;
@@ -91,7 +91,7 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
                     card
                 );
             }
-            merged.to_snapshot(0, 0)
+            merged.to_snapshot(window.0, window.1)
         }
         algorithm_id::KLL => {
             let merged = merge_all(&blobs, KllSketch::from_snapshot)?;
@@ -101,7 +101,7 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
                     println!("  p{:<4} {}", (q * 100.0) as u32, v);
                 }
             }
-            merged.to_snapshot(0, 0)
+            merged.to_snapshot(window.0, window.1)
         }
         algorithm_id::COUNT_MIN => {
             let merged = merge_all(&blobs, CountMinSketch::from_snapshot)?;
@@ -112,7 +112,7 @@ pub fn run(files: &[PathBuf], out: Option<&Path>) -> Result<()> {
                 merged.epsilon(),
                 merged.delta()
             );
-            merged.to_snapshot(0, 0)
+            merged.to_snapshot(window.0, window.1)
         }
         other => bail!("snapshots with algorithm id {other} cannot be merged by this tool"),
     };
