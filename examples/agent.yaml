@@ -1,0 +1,23 @@
+# FlowSketch live agent configuration.
+#
+# Demo mode (no privileges needed): replay a pcap and serve results.
+#   flowsketch synth --out demo.pcap --packets 200000
+#   flowsketch agent --config examples/agent.yaml
+#   curl localhost:9464/metrics
+#
+# Live mode: switch source.kind to af_packet (requires CAP_NET_RAW/root):
+#   source:
+#     kind: af_packet
+#     interface: eth0
+agent:
+  nodeName: node-a
+  listen: 127.0.0.1:9464
+  seed: 0
+  flushIntervalMs: 1000
+  source:
+    kind: pcap
+    path: ../demo.pcap
+queries:
+  - file: queries/top-talkers.yaml
+  - file: queries/suspected-scanners.yaml
+  - file: queries/flow-size-quantiles.yaml

@@ -35,3 +35,37 @@ jobs:
             --query examples/queries/top-talkers.yaml \
             --query examples/queries/suspected-scanners.yaml \
             --format prometheus | head -20
+      - name: Agent smoke (pcap source -> HTTP endpoints)
+        run: |
+          BIN=target/release/flowsketch
+          cat > /tmp/agent-ci.yaml <<EOF
+          agent:
+            listen: 127.0.0.1:19464
+            flushIntervalMs: 100
+            source:
+              kind: pcap
+              path: /tmp/ci.pcap
+          queries:
+            - file: $PWD/examples/queries/top-talkers.yaml
+            - file: $PWD/examples/queries/flow-size-quantiles.yaml
+            - file: $PWD/examples/queries/source-entropy.yaml
+          EOF
+          $BIN agent --config /tmp/agent-ci.yaml &
+          AGENT_PID=$!
+          for i in $(seq 1 50); do
+            curl -sf localhost:19464/readyz && break || sleep 0.2
+          done
+          sleep 2
+          curl -sf localhost:19464/healthz
+          curl -sf localhost:19464/metrics | grep -E "flowsketch_(estimate|agent_events_processed_total)" | head -10
+          curl -sf localhost:19464/v1/queries | grep '"algorithm"'
+          kill $AGENT_PID
+      - name: Distributed merge smoke (two replays -> merge-snapshots)
+        run: |
+          BIN=target/release/flowsketch
+          $BIN synth --out /tmp/ci-b.pcap --packets 30000 --scanners 1 --seed 8
+          $BIN replay /tmp/ci.pcap --query examples/queries/suspected-scanners.yaml \
+            --seed 9 --snapshot-out /tmp/snaps-a > /dev/null
+          $BIN replay /tmp/ci-b.pcap --query examples/queries/suspected-scanners.yaml \
+            --seed 9 --snapshot-out /tmp/snaps-b > /dev/null
+          $BIN merge-snapshots /tmp/snaps-a/*.fsk1 /tmp/snaps-b/*.fsk1

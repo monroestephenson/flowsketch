@@ -10,6 +10,7 @@ pub mod count_sketch;
 pub mod exact;
 pub mod hll;
 pub mod hll_map;
+pub mod kll;
 pub mod misra_gries;
 pub mod space_saving;
 
@@ -18,5 +19,6 @@ pub use count_sketch::CountSketch;
 pub use exact::ExactCounter;
 pub use hll::HyperLogLog;
 pub use hll_map::HllMap;
+pub use kll::KllSketch;
 pub use misra_gries::MisraGries;
 pub use space_saving::SpaceSaving;

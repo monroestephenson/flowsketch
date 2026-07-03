@@ -36,6 +36,7 @@ pub mod algorithm_id {
     pub const MISRA_GRIES: u16 = 5;
     pub const HLL_MAP: u16 = 6;
     pub const EXACT: u16 = 7;
+    pub const KLL: u16 = 8;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
