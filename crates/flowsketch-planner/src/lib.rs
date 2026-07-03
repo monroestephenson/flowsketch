@@ -39,6 +39,10 @@ pub enum ErrorKind {
     Relative,
     /// Counts of tracked keys are upper bounds with per-key error terms.
     CandidateUpperBound,
+    /// The returned value's true rank is within epsilon*n of the request.
+    RankError,
+    /// A composed estimator without a formal single-number bound.
+    Heuristic,
 }
 
 impl ErrorKind {
@@ -47,6 +51,8 @@ impl ErrorKind {
             ErrorKind::AdditiveOverestimate => "additive-overestimate",
             ErrorKind::Relative => "relative",
             ErrorKind::CandidateUpperBound => "candidate-upper-bound",
+            ErrorKind::RankError => "rank-error",
+            ErrorKind::Heuristic => "heuristic",
         }
     }
 }
@@ -186,17 +192,62 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
         }
 
         Measure::Entropy { .. } => {
-            return Err(reject(
-                "entropy is not supported in v0; planned via UnivMon-style distribution \
-                 sketches in a later release"
-                    .into(),
-            ))
+            if !query.group_by.is_empty() {
+                return Err(reject(
+                    "grouped entropy is not supported yet (it needs a bounded keyed \
+                     distribution sketch); drop groupBy to measure the field's global \
+                     entropy per window"
+                        .into(),
+                ));
+            }
+            // Composite estimator: SpaceSaving captures the head of the
+            // distribution exactly-ish; HLL sizes the tail's support so the
+            // remaining mass can be treated as uniform over it.
+            let capacity = ((1.0 / query.error.epsilon).ceil() as usize).clamp(256, 1 << 16);
+            let precision = hll_precision_for_error(0.0163);
+            let sketch = PhysicalSketch::Composite {
+                stages: vec![
+                    PhysicalSketch::SpaceSaving { capacity },
+                    PhysicalSketch::HyperLogLog { precision },
+                ],
+            };
+            let contract = format!(
+                "heuristic: exact head entropy over the top {capacity} values plus a \
+                 uniform-tail correction sized by an HLL distinct count (precision \
+                 {precision}); no formal single-number bound — validate against \
+                 `flowsketch bench` for your traffic shape"
+            );
+            (sketch, ErrorKind::Heuristic, contract, 1)
         }
-        Measure::Quantile { .. } => {
-            return Err(reject(
-                "quantile is not supported in v0; planned via KLL sketches in a later release"
-                    .into(),
-            ))
+
+        Measure::Quantile { q, .. } => {
+            if !query.group_by.is_empty() {
+                return Err(reject(
+                    "grouped quantile is not supported yet (it needs a bounded keyed \
+                     KLL map); drop groupBy to measure the field's global distribution \
+                     per window"
+                        .into(),
+                ));
+            }
+            if !(0.0..=1.0).contains(q) {
+                return Err(reject(format!("quantile q must be in [0, 1], got {q}")));
+            }
+            // Epsilon is a normalized rank error here.
+            let eps = query.error.epsilon;
+            let k = kll_k_for_error(eps);
+            let achieved = 2.3 / k as f64;
+            if achieved > eps {
+                warnings.push(format!(
+                    "requested rank error {eps} is tighter than the largest supported \
+                     KLL (k={k}) delivers; plan achieves ~{achieved:.5}"
+                ));
+            }
+            let sketch = PhysicalSketch::Kll { k };
+            let contract = format!(
+                "returned value's true rank is within ~{achieved:.4} * n of the requested \
+                 quantile with high probability (KLL, k={k})"
+            );
+            (sketch, ErrorKind::RankError, contract, 1)
         }
     };
 
@@ -253,6 +304,12 @@ fn count_min_dimensions(epsilon: f64, delta: f64) -> Result<(usize, usize), Stri
 fn hll_precision_for_error(epsilon: f64) -> u8 {
     let m = (1.04 / epsilon).powi(2);
     (m.log2().ceil() as i64).clamp(4, 18) as u8
+}
+
+/// Smallest KLL `k` whose normalized rank error (~2.3/k) is <= `epsilon`.
+/// Mirrors `flowsketch_algos::KllSketch::k_for_error`.
+fn kll_k_for_error(epsilon: f64) -> usize {
+    ((2.3 / epsilon).ceil() as usize).clamp(8, 1 << 16)
 }
 
 /// Render a byte count for humans.
@@ -478,12 +535,47 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_measures_are_rejected_with_direction() {
+    fn grouped_entropy_and_quantile_are_rejected_with_direction() {
         let err = plan_yaml(
             "name: e\nwindow: {size: 30s}\ngroupBy: [dst.ip]\nmeasure: {type: entropy, field: src.ip}\n",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("not supported in v0"));
+        assert!(err.to_string().contains("grouped entropy"));
+
+        let err = plan_yaml(
+            "name: q\nwindow: {size: 30s}\ngroupBy: [dst.ip]\nmeasure: {type: quantile, field: bytes, q: 0.99}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("grouped quantile"));
+    }
+
+    #[test]
+    fn ungrouped_quantile_plans_kll() {
+        let p = plan_yaml(
+            "name: q\nwindow: {size: 30s}\nmeasure: {type: quantile, field: bytes, q: 0.99, error: {epsilon: 0.01}}\n",
+        )
+        .unwrap();
+        match p.physical.sketch {
+            PhysicalSketch::Kll { k } => assert_eq!(k, 230),
+            other => panic!("expected kll, got {other:?}"),
+        }
+        assert_eq!(p.physical.error_kind, ErrorKind::RankError);
+        assert_eq!(p.physical.export_series_upper_bound, 1);
+    }
+
+    #[test]
+    fn ungrouped_entropy_plans_head_tail_composite() {
+        let p =
+            plan_yaml("name: e\nwindow: {size: 30s}\nmeasure: {type: entropy, field: src.ip}\n")
+                .unwrap();
+        match &p.physical.sketch {
+            PhysicalSketch::Composite { stages } => {
+                assert!(matches!(stages[0], PhysicalSketch::SpaceSaving { .. }));
+                assert!(matches!(stages[1], PhysicalSketch::HyperLogLog { .. }));
+            }
+            other => panic!("expected composite, got {other:?}"),
+        }
+        assert_eq!(p.physical.error_kind, ErrorKind::Heuristic);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# Source-address entropy (bits) per window. A sudden drop means traffic
+# concentrated on few sources; a sudden rise can mean spoofed-source DDoS.
+# Heuristic estimator: SpaceSaving head + HLL-sized uniform tail.
+name: source_entropy
+window:
+  size: 30s
+  slide: 10s
+measure:
+  type: entropy
+  field: src.ip
+export:
+  prometheus: true
+  maxSeries: 1

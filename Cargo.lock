@@ -111,6 +111,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "flowsketch-agent"
+version = "0.1.0"
+dependencies = [
+ "flowsketch-core",
+ "flowsketch-ir",
+ "flowsketch-pcap",
+ "flowsketch-planner",
+ "flowsketch-prometheus",
+ "flowsketch-runtime",
+ "libc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+]
+
+[[package]]
 name = "flowsketch-algos"
 version = "0.1.0"
 dependencies = [
@@ -123,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "flowsketch-agent",
  "flowsketch-algos",
  "flowsketch-core",
  "flowsketch-ir",
@@ -220,6 +238,12 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "memchr"

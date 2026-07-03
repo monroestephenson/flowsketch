@@ -59,6 +59,24 @@ underestimate by at most `N/(k+1)`; every key above that is guaranteed
 present. Merge = add summaries, then trim back to capacity by subtracting
 the (excess+1)-smallest count — the standard mergeable-summaries result.
 
+## KLL (`kll.rs`)
+
+Quantile sketch (Karnin-Lang-Liberty): levels of buffers where level `l`
+holds weight-`2^l` items; overflow sorts the level and promotes a random
+parity half. Capacities decay by 2/3 from `k` at the top (floor 8), giving
+~3k stored items total. Normalized rank error ~ `2.3/k`. Compaction parity
+comes from a seeded SplitMix64 stream, so equal-seed sketches are
+byte-deterministic (golden-tested). Merge concatenates levels and
+recompresses.
+
+## Entropy estimator (runtime composite)
+
+Not a single sketch: the runtime combines a SpaceSaving head (guaranteed
+counts give exact-ish `-p log2 p` terms) with an HLL that sizes the tail's
+support, treating residual mass as uniform over it. Labeled `heuristic` in
+every export. Grouped entropy needs a bounded keyed distribution sketch
+and is deliberately deferred.
+
 ## Exact counter (`exact.rs`)
 
 Unbounded hash-map counter and distinct-set tracker. Never planned for

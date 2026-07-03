@@ -17,7 +17,13 @@ use flowsketch_runtime::QueryEngine;
 
 use crate::{export_info, OutputFormat};
 
-pub fn run(pcap_path: &Path, plans: Vec<Plan>, format: OutputFormat, seed: u64) -> Result<()> {
+pub fn run(
+    pcap_path: &Path,
+    plans: Vec<Plan>,
+    format: OutputFormat,
+    seed: u64,
+    snapshot_out: Option<&Path>,
+) -> Result<()> {
     let info = export_info(&plans);
     let plan_meta: Vec<(String, String, u64)> = plans
         .iter()
@@ -45,6 +51,19 @@ pub fn run(pcap_path: &Path, plans: Vec<Plan>, format: OutputFormat, seed: u64) 
     }
     engine.finish().context("final window flush failed")?;
     let elapsed = started.elapsed();
+
+    if let Some(dir) = snapshot_out {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        for snap in engine
+            .export_snapshots()
+            .context("snapshot export failed")?
+        {
+            let file = dir.join(format!("{}.{}.fsk1", snap.query_name, snap.component));
+            std::fs::write(&file, &snap.bytes)
+                .with_context(|| format!("cannot write {}", file.display()))?;
+            eprintln!("wrote snapshot {}", file.display());
+        }
+    }
 
     let estimates = engine.take_estimates();
 

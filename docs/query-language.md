@@ -49,8 +49,8 @@ bytes  packets  interface.index  node.id
 | `sum`            | `value` (bytes/packets) | summed value per group             |
 | `heavy_hitters`  | `value`, `limit`  | top-`limit` groups by summed value       |
 | `distinct_count` | `field`           | approx. distinct `field` values per group|
-| `entropy`        | `field`           | **rejected in v0** (planned)             |
-| `quantile`       | `field`, `q`      | **rejected in v0** (planned)             |
+| `entropy`        | `field`           | empirical entropy (bits) of `field` — ungrouped only |
+| `quantile`       | `field`, `q`      | value at quantile `q` of a numeric field — ungrouped only |
 
 ## Windows
 
@@ -64,6 +64,8 @@ merged at each slide boundary. Estimates are emitted once per slide.
 - `size` must be a positive multiple of `slide`
 - `heavy_hitters` requires `groupBy` (the identities being ranked)
 - `distinct_count`'s `field` must not also appear in `groupBy`
+- `entropy` and `quantile` reject `groupBy` (bounded keyed distribution
+  sketches are a later phase); `q` must be in [0, 1]
 - `epsilon`/`delta` must be in (0, 1); `maxSeries` must be positive
 - plans whose estimated memory exceeds `resources.maxMemory` are rejected
   at plan time with a suggestion (loosen epsilon, shrink window, raise budget)

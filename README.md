@@ -17,10 +17,20 @@
 >   --query examples/queries/suspected-scanners.yaml
 > ```
 >
+> Beyond the v0 MVP, the following are also implemented:
+>
+> - **live agent** (`flowsketch-agent`, Phase 3): pcap or AF_PACKET capture
+>   feeding the engine, with HTTP `/metrics`, `/healthz`, `/readyz`, and
+>   `/v1/queries` (`flowsketch agent --config examples/agent.yaml`)
+> - **KLL quantile sketch** and the `quantile` measure (e.g. packet-size p99)
+> - **entropy measure** (ungrouped): SpaceSaving-head + HLL-tail estimator
+> - **cross-process sketch merge**: `flowsketch replay --snapshot-out` +
+>   `flowsketch merge-snapshots` (the Phase 7 distributed-merge primitive)
+>
 > See `docs/operator-guide.md`, `docs/query-language.md`,
 > `docs/accuracy-contracts.md`, and `docs/algorithm-notes.md`. Everything
-> below this block is the original design plan; later phases (live agent,
-> OTLP, Kubernetes, eBPF, gateway) are not yet built.
+> below this block is the original design plan; the remaining phases (OTLP,
+> Kubernetes, eBPF, gateway service) are not yet built.
 
 ## 0. Core thesis
 
