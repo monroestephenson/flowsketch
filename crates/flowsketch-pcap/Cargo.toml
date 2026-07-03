@@ -1,0 +1,12 @@
+[package]
+name = "flowsketch-pcap"
+description = "FlowSketch offline replay: classic pcap reading and L2/L3/L4 header parsing into flow events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }
+thiserror = { workspace = true }

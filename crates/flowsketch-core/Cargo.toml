@@ -1,0 +1,12 @@
+[package]
+name = "flowsketch-core"
+description = "FlowSketch core: flow event model, fields, seeded hashing, sketch traits, estimates, snapshot format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

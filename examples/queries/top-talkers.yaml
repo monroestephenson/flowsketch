@@ -1,0 +1,15 @@
+# Top talkers: the src/dst pairs moving the most bytes.
+name: top_talkers
+window:
+  size: 60s
+  slide: 10s
+groupBy:
+  - src.ip
+  - dst.ip
+measure:
+  type: heavy_hitters
+  value: bytes
+  limit: 100
+export:
+  prometheus: true
+  maxSeries: 100

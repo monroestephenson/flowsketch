@@ -1,0 +1,12 @@
+# Byte volume per protocol: a low-cardinality sanity query.
+name: protocol_bytes
+window:
+  size: 60s
+groupBy:
+  - protocol
+measure:
+  type: sum
+  value: bytes
+export:
+  prometheus: true
+  maxSeries: 32
