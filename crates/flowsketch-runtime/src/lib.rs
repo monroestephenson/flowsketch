@@ -3,15 +3,30 @@
 //! sketches from flow events, and emits `SketchEstimate`s when windows
 //! close.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, KllSketch, SpaceSaving};
 use flowsketch_core::field::group_key;
 use flowsketch_core::hash::HashSpec;
+use flowsketch_core::snapshot::read_snapshot;
 use flowsketch_core::{FlowEvent, Sketch, SketchError, SketchEstimate};
 use flowsketch_ir::logical::Measure;
 use flowsketch_ir::physical::PhysicalSketch;
 use flowsketch_planner::{ErrorKind, Plan};
+
+/// Component names tagging each FSK1 blob of a (possibly multi-sketch)
+/// query state. Shared by snapshot export and reconstruction so the two
+/// sides cannot drift.
+pub mod component {
+    pub const SPACESAVING: &str = "spacesaving";
+    pub const COUNT_MIN: &str = "count-min";
+    pub const KEYS_SPACESAVING: &str = "keys-spacesaving";
+    pub const HLLMAP: &str = "hllmap";
+    pub const HLL: &str = "hll";
+    pub const KLL: &str = "kll";
+    pub const HEAD_SPACESAVING: &str = "head-spacesaving";
+    pub const TAIL_HLL: &str = "tail-hll";
+}
 
 /// Sketch state for one window bucket of one query.
 #[derive(Debug, Clone)]
@@ -147,22 +162,208 @@ impl QueryState {
     fn to_snapshots(&self, ws: u64, we: u64) -> Vec<(String, Vec<u8>)> {
         match self {
             QueryState::HeavyHitters { ss } => {
-                vec![("spacesaving".into(), ss.to_snapshot(ws, we))]
+                vec![(component::SPACESAVING.into(), ss.to_snapshot(ws, we))]
             }
             QueryState::Counter { cm, keys } => vec![
-                ("count-min".into(), cm.to_snapshot(ws, we)),
-                ("keys-spacesaving".into(), keys.to_snapshot(ws, we)),
+                (component::COUNT_MIN.into(), cm.to_snapshot(ws, we)),
+                (component::KEYS_SPACESAVING.into(), keys.to_snapshot(ws, we)),
             ],
             QueryState::DistinctPerKey { map } => {
-                vec![("hllmap".into(), map.to_snapshot(ws, we))]
+                vec![(component::HLLMAP.into(), map.to_snapshot(ws, we))]
             }
-            QueryState::DistinctGlobal { hll } => vec![("hll".into(), hll.to_snapshot(ws, we))],
-            QueryState::Quantile { kll } => vec![("kll".into(), kll.to_snapshot(ws, we))],
+            QueryState::DistinctGlobal { hll } => {
+                vec![(component::HLL.into(), hll.to_snapshot(ws, we))]
+            }
+            QueryState::Quantile { kll } => vec![(component::KLL.into(), kll.to_snapshot(ws, we))],
             QueryState::Entropy { ss, hll } => vec![
-                ("head-spacesaving".into(), ss.to_snapshot(ws, we)),
-                ("tail-hll".into(), hll.to_snapshot(ws, we)),
+                (component::HEAD_SPACESAVING.into(), ss.to_snapshot(ws, we)),
+                (component::TAIL_HLL.into(), hll.to_snapshot(ws, we)),
             ],
         }
+    }
+
+    /// The component names this physical plan's state serializes to.
+    fn component_names(sketch: &PhysicalSketch) -> Result<&'static [&'static str], SketchError> {
+        match sketch {
+            PhysicalSketch::SpaceSaving { .. } => Ok(&[component::SPACESAVING]),
+            PhysicalSketch::HllMap { .. } => Ok(&[component::HLLMAP]),
+            PhysicalSketch::HyperLogLog { .. } => Ok(&[component::HLL]),
+            PhysicalSketch::Kll { .. } => Ok(&[component::KLL]),
+            PhysicalSketch::Composite { stages } => match stages.as_slice() {
+                [PhysicalSketch::SpaceSaving { .. }, PhysicalSketch::CountMin { .. }] => {
+                    Ok(&[component::COUNT_MIN, component::KEYS_SPACESAVING])
+                }
+                [PhysicalSketch::SpaceSaving { .. }, PhysicalSketch::HyperLogLog { .. }] => {
+                    Ok(&[component::HEAD_SPACESAVING, component::TAIL_HLL])
+                }
+                other => Err(SketchError::InvalidParam(format!(
+                    "runtime cannot execute composite plan {other:?}"
+                ))),
+            },
+            other => Err(SketchError::InvalidParam(format!(
+                "runtime cannot execute plan {other:?}"
+            ))),
+        }
+    }
+
+    /// Rebuild a state from named component snapshots (the inverse of
+    /// `to_snapshots`). Parameters come from the snapshots themselves;
+    /// callers validate them against a plan via `WindowState`.
+    fn from_snapshots(
+        sketch: &PhysicalSketch,
+        components: &BTreeMap<&str, &[u8]>,
+    ) -> Result<Self, SketchError> {
+        let get = |name: &str| -> Result<&[u8], SketchError> {
+            components.get(name).copied().ok_or_else(|| {
+                SketchError::Snapshot(format!("missing component snapshot {name:?}"))
+            })
+        };
+        match sketch {
+            PhysicalSketch::SpaceSaving { .. } => Ok(QueryState::HeavyHitters {
+                ss: SpaceSaving::from_snapshot(get(component::SPACESAVING)?)?,
+            }),
+            PhysicalSketch::HllMap { .. } => Ok(QueryState::DistinctPerKey {
+                map: HllMap::from_snapshot(get(component::HLLMAP)?)?,
+            }),
+            PhysicalSketch::HyperLogLog { .. } => Ok(QueryState::DistinctGlobal {
+                hll: HyperLogLog::from_snapshot(get(component::HLL)?)?,
+            }),
+            PhysicalSketch::Kll { .. } => Ok(QueryState::Quantile {
+                kll: KllSketch::from_snapshot(get(component::KLL)?)?,
+            }),
+            PhysicalSketch::Composite { stages } => match stages.as_slice() {
+                [PhysicalSketch::SpaceSaving { .. }, PhysicalSketch::CountMin { .. }] => {
+                    Ok(QueryState::Counter {
+                        cm: CountMinSketch::from_snapshot(get(component::COUNT_MIN)?)?,
+                        keys: SpaceSaving::from_snapshot(get(component::KEYS_SPACESAVING)?)?,
+                    })
+                }
+                [PhysicalSketch::SpaceSaving { .. }, PhysicalSketch::HyperLogLog { .. }] => {
+                    Ok(QueryState::Entropy {
+                        ss: SpaceSaving::from_snapshot(get(component::HEAD_SPACESAVING)?)?,
+                        hll: HyperLogLog::from_snapshot(get(component::TAIL_HLL)?)?,
+                    })
+                }
+                other => Err(SketchError::InvalidParam(format!(
+                    "runtime cannot execute composite plan {other:?}"
+                ))),
+            },
+            other => Err(SketchError::InvalidParam(format!(
+                "runtime cannot execute plan {other:?}"
+            ))),
+        }
+    }
+}
+
+/// One query window's sketch state reconstructed from FSK1 component
+/// snapshots — the unit the gateway receives from agents, merges across
+/// nodes, and emits cluster-level estimates from.
+#[derive(Debug, Clone)]
+pub struct WindowState {
+    state: QueryState,
+    window_start_nanos: u64,
+    window_end_nanos: u64,
+}
+
+impl WindowState {
+    /// Parse component snapshots for one query and validate them against
+    /// the local `plan` and `hash`: all components must cover the same
+    /// window, the component set must match the plan's physical shape, and
+    /// each sketch must be merge-compatible with a freshly built instance
+    /// of the plan (same algorithm, parameters, and hash spec) — the exact
+    /// checks distributed merge correctness depends on.
+    pub fn from_components(
+        plan: &Plan,
+        hash: &HashSpec,
+        components: &[(String, Vec<u8>)],
+    ) -> Result<Self, SketchError> {
+        let expected = QueryState::component_names(&plan.physical.sketch)?;
+        let mut window: Option<(u64, u64)> = None;
+        let mut by_name: BTreeMap<&str, &[u8]> = BTreeMap::new();
+        for (name, bytes) in components {
+            if !expected.contains(&name.as_str()) {
+                return Err(SketchError::Snapshot(format!(
+                    "unexpected component snapshot {name:?} (plan expects {expected:?})"
+                )));
+            }
+            if by_name.insert(name.as_str(), bytes.as_slice()).is_some() {
+                return Err(SketchError::Snapshot(format!(
+                    "duplicate component snapshot {name:?}"
+                )));
+            }
+            let (header, _, _) = read_snapshot(bytes)?;
+            let w = (header.window_start_nanos, header.window_end_nanos);
+            match window {
+                None => window = Some(w),
+                Some(prev) if prev != w => {
+                    return Err(SketchError::IncompatibleMerge(format!(
+                        "component {name:?} covers window [{}, {}) but its siblings cover \
+                         [{}, {})",
+                        w.0, w.1, prev.0, prev.1
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        let Some((window_start_nanos, window_end_nanos)) = window else {
+            return Err(SketchError::Snapshot("no component snapshots given".into()));
+        };
+
+        let parsed = QueryState::from_snapshots(&plan.physical.sketch, &by_name)?;
+        // Merging into an empty state built from the plan runs the same
+        // compatibility validation (params + hash spec) node merges use.
+        let mut state = QueryState::build(&plan.physical.sketch, hash)?;
+        state.merge_from(&parsed)?;
+        Ok(WindowState {
+            state,
+            window_start_nanos,
+            window_end_nanos,
+        })
+    }
+
+    /// Merge another node's state for the same query. Sketch compatibility
+    /// is validated by the sketches; identical window bounds are enforced
+    /// here so different time ranges never blend into one estimate.
+    pub fn merge_from(&mut self, other: &WindowState) -> Result<(), SketchError> {
+        if (self.window_start_nanos, self.window_end_nanos)
+            != (other.window_start_nanos, other.window_end_nanos)
+        {
+            return Err(SketchError::IncompatibleMerge(format!(
+                "window mismatch: [{}, {}) vs [{}, {})",
+                self.window_start_nanos,
+                self.window_end_nanos,
+                other.window_start_nanos,
+                other.window_end_nanos
+            )));
+        }
+        self.state.merge_from(&other.state)
+    }
+
+    /// Estimates for this (possibly merged) window, using the plan's
+    /// measure semantics, export caps, and alert thresholds.
+    pub fn estimates(&self, plan: &Plan) -> Vec<SketchEstimate> {
+        emit_estimates(
+            plan,
+            &self.state,
+            self.window_start_nanos,
+            self.window_end_nanos,
+        )
+    }
+
+    pub fn window_start_nanos(&self) -> u64 {
+        self.window_start_nanos
+    }
+
+    pub fn window_end_nanos(&self) -> u64 {
+        self.window_end_nanos
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.state.memory_bytes()
+    }
+
+    pub fn update_count(&self) -> u64 {
+        self.state.update_count()
     }
 }
 
@@ -368,116 +569,128 @@ impl RunningQuery {
     }
 
     fn emit(&self, state: &QueryState, window_start: u64, window_end: u64) -> Vec<SketchEstimate> {
-        let q = &self.plan.query;
-        let p = &self.plan.physical;
-        let algorithm = p.sketch.algorithm_name();
-        let sketch_bytes = state.memory_bytes() as u64;
-        let update_count = state.update_count();
-        let cap = p.export_series_upper_bound.min(q.export.max_series);
-
-        let label_names: Vec<String> = q.group_by.iter().map(|f| f.name().to_string()).collect();
-        let make_group = |key: &[u8]| -> Vec<(String, String)> {
-            label_names
-                .iter()
-                .cloned()
-                .zip(flowsketch_core::field::split_group_key(key))
-                .collect()
-        };
-        let base = |group: Vec<(String, String)>, estimate: f64| SketchEstimate {
-            query_name: q.name.clone(),
-            window_start_nanos: window_start,
-            window_end_nanos: window_end,
-            group,
-            estimate,
-            lower_bound: None,
-            upper_bound: None,
-            confidence: None,
-            algorithm: algorithm.clone(),
-            sketch_bytes,
-            update_count,
-        };
-
-        let mut out: Vec<SketchEstimate> = match state {
-            QueryState::HeavyHitters { ss } => ss
-                .top_k(cap)
-                .into_iter()
-                .map(|(key, entry)| {
-                    let mut e = base(make_group(&key), entry.count as f64);
-                    e.upper_bound = Some(entry.count as f64);
-                    e.lower_bound = Some(entry.guaranteed() as f64);
-                    e
-                })
-                .collect(),
-
-            QueryState::Counter { cm, keys } => keys
-                .top_k(cap)
-                .into_iter()
-                .map(|(key, _)| {
-                    let est = cm.estimate_u64(&key) as f64;
-                    let slack = cm.epsilon() * cm.total_weight() as f64;
-                    let mut e = base(make_group(&key), est);
-                    e.upper_bound = Some(est);
-                    e.lower_bound = Some((est - slack).max(0.0));
-                    e.confidence = Some(1.0 - cm.delta());
-                    e
-                })
-                .collect(),
-
-            QueryState::DistinctPerKey { map } => {
-                let rel = map.relative_error();
-                map.entries()
-                    .into_iter()
-                    .take(cap)
-                    .map(|(key, card)| {
-                        let mut e = base(make_group(&key), card);
-                        e.lower_bound = Some(card * (1.0 - 2.0 * rel));
-                        e.upper_bound = Some(card * (1.0 + 2.0 * rel));
-                        e.confidence = Some(0.95);
-                        e
-                    })
-                    .collect()
-            }
-
-            QueryState::DistinctGlobal { hll } => {
-                let card = hll.cardinality();
-                let rel = hll.relative_error();
-                let mut e = base(Vec::new(), card);
-                e.lower_bound = Some(card * (1.0 - 2.0 * rel));
-                e.upper_bound = Some(card * (1.0 + 2.0 * rel));
-                e.confidence = Some(0.95);
-                vec![e]
-            }
-
-            QueryState::Quantile { kll } => {
-                let Measure::Quantile { q: quantile, .. } = &q.measure else {
-                    return Vec::new();
-                };
-                let Some(value) = kll.quantile(*quantile) else {
-                    return Vec::new();
-                };
-                let eps = kll.rank_error();
-                let mut e = base(Vec::new(), value as f64);
-                // Rank error translates to value bounds by querying the
-                // neighboring quantiles.
-                e.lower_bound = kll.quantile((quantile - eps).max(0.0)).map(|v| v as f64);
-                e.upper_bound = kll.quantile((quantile + eps).min(1.0)).map(|v| v as f64);
-                e.confidence = Some(0.99);
-                vec![e]
-            }
-
-            QueryState::Entropy { ss, hll } => {
-                let Some(entropy_bits) = estimate_entropy_bits(ss, hll) else {
-                    return Vec::new();
-                };
-                vec![base(Vec::new(), entropy_bits)]
-            }
-        };
-
-        if !q.alert.is_empty() {
-            out.retain(|e| q.alert.fires(e.estimate));
-        }
-        out
+        emit_estimates(&self.plan, state, window_start, window_end)
     }
+}
+
+/// Estimates for one query window state under `plan`'s measure semantics,
+/// export caps, and alert thresholds. Shared by the live engine and the
+/// gateway's cross-node merge path.
+fn emit_estimates(
+    plan: &Plan,
+    state: &QueryState,
+    window_start: u64,
+    window_end: u64,
+) -> Vec<SketchEstimate> {
+    let q = &plan.query;
+    let p = &plan.physical;
+    let algorithm = p.sketch.algorithm_name();
+    let sketch_bytes = state.memory_bytes() as u64;
+    let update_count = state.update_count();
+    let cap = p.export_series_upper_bound.min(q.export.max_series);
+
+    let label_names: Vec<String> = q.group_by.iter().map(|f| f.name().to_string()).collect();
+    let make_group = |key: &[u8]| -> Vec<(String, String)> {
+        label_names
+            .iter()
+            .cloned()
+            .zip(flowsketch_core::field::split_group_key(key))
+            .collect()
+    };
+    let base = |group: Vec<(String, String)>, estimate: f64| SketchEstimate {
+        query_name: q.name.clone(),
+        window_start_nanos: window_start,
+        window_end_nanos: window_end,
+        group,
+        estimate,
+        lower_bound: None,
+        upper_bound: None,
+        confidence: None,
+        algorithm: algorithm.clone(),
+        sketch_bytes,
+        update_count,
+    };
+
+    let mut out: Vec<SketchEstimate> = match state {
+        QueryState::HeavyHitters { ss } => ss
+            .top_k(cap)
+            .into_iter()
+            .map(|(key, entry)| {
+                let mut e = base(make_group(&key), entry.count as f64);
+                e.upper_bound = Some(entry.count as f64);
+                e.lower_bound = Some(entry.guaranteed() as f64);
+                e
+            })
+            .collect(),
+
+        QueryState::Counter { cm, keys } => keys
+            .top_k(cap)
+            .into_iter()
+            .map(|(key, _)| {
+                let est = cm.estimate_u64(&key) as f64;
+                let slack = cm.epsilon() * cm.total_weight() as f64;
+                let mut e = base(make_group(&key), est);
+                e.upper_bound = Some(est);
+                e.lower_bound = Some((est - slack).max(0.0));
+                e.confidence = Some(1.0 - cm.delta());
+                e
+            })
+            .collect(),
+
+        QueryState::DistinctPerKey { map } => {
+            let rel = map.relative_error();
+            map.entries()
+                .into_iter()
+                .take(cap)
+                .map(|(key, card)| {
+                    let mut e = base(make_group(&key), card);
+                    e.lower_bound = Some(card * (1.0 - 2.0 * rel));
+                    e.upper_bound = Some(card * (1.0 + 2.0 * rel));
+                    e.confidence = Some(0.95);
+                    e
+                })
+                .collect()
+        }
+
+        QueryState::DistinctGlobal { hll } => {
+            let card = hll.cardinality();
+            let rel = hll.relative_error();
+            let mut e = base(Vec::new(), card);
+            e.lower_bound = Some(card * (1.0 - 2.0 * rel));
+            e.upper_bound = Some(card * (1.0 + 2.0 * rel));
+            e.confidence = Some(0.95);
+            vec![e]
+        }
+
+        QueryState::Quantile { kll } => {
+            let Measure::Quantile { q: quantile, .. } = &q.measure else {
+                return Vec::new();
+            };
+            let Some(value) = kll.quantile(*quantile) else {
+                return Vec::new();
+            };
+            let eps = kll.rank_error();
+            let mut e = base(Vec::new(), value as f64);
+            // Rank error translates to value bounds by querying the
+            // neighboring quantiles.
+            e.lower_bound = kll.quantile((quantile - eps).max(0.0)).map(|v| v as f64);
+            e.upper_bound = kll.quantile((quantile + eps).min(1.0)).map(|v| v as f64);
+            e.confidence = Some(0.99);
+            vec![e]
+        }
+
+        QueryState::Entropy { ss, hll } => {
+            let Some(entropy_bits) = estimate_entropy_bits(ss, hll) else {
+                return Vec::new();
+            };
+            vec![base(Vec::new(), entropy_bits)]
+        }
+    };
+
+    if !q.alert.is_empty() {
+        out.retain(|e| q.alert.fires(e.estimate));
+    }
+    out
 }
 
 /// The engine: a set of running queries fed from one event stream.
@@ -846,6 +1059,125 @@ mod tests {
             .collect();
         assert!(final_hosts.contains(&"10.0.0.7"), "{final_hosts:?}");
         assert!(final_hosts.contains(&"10.0.0.8"), "{final_hosts:?}");
+    }
+
+    /// Build a planned query and an engine on `seed` for the WindowState
+    /// tests, which need the plan alongside the engine.
+    fn plan_and_engine(yaml: &str, seed: u64) -> (Plan, QueryEngine) {
+        let q = parse_query_yaml(yaml).unwrap();
+        let p = plan(q, &HashSpec::new(seed)).unwrap();
+        let eng = QueryEngine::new(vec![p.clone()], HashSpec::new(seed)).unwrap();
+        (p, eng)
+    }
+
+    fn components_of(engine: &QueryEngine) -> Vec<(String, Vec<u8>)> {
+        engine
+            .export_snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.component, s.bytes))
+            .collect()
+    }
+
+    const SCANNER_YAML: &str = "name: scan\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
+         measure: {type: distinct_count, field: dst.ip, error: {epsilon: 0.02}}\n";
+
+    #[test]
+    fn window_state_merges_distinct_counts_across_engines() {
+        // Two "nodes" observe the same source scanning disjoint /16s; the
+        // merged fan-out must approximate the union, which no single node
+        // ever saw.
+        let (plan, mut node_a) = plan_and_engine(SCANNER_YAML, 7);
+        let (_, mut node_b) = plan_and_engine(SCANNER_YAML, 7);
+        for i in 0..1_000u32 {
+            let (a, b) = (i / 256, i % 256);
+            node_a
+                .process(&event(5, "10.0.1.50", &format!("10.1.{a}.{b}"), 22, 60))
+                .unwrap();
+            node_b
+                .process(&event(5, "10.0.1.50", &format!("10.2.{a}.{b}"), 22, 60))
+                .unwrap();
+        }
+
+        let hash = HashSpec::new(7);
+        let mut merged =
+            WindowState::from_components(&plan, &hash, &components_of(&node_a)).unwrap();
+        let other = WindowState::from_components(&plan, &hash, &components_of(&node_b)).unwrap();
+        merged.merge_from(&other).unwrap();
+
+        let est = merged.estimates(&plan);
+        assert_eq!(est.len(), 1);
+        assert_eq!(est[0].group[0].1, "10.0.1.50");
+        assert!(
+            (est[0].estimate - 2_000.0).abs() < 200.0,
+            "merged fan-out {} should approximate the 2000-destination union",
+            est[0].estimate
+        );
+    }
+
+    #[test]
+    fn window_state_rejects_mismatched_hash_seed() {
+        let (plan, mut foreign) = plan_and_engine(SCANNER_YAML, 9);
+        foreign
+            .process(&event(5, "10.0.1.50", "10.9.9.9", 22, 60))
+            .unwrap();
+        // Snapshots hashed with seed 9 must not merge into a seed-7 plan.
+        let err = WindowState::from_components(&plan, &HashSpec::new(7), &components_of(&foreign))
+            .unwrap_err();
+        assert!(matches!(err, SketchError::IncompatibleMerge(_)), "{err}");
+    }
+
+    #[test]
+    fn window_state_rejects_mismatched_windows() {
+        let (plan, mut early) = plan_and_engine(SCANNER_YAML, 7);
+        let (_, mut late) = plan_and_engine(SCANNER_YAML, 7);
+        early
+            .process(&event(5, "10.0.1.50", "10.9.9.9", 22, 60))
+            .unwrap();
+        late.process(&event(500, "10.0.1.50", "10.9.9.9", 22, 60))
+            .unwrap();
+
+        let hash = HashSpec::new(7);
+        let mut a = WindowState::from_components(&plan, &hash, &components_of(&early)).unwrap();
+        let b = WindowState::from_components(&plan, &hash, &components_of(&late)).unwrap();
+        let err = a.merge_from(&b).unwrap_err();
+        assert!(matches!(err, SketchError::IncompatibleMerge(_)), "{err}");
+    }
+
+    #[test]
+    fn window_state_rejects_wrong_components() {
+        // Hand a heavy-hitters plan the scanner query's hllmap snapshot.
+        let (hh_plan, _) = plan_and_engine(
+            "name: tt\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
+             measure: {type: heavy_hitters, value: bytes, limit: 5}\n",
+            7,
+        );
+        let (_, mut scanner) = plan_and_engine(SCANNER_YAML, 7);
+        scanner
+            .process(&event(5, "10.0.1.50", "10.9.9.9", 22, 60))
+            .unwrap();
+        let err =
+            WindowState::from_components(&hh_plan, &HashSpec::new(7), &components_of(&scanner))
+                .unwrap_err();
+        assert!(err.to_string().contains("unexpected component"), "{err}");
+    }
+
+    #[test]
+    fn window_state_round_trips_counter_composite() {
+        // sum(bytes) uses the two-component Counter state (count-min +
+        // key tracker); reconstruction must preserve exact totals.
+        let yaml =
+            "name: pb\nwindow: {size: 60s}\ngroupBy: [protocol]\nmeasure: {type: sum, value: bytes}\n";
+        let (plan, mut eng) = plan_and_engine(yaml, 7);
+        for _ in 0..500u32 {
+            eng.process(&event(5, "10.0.0.1", "10.0.0.2", 443, 1_000))
+                .unwrap();
+        }
+        let state =
+            WindowState::from_components(&plan, &HashSpec::new(7), &components_of(&eng)).unwrap();
+        let est = state.estimates(&plan);
+        assert_eq!(est.len(), 1);
+        assert_eq!(est[0].estimate, 500_000.0);
     }
 
     #[test]

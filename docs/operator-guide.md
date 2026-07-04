@@ -1,8 +1,9 @@
 # Operator guide
 
 Everything runs from a single static binary: offline replay (README §26),
-the live userspace agent (Phase 3), and cross-process sketch merge (the
-Phase 7 primitive).
+the live userspace agent (Phase 3), and distributed merge — both the
+offline `merge-snapshots` primitive and the live cluster gateway
+(Phase 7).
 
 ## Build
 
@@ -42,6 +43,7 @@ table; only the planted scanners (`10.66.0.x`) cross the scanner alert.
 | `flowsketch agent --config agent.yaml` | live agent: capture + HTTP endpoints |
 | `flowsketch replay ... --snapshot-out DIR` | dump final sketch state as FSK1 files |
 | `flowsketch merge-snapshots a.fsk1 b.fsk1 [--out m.fsk1]` | merge sketches across nodes/processes |
+| `flowsketch gateway --config gateway.yaml` | cluster gateway: receive agent pushes, serve merged /metrics |
 
 `--format prometheus` prints text exposition for the final window — the
 same rendering the live agent will serve at `/metrics`.
@@ -98,6 +100,50 @@ flowsketch merge-snapshots snaps-a/*.fsk1 snaps-b/*.fsk1
 
 Merges validate algorithm, parameters, hash family, and seed from the
 FSK1 headers; mismatches are rejected loudly, never silently merged.
+
+## Cluster gateway (live distributed merge)
+
+The gateway turns the snapshot-merge primitive into a running service:
+each agent periodically pushes its current window's sketch snapshots, and
+the gateway serves cluster-level estimates no single node could compute
+(cluster-wide top-k, distinct destinations across all nodes).
+
+```text
+agent on node A ─┐  POST /v1/snapshots (FSK1 snapshots, FSKB batch)
+agent on node B ─┼─> flowsketch gateway ──> GET /metrics (merged)
+agent on node C ─┘
+```
+
+```bash
+# Gateway side — same query files and seed as the agents:
+flowsketch gateway --config examples/gateway.yaml
+
+# Agent side — add a push block to each agent config:
+# export:
+#   gateway:
+#     endpoint: http://flowsketch-gateway:9465
+#     intervalMs: 5000
+
+curl -s localhost:9465/metrics   # merged estimates + gateway health
+curl -s localhost:9465/v1/nodes  # per-node windows, freshness, sizes
+```
+
+Semantics and safety:
+
+- Every pushed sketch is validated against the gateway's own plan for
+  that query (algorithm, parameters, hash family and seed) before it may
+  merge; incompatible or unknown pushes are rejected with HTTP 400 and
+  counted in `flowsketch_gateway_snapshots_rejected_total`.
+- Only nodes covering **exactly the same window boundaries** merge
+  (README §17.3). Nodes on other boundaries are excluded from that round
+  and visible as the gap between `flowsketch_gateway_nodes_known` and
+  `flowsketch_gateway_nodes_merged`.
+- Gateway memory is bounded: one window state per (query, live node),
+  each within the planner's budget; nodes that stop pushing are evicted
+  after `staleAfterMs`.
+- Estimates keep their error contracts: the merged output carries the
+  same `algorithm`/`error_kind` labels and series caps as node-local
+  export.
 
 ## Cardinality guardrails
 

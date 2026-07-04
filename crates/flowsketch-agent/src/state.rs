@@ -4,13 +4,13 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use flowsketch_core::SketchEstimate;
 use flowsketch_ir::logical::Measure;
 use flowsketch_planner::Plan;
 use flowsketch_prometheus::QueryExportInfo;
-use flowsketch_runtime::QueryEngine;
+use flowsketch_runtime::{QueryEngine, SnapshotExport};
 
 /// Plan metadata the HTTP layer serves on /v1/queries and uses for
 /// /metrics labels.
@@ -57,6 +57,20 @@ pub struct PublishedState {
     pub late_events: AtomicU64,
     pub otlp_exports: AtomicU64,
     pub otlp_failures: AtomicU64,
+    pub gateway_pushes: AtomicU64,
+    pub gateway_push_failures: AtomicU64,
+
+    /// Latest exported window snapshots for the gateway pusher, refreshed
+    /// by the engine thread at most once per `interval` (serializing
+    /// sketches on every publish would be wasted work under load).
+    /// `None` gate = no gateway configured, snapshots never exported.
+    snapshot_gate: Mutex<Option<SnapshotGate>>,
+    snapshots: Mutex<Vec<SnapshotExport>>,
+}
+
+struct SnapshotGate {
+    interval: Duration,
+    last_export: Option<Instant>,
 }
 
 impl PublishedState {
@@ -89,6 +103,52 @@ impl PublishedState {
             late_events: AtomicU64::new(0),
             otlp_exports: AtomicU64::new(0),
             otlp_failures: AtomicU64::new(0),
+            gateway_pushes: AtomicU64::new(0),
+            gateway_push_failures: AtomicU64::new(0),
+            snapshot_gate: Mutex::new(None),
+            snapshots: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Turn on periodic snapshot export (called before the engine starts
+    /// when a gateway push is configured).
+    pub fn enable_snapshot_export(&self, interval: Duration) {
+        *self.snapshot_gate.lock().unwrap() = Some(SnapshotGate {
+            interval,
+            last_export: None,
+        });
+    }
+
+    /// The most recently exported window snapshots (empty until the first
+    /// export, or when no gateway is configured).
+    pub fn latest_snapshots(&self) -> Vec<SnapshotExport> {
+        self.snapshots.lock().unwrap().clone()
+    }
+
+    /// Export snapshots now, ignoring the rate gate — used for the final
+    /// publish when a finite source completes, so the trailing window is
+    /// available to push regardless of timing.
+    pub fn export_snapshots_now(&self, engine: &QueryEngine) {
+        if self.snapshot_gate.lock().unwrap().is_none() {
+            return;
+        }
+        if let Ok(snaps) = engine.export_snapshots() {
+            *self.snapshots.lock().unwrap() = snaps;
+        }
+    }
+
+    fn maybe_export_snapshots(&self, engine: &QueryEngine) {
+        let mut gate = self.snapshot_gate.lock().unwrap();
+        let Some(gate) = gate.as_mut() else { return };
+        if gate
+            .last_export
+            .is_some_and(|last| last.elapsed() < gate.interval)
+        {
+            return;
+        }
+        if let Ok(snaps) = engine.export_snapshots() {
+            *self.snapshots.lock().unwrap() = snaps;
+            gate.last_export = Some(Instant::now());
         }
     }
 
@@ -100,6 +160,7 @@ impl PublishedState {
             .store(engine.sketch_memory_bytes() as u64, Ordering::Relaxed);
         self.late_events
             .store(engine.late_events(), Ordering::Relaxed);
+        self.maybe_export_snapshots(engine);
         if drained.is_empty() {
             return;
         }
@@ -149,7 +210,7 @@ impl PublishedState {
     /// Agent health block appended to /metrics.
     pub fn render_health_metrics(&self) -> String {
         let mut out = String::new();
-        let counters: [(&str, &str, u64); 7] = [
+        let counters: [(&str, &str, u64); 9] = [
             (
                 "flowsketch_agent_events_processed_total",
                 "Flow events processed by the sketch engine.",
@@ -184,6 +245,16 @@ impl PublishedState {
                 "flowsketch_agent_otlp_export_failures_total",
                 "OTLP exports that failed after retries.",
                 self.otlp_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_gateway_pushes_total",
+                "Successful snapshot pushes to the gateway.",
+                self.gateway_pushes.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_gateway_push_failures_total",
+                "Snapshot pushes that failed after retries.",
+                self.gateway_push_failures.load(Ordering::Relaxed),
             ),
         ];
         for (name, help, value) in counters {
