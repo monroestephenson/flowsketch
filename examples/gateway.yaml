@@ -1,0 +1,22 @@
+# FlowSketch cluster gateway configuration (README Phase 7).
+#
+# Agents push their current window's sketch snapshots here; the gateway
+# validates merge compatibility, combines them across nodes, and serves
+# cluster-level estimates:
+#
+#   flowsketch gateway --config examples/gateway.yaml
+#   curl localhost:9465/metrics    # merged cluster-level estimates
+#   curl localhost:9465/v1/nodes   # which agents are pushing, and how fresh
+#
+# The gateway must load the SAME query files and hash seed as the agents
+# pushing to it — that is what makes pushed sketches verifiable and
+# mergeable (same algorithm, parameters, hash family, seed, and window
+# boundaries; anything else is rejected and counted).
+gateway:
+  listen: 127.0.0.1:9465
+  seed: 0            # must match agent.seed on every pushing agent
+  staleAfterMs: 300000  # forget nodes that stop pushing for 5 minutes
+queries:
+  - file: queries/top-talkers.yaml
+  - file: queries/suspected-scanners.yaml
+  - file: queries/flow-size-quantiles.yaml

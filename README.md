@@ -6,7 +6,8 @@
 > workspace: `flowsketch-core`, `flowsketch-algos` (Count-Min, CountSketch,
 > HyperLogLog, HLLMap, SpaceSaving, Misra-Gries + exact baseline),
 > `flowsketch-ir`, `flowsketch-planner`, `flowsketch-runtime`,
-> `flowsketch-pcap`, `flowsketch-prometheus`, and `flowsketch-cli`.
+> `flowsketch-pcap`, `flowsketch-prometheus`, `flowsketch-gateway`, and
+> `flowsketch-cli`.
 >
 > ```bash
 > cargo build --release
@@ -29,11 +30,16 @@
 > - **OTLP metrics export** (Phase 4): the agent pushes estimates to any
 >   OpenTelemetry Collector / Grafana Alloy / Datadog OTel endpoint over
 >   OTLP/HTTP+JSON with OTel semantic conventions, batching, and retry
+> - **cluster gateway** (`flowsketch-gateway`, Phase 7): agents push their
+>   window's FSK1 sketch snapshots (`export.gateway` in the agent config);
+>   the gateway validates merge compatibility, combines them across nodes,
+>   and serves cluster-level estimates on `/metrics` plus node inventory on
+>   `/v1/nodes` (`flowsketch gateway --config examples/gateway.yaml`)
 >
 > See `docs/operator-guide.md`, `docs/query-language.md`,
 > `docs/accuracy-contracts.md`, and `docs/algorithm-notes.md`. Everything
 > below this block is the original design plan; the remaining phases
-> (Kubernetes, eBPF, gateway service) are not yet built.
+> (Kubernetes, eBPF) are not yet built.
 
 ## 0. Core thesis
 

@@ -70,6 +70,10 @@ pub fn run(
     if let Some(otlp) = config.otlp.clone() {
         spawn_otlp_exporter(otlp, Arc::clone(&published), config.node_name.clone());
     }
+    if let Some(gateway) = config.gateway.clone() {
+        published.enable_snapshot_export(Duration::from_millis(gateway.interval_ms));
+        spawn_gateway_pusher(gateway, Arc::clone(&published), config.node_name.clone());
+    }
     on_ready(addr);
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<FlowEvent>(EVENT_CHANNEL_CAPACITY);
@@ -165,6 +169,50 @@ fn spawn_otlp_exporter(
         .expect("spawn otlp thread");
 }
 
+/// Periodically push the engine's current window snapshots to the cluster
+/// gateway (Phase 7 distributed merge). The engine thread refreshes the
+/// snapshot set on its own cadence; this thread just ships the latest one.
+/// Re-pushing an unchanged window is harmless — the gateway replaces the
+/// node's entry and refreshes its liveness.
+fn spawn_gateway_pusher(
+    cfg: flowsketch_gateway::PushConfig,
+    state: Arc<PublishedState>,
+    node_name: String,
+) {
+    let url = cfg.snapshots_url();
+    let interval = Duration::from_millis(cfg.interval_ms);
+    std::thread::Builder::new()
+        .name("fs-gateway".into())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            let snapshots = state.latest_snapshots();
+            if snapshots.is_empty() {
+                continue;
+            }
+            let batch = flowsketch_gateway::PushBatch {
+                node: node_name.clone(),
+                entries: snapshots
+                    .into_iter()
+                    .map(|s| flowsketch_gateway::PushEntry {
+                        query_name: s.query_name,
+                        component: s.component,
+                        snapshot: s.bytes,
+                    })
+                    .collect(),
+            };
+            match flowsketch_gateway::push_batch(&url, &batch.encode()) {
+                Ok(()) => {
+                    state.gateway_pushes.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    state.gateway_push_failures.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("gateway push failed: {err}");
+                }
+            }
+        })
+        .expect("spawn gateway push thread");
+}
+
 /// Push events into the channel, counting drops instead of blocking.
 pub(crate) fn offer_event(
     tx: &SyncSender<FlowEvent>,
@@ -207,8 +255,11 @@ fn engine_loop(
         }
     }
     // Source finished: flush trailing windows and publish the final state.
+    // The trailing window's snapshots export unconditionally so the
+    // gateway pusher ships the final state regardless of gate timing.
     engine.finish()?;
     published.publish(&mut engine);
+    published.export_snapshots_now(&engine);
     published.source_done.store(true, Ordering::Release);
     Ok(())
 }
