@@ -88,6 +88,24 @@ impl AgentConfig {
                     g.endpoint
                 )));
             }
+            // The gateway keys snapshots by node name. Agents left on the
+            // default would all push as "unknown" and overwrite each other,
+            // so a unique nodeName is mandatory in gateway mode.
+            if raw
+                .agent
+                .node_name
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                return Err(AgentError::Config(
+                    "agent.nodeName must be set to a unique value when export.gateway is \
+                     configured; the gateway keys snapshots by node name and agents sharing \
+                     the default would overwrite each other"
+                        .into(),
+                ));
+            }
         }
         Ok(AgentConfig {
             node_name: raw.agent.node_name.unwrap_or_else(|| "unknown".into()),
@@ -262,7 +280,8 @@ queries:
     #[test]
     fn parses_gateway_export_block() {
         let cfg = AgentConfig::from_yaml(
-            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n\
+            "agent:\n  nodeName: node-a\n  source: {kind: pcap, path: x.pcap}\n\
+             queries:\n  - file: q.yaml\n\
              export:\n  gateway:\n    endpoint: http://gw:9465\n    intervalMs: 1000\n",
         )
         .unwrap();
@@ -273,10 +292,36 @@ queries:
 
         // https is rejected with direction (no TLS in v0).
         assert!(AgentConfig::from_yaml(
-            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n\
+            "agent:\n  nodeName: node-a\n  source: {kind: pcap, path: x.pcap}\n\
+             queries:\n  - file: q.yaml\n\
              export:\n  gateway:\n    endpoint: https://gw:9465\n",
         )
         .is_err());
+    }
+
+    #[test]
+    fn gateway_push_requires_node_name() {
+        // The gateway keys snapshots by node name, so gateway mode without
+        // an explicit nodeName is rejected rather than defaulting to a
+        // shared "unknown" id that would make agents overwrite each other.
+        let without_name =
+            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n\
+             export:\n  gateway:\n    endpoint: http://gw:9465\n";
+        assert!(AgentConfig::from_yaml(without_name).is_err());
+
+        // A blank/whitespace nodeName is also rejected.
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  nodeName: '  '\n  source: {kind: pcap, path: x.pcap}\n\
+             queries:\n  - file: q.yaml\n\
+             export:\n  gateway:\n    endpoint: http://gw:9465\n",
+        )
+        .is_err());
+
+        // Without gateway push the default nodeName is still fine.
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
+        )
+        .is_ok());
     }
 
     #[test]
