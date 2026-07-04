@@ -1,6 +1,6 @@
 [package]
-name = "flowsketch-agent"
-description = "FlowSketch live agent: packet capture sources feeding the sketch engine, with an embedded HTTP server for /metrics, /healthz, /readyz, and /v1/queries"
+name = "flowsketch-gateway"
+description = "FlowSketch cluster gateway: receives FSK1 sketch snapshots pushed by agents, validates merge compatibility, merges them across nodes, and serves cluster-level estimates on /metrics"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,14 +12,8 @@ flowsketch-core = { workspace = true }
 flowsketch-ir = { workspace = true }
 flowsketch-planner = { workspace = true }
 flowsketch-runtime = { workspace = true }
-flowsketch-pcap = { workspace = true }
 flowsketch-prometheus = { workspace = true }
-flowsketch-otel = { workspace = true }
-flowsketch-gateway = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

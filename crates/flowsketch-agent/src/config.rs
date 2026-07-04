@@ -46,6 +46,8 @@ pub struct AgentConfig {
     pub query_files: Vec<PathBuf>,
     /// OTLP export, if configured.
     pub otlp: Option<flowsketch_otel::OtlpConfig>,
+    /// Snapshot push to a cluster gateway, if configured.
+    pub gateway: Option<flowsketch_gateway::PushConfig>,
 }
 
 impl AgentConfig {
@@ -57,7 +59,8 @@ impl AgentConfig {
                 "agent config must list at least one query file".into(),
             ));
         }
-        let otlp = raw.export.and_then(|e| e.otlp).map(|o| {
+        let export = raw.export.unwrap_or_default();
+        let otlp = export.otlp.map(|o| {
             let interval_ms = o.interval_ms.unwrap_or(5_000).max(100);
             flowsketch_otel::OtlpConfig {
                 endpoint: o.endpoint,
@@ -73,6 +76,37 @@ impl AgentConfig {
                 )));
             }
         }
+        let gateway = export.gateway.map(|g| flowsketch_gateway::PushConfig {
+            endpoint: g.endpoint,
+            interval_ms: g.interval_ms.unwrap_or(5_000).max(100),
+        });
+        if let Some(g) = &gateway {
+            if !g.endpoint.starts_with("http://") {
+                return Err(AgentError::Config(format!(
+                    "export.gateway.endpoint must be http:// (got {:?}); point it at a \
+                     flowsketch gateway",
+                    g.endpoint
+                )));
+            }
+            // The gateway keys snapshots by node name. Agents left on the
+            // default would all push as "unknown" and overwrite each other,
+            // so a unique nodeName is mandatory in gateway mode.
+            if raw
+                .agent
+                .node_name
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                return Err(AgentError::Config(
+                    "agent.nodeName must be set to a unique value when export.gateway is \
+                     configured; the gateway keys snapshots by node name and agents sharing \
+                     the default would overwrite each other"
+                        .into(),
+                ));
+            }
+        }
         Ok(AgentConfig {
             node_name: raw.agent.node_name.unwrap_or_else(|| "unknown".into()),
             listen: raw.agent.listen.unwrap_or_else(|| "127.0.0.1:9464".into()),
@@ -81,6 +115,7 @@ impl AgentConfig {
             source: raw.agent.source,
             query_files: raw.queries.into_iter().map(|q| q.file).collect(),
             otlp,
+            gateway,
         })
     }
 
@@ -134,16 +169,26 @@ struct RawConfig {
     export: Option<RawExport>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExport {
     #[serde(default)]
     otlp: Option<RawOtlp>,
+    #[serde(default)]
+    gateway: Option<RawGatewayPush>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOtlp {
+    endpoint: String,
+    #[serde(default, rename = "intervalMs", alias = "interval_ms")]
+    interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayPush {
     endpoint: String,
     #[serde(default, rename = "intervalMs", alias = "interval_ms")]
     interval_ms: Option<u64>,
@@ -230,6 +275,53 @@ queries:
              export:\n  otlp:\n    endpoint: https://collector:4318\n",
         )
         .is_err());
+    }
+
+    #[test]
+    fn parses_gateway_export_block() {
+        let cfg = AgentConfig::from_yaml(
+            "agent:\n  nodeName: node-a\n  source: {kind: pcap, path: x.pcap}\n\
+             queries:\n  - file: q.yaml\n\
+             export:\n  gateway:\n    endpoint: http://gw:9465\n    intervalMs: 1000\n",
+        )
+        .unwrap();
+        let gw = cfg.gateway.expect("gateway configured");
+        assert_eq!(gw.endpoint, "http://gw:9465");
+        assert_eq!(gw.interval_ms, 1000);
+        assert_eq!(gw.snapshots_url(), "http://gw:9465/v1/snapshots");
+
+        // https is rejected with direction (no TLS in v0).
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  nodeName: node-a\n  source: {kind: pcap, path: x.pcap}\n\
+             queries:\n  - file: q.yaml\n\
+             export:\n  gateway:\n    endpoint: https://gw:9465\n",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gateway_push_requires_node_name() {
+        // The gateway keys snapshots by node name, so gateway mode without
+        // an explicit nodeName is rejected rather than defaulting to a
+        // shared "unknown" id that would make agents overwrite each other.
+        let without_name =
+            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n\
+             export:\n  gateway:\n    endpoint: http://gw:9465\n";
+        assert!(AgentConfig::from_yaml(without_name).is_err());
+
+        // A blank/whitespace nodeName is also rejected.
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  nodeName: '  '\n  source: {kind: pcap, path: x.pcap}\n\
+             queries:\n  - file: q.yaml\n\
+             export:\n  gateway:\n    endpoint: http://gw:9465\n",
+        )
+        .is_err());
+
+        // Without gateway push the default nodeName is still fine.
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
+        )
+        .is_ok());
     }
 
     #[test]

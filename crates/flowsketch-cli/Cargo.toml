@@ -20,6 +20,7 @@ flowsketch-runtime = { workspace = true }
 flowsketch-pcap = { workspace = true }
 flowsketch-prometheus = { workspace = true }
 flowsketch-agent = { workspace = true }
+flowsketch-gateway = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }

@@ -57,6 +57,13 @@ enum Command {
         #[arg(long, short)]
         config: PathBuf,
     },
+    /// Run the cluster gateway: receive snapshot pushes from agents, merge
+    /// them across nodes, serve cluster-level /metrics
+    Gateway {
+        /// Gateway config YAML (see examples/gateway.yaml)
+        #[arg(long, short)]
+        config: PathBuf,
+    },
     /// Merge FSK1 sketch snapshots from different processes/nodes and print
     /// the combined estimates (merge compatibility is validated)
     MergeSnapshots {
@@ -160,6 +167,22 @@ fn main() -> Result<()> {
             );
             flowsketch_agent::run(cfg, |addr| {
                 eprintln!("listening on http://{addr} (/metrics /healthz /readyz /v1/queries)");
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        Command::Gateway { config } => {
+            let cfg = flowsketch_gateway::GatewayConfig::from_file(&config)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            eprintln!(
+                "flowsketch gateway starting: queries={} staleAfterMs={}",
+                cfg.query_files.len(),
+                cfg.stale_after_ms
+            );
+            flowsketch_gateway::run(cfg, |addr| {
+                eprintln!(
+                    "listening on http://{addr} (POST /v1/snapshots; GET /metrics /healthz \
+                     /readyz /v1/queries /v1/nodes)"
+                );
             })
             .map_err(|e| anyhow::anyhow!("{e}"))
         }

@@ -115,6 +115,7 @@ name = "flowsketch-agent"
 version = "0.1.0"
 dependencies = [
  "flowsketch-core",
+ "flowsketch-gateway",
  "flowsketch-ir",
  "flowsketch-otel",
  "flowsketch-pcap",
@@ -144,6 +145,7 @@ dependencies = [
  "flowsketch-agent",
  "flowsketch-algos",
  "flowsketch-core",
+ "flowsketch-gateway",
  "flowsketch-ir",
  "flowsketch-pcap",
  "flowsketch-planner",
@@ -157,6 +159,21 @@ name = "flowsketch-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "flowsketch-gateway"
+version = "0.1.0"
+dependencies = [
+ "flowsketch-core",
+ "flowsketch-ir",
+ "flowsketch-planner",
+ "flowsketch-prometheus",
+ "flowsketch-runtime",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "thiserror",
 ]
 
