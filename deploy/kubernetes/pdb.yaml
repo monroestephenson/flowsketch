@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: flowsketch-gateway
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flowsketch
+      app.kubernetes.io/component: gateway

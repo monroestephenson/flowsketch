@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowsketch-gateway
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flowsketch
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flowsketch
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: flowsketch-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: ghcr.io/monroestephenson/flowsketch:latest
+          imagePullPolicy: IfNotPresent
+          args: ["gateway", "--config", "/etc/flowsketch/config/gateway.yaml"]
+          ports:
+            - name: http
+              containerPort: 9465
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/flowsketch/config
+              readOnly: true
+            - name: queries
+              mountPath: /etc/flowsketch/queries
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: flowsketch-gateway-config
+        - name: queries
+          configMap:
+            name: flowsketch-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowsketch-gateway
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: http
+      port: 9465
+      targetPort: http

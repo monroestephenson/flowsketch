@@ -39,8 +39,11 @@
 >
 > See `docs/operator-guide.md`, `docs/query-language.md`,
 > `docs/accuracy-contracts.md`, `docs/algorithm-notes.md`, and
-> `docs/security.md`. Everything below this block is the original design
-> plan; the remaining phases (Kubernetes, eBPF) are not yet built.
+> `docs/security.md`, `docs/production-readiness.md`,
+> `docs/ebpf-roadmap.md`, and `benchmarks/README.md`. Everything below
+> this block is the original design plan; Kubernetes manifests and the
+> eBPF event-contract crate exist, but the eBPF collector itself is not
+> yet built.
 
 ## 0. Core thesis
 
@@ -1894,10 +1897,10 @@ Metrics:
 Targets:
 
 ```text
-1 Gbps: easy MVP
-10 Gbps: credible v1
-25/40 Gbps: serious infrastructure
-100 Gbps: future/DPDK/P4/SmartNIC tier
+1 Gb/s: easy MVP
+10 Gb/s: credible v1
+25/40 Gb/s: serious infrastructure
+100 Gb/s: future/DPDK/P4/SmartNIC tier
 ```
 
 Test matrix:
@@ -1922,6 +1925,19 @@ standard query suite
 results dashboard
 reproducible Docker environment
 ```
+
+Implemented v0 harness:
+
+```bash
+flowsketch bench --trace /data/caida-or-mawi.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile all
+```
+
+This reports measured parser/runtime throughput and projects the CPU cores
+needed for 1/10/25/40/100 Gb/s at the trace's observed average packet size.
+It also reports direct projected L3 Gb/s per core. It does not replace live
+NIC validation. See `benchmarks/README.md`.
 
 This is crucial for trust. Operators will not install this based on theory alone.
 

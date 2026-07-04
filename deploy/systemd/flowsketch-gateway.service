@@ -1,0 +1,21 @@
+[Unit]
+Description=FlowSketch cluster sketch gateway
+Documentation=https://github.com/monroestephenson/flowsketch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/flowsketch gateway --config /etc/flowsketch/gateway.yaml
+Restart=on-failure
+RestartSec=5s
+User=flowsketch
+Group=flowsketch
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/flowsketch
+
+[Install]
+WantedBy=multi-user.target

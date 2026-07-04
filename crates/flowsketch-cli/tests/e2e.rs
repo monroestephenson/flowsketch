@@ -203,8 +203,58 @@ fn bench_runs_and_reports_accuracy() {
         "10000",
         "--dist",
         "zipf",
+        "--profile",
+        "all",
     ]));
     let text = stdout(&out);
     assert!(text.contains("updates/s/core"), "{text}");
+    assert!(text.contains("measured_l3_capacity="), "{text}");
     assert!(text.contains("ARE over truth top-"), "{text}");
+    assert!(text.contains("target: profile=1 Gb/s"), "{text}");
+    assert!(text.contains("target: profile=100 Gb/s"), "{text}");
+}
+
+#[test]
+fn bench_trace_profile_runs_on_generated_pcap() {
+    let dir = std::env::temp_dir().join("flowsketch-e2e-bench-trace");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pcap = synth_trace(&dir);
+
+    let out = run_ok(
+        flowsketch()
+            .arg("bench")
+            .args(["--trace", pcap.to_str().unwrap()])
+            .arg("--query")
+            .arg(example("top-talkers.yaml"))
+            .args(["--profile", "10g"]),
+    );
+    let text = stdout(&out);
+    assert!(text.contains("trace benchmark:"), "{text}");
+    assert!(text.contains("observed_l3_rate="), "{text}");
+    assert!(text.contains("measured_l3_capacity="), "{text}");
+    assert!(text.contains("target: profile=10 Gb/s"), "{text}");
+    assert!(text.contains("estimated_cores_for_target="), "{text}");
+    assert!(text.contains("runtime: estimates="), "{text}");
+}
+
+#[test]
+fn bench_real_trace_if_configured() {
+    let Ok(trace) = std::env::var("FLOWSKETCH_REAL_TRACE") else {
+        eprintln!(
+            "skipping real-trace bench; set FLOWSKETCH_REAL_TRACE=/path/to/caida-or-mawi.pcap"
+        );
+        return;
+    };
+    let profile = std::env::var("FLOWSKETCH_REAL_TRACE_PROFILE").unwrap_or_else(|_| "100g".into());
+    let out = run_ok(
+        flowsketch()
+            .arg("bench")
+            .args(["--trace", &trace])
+            .arg("--query")
+            .arg(example("top-talkers.yaml"))
+            .args(["--profile", &profile]),
+    );
+    let text = stdout(&out);
+    assert!(text.contains("trace benchmark:"), "{text}");
+    assert!(text.contains("projection:"), "{text}");
 }

@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flowsketch-agent
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flowsketch
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flowsketch
+        app.kubernetes.io/component: agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: flowsketch-agent
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/monroestephenson/flowsketch:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/etc/flowsketch/config/start-agent.sh"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 9464
+              hostPort: 9464
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["NET_RAW"]
+              drop: ["ALL"]
+            runAsUser: 0
+            runAsGroup: 0
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/flowsketch/config
+              readOnly: true
+            - name: queries
+              mountPath: /etc/flowsketch/queries
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: flowsketch-agent-config
+            defaultMode: 0555
+        - name: queries
+          configMap:
+            name: flowsketch-queries
+        - name: tmp
+          emptyDir: {}

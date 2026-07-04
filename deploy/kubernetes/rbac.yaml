@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flowsketch-agent
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: agent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flowsketch-gateway
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway

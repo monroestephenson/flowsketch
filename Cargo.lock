@@ -163,6 +163,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowsketch-ebpf"
+version = "0.1.0"
+dependencies = [
+ "flowsketch-core",
+ "thiserror",
+]
+
+[[package]]
 name = "flowsketch-gateway"
 version = "0.1.0"
 dependencies = [

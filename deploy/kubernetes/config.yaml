@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowsketch-queries
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+data:
+  top-talkers.yaml: |
+    name: top_talkers
+    window:
+      size: 60s
+      slide: 10s
+    groupBy:
+      - src.ip
+      - dst.ip
+    measure:
+      type: heavy_hitters
+      value: bytes
+      limit: 100
+      error:
+        epsilon: 0.001
+    export:
+      prometheus: true
+      maxSeries: 100
+    resources:
+      maxMemory: 64MiB
+  suspected-scanners.yaml: |
+    name: suspected_scanners
+    window:
+      size: 60s
+      slide: 10s
+    match:
+      protocol: tcp
+      dst.port: [22, 80, 443, 5432, 6379]
+    groupBy:
+      - src.ip
+    measure:
+      type: distinct_count
+      field: dst.ip
+      error:
+        epsilon: 0.02
+    alertIf:
+      gt: 500
+    export:
+      prometheus: true
+      maxSeries: 500
+    resources:
+      maxMemory: 64MiB
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowsketch-agent-config
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: agent
+data:
+  agent.yaml.template: |
+    agent:
+      nodeName: ${NODE_NAME}
+      listen: 0.0.0.0:9464
+      seed: 0
+      flushIntervalMs: 1000
+      source:
+        kind: af_packet
+        interface: eth0
+    queries:
+      - file: /etc/flowsketch/queries/top-talkers.yaml
+      - file: /etc/flowsketch/queries/suspected-scanners.yaml
+    export:
+      gateway:
+        endpoint: http://flowsketch-gateway.flowsketch.svc.cluster.local:9465
+        intervalMs: 5000
+  start-agent.sh: |
+    #!/bin/sh
+    set -eu
+    sed "s|\${NODE_NAME}|${NODE_NAME}|g" \
+      /etc/flowsketch/config/agent.yaml.template > /tmp/flowsketch-agent.yaml
+    exec /usr/local/bin/flowsketch agent --config /tmp/flowsketch-agent.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowsketch-gateway-config
+  namespace: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway
+data:
+  gateway.yaml: |
+    gateway:
+      listen: 0.0.0.0:9465
+      seed: 0
+      staleAfterMs: 300000
+    queries:
+      - file: /etc/flowsketch/queries/top-talkers.yaml
+      - file: /etc/flowsketch/queries/suspected-scanners.yaml

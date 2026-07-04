@@ -5,6 +5,11 @@ the live userspace agent (Phase 3), and distributed merge — both the
 offline `merge-snapshots` primitive and the live cluster gateway
 (Phase 7).
 
+For deployment hardening and rollout gates, see
+`docs/production-readiness.md`. For Kubernetes manifests, see
+`deploy/kubernetes/`. For the eBPF collector contract and roadmap, see
+`docs/ebpf-roadmap.md`.
+
 ## Build
 
 ```bash

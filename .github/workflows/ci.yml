@@ -39,6 +39,9 @@ jobs:
             --query examples/queries/top-talkers.yaml \
             --query examples/queries/suspected-scanners.yaml \
             --format prometheus | head -20
+          $BIN bench --trace /tmp/ci.pcap \
+            --query examples/queries/top-talkers.yaml \
+            --profile all
       - name: Agent smoke (pcap source -> HTTP endpoints)
         run: |
           BIN=target/release/flowsketch

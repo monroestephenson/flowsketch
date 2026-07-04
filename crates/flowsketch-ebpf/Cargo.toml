@@ -1,0 +1,12 @@
+[package]
+name = "flowsketch-ebpf"
+description = "FlowSketch eBPF collector contract and scaffolding for future tc/XDP packet metadata extraction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }
+thiserror = { workspace = true }

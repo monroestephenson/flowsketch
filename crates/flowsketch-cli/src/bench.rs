@@ -1,9 +1,12 @@
-//! `flowsketch bench`: update throughput, memory footprint, and accuracy
-//! against an exact ground-truth counter on synthetic distributions.
+//! `flowsketch bench`: synthetic sketch throughput/accuracy and real-pcap
+//! trace throughput against line-rate profiles.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use flowsketch_algos::{
@@ -11,6 +14,10 @@ use flowsketch_algos::{
 };
 use flowsketch_core::hash::{HashSpec, SplitMixRng};
 use flowsketch_core::Sketch;
+use flowsketch_ir::parse_query_yaml;
+use flowsketch_pcap::PcapReader;
+use flowsketch_planner::{plan, Plan};
+use flowsketch_runtime::QueryEngine;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Algo {
@@ -25,6 +32,79 @@ pub enum Algo {
 pub enum Dist {
     Uniform,
     Zipf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Profile {
+    /// Print projections for every supported line-rate target.
+    All,
+    #[value(name = "1g")]
+    OneG,
+    #[value(name = "10g")]
+    TenG,
+    #[value(name = "25g")]
+    TwentyFiveG,
+    #[value(name = "40g")]
+    FortyG,
+    #[value(name = "100g")]
+    HundredG,
+}
+
+impl Profile {
+    fn selected(self) -> &'static [Profile] {
+        match self {
+            Profile::All => &[
+                Profile::OneG,
+                Profile::TenG,
+                Profile::TwentyFiveG,
+                Profile::FortyG,
+                Profile::HundredG,
+            ],
+            Profile::OneG => &[Profile::OneG],
+            Profile::TenG => &[Profile::TenG],
+            Profile::TwentyFiveG => &[Profile::TwentyFiveG],
+            Profile::FortyG => &[Profile::FortyG],
+            Profile::HundredG => &[Profile::HundredG],
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Profile::All => "all",
+            Profile::OneG => "1 Gb/s",
+            Profile::TenG => "10 Gb/s",
+            Profile::TwentyFiveG => "25 Gb/s",
+            Profile::FortyG => "40 Gb/s",
+            Profile::HundredG => "100 Gb/s",
+        }
+    }
+
+    fn gbps(self) -> f64 {
+        match self {
+            Profile::All => 0.0,
+            Profile::OneG => 1.0,
+            Profile::TenG => 10.0,
+            Profile::TwentyFiveG => 25.0,
+            Profile::FortyG => 40.0,
+            Profile::HundredG => 100.0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BenchConfig {
+    pub algo: Algo,
+    pub events: u64,
+    pub keys: u64,
+    pub dist: Dist,
+    pub profile: Option<Profile>,
+    /// Average packet size used for synthetic line-rate projection.
+    pub avg_packet_bytes: u64,
+    /// Real classic-pcap trace to benchmark parser/runtime throughput.
+    pub trace: Option<PathBuf>,
+    /// Query files to execute while replaying `trace`.
+    pub queries: Vec<PathBuf>,
+    pub seed: u64,
 }
 
 /// Zipf(s=1) sampler over `n` keys via inverse-CDF on a precomputed table.
@@ -53,7 +133,24 @@ impl Zipf {
     }
 }
 
-pub fn run(algo: Algo, events: u64, keys: u64, dist: Dist) -> Result<()> {
+pub fn run(cfg: BenchConfig) -> Result<()> {
+    if let Some(trace) = &cfg.trace {
+        run_trace(cfg.clone(), trace)
+    } else {
+        run_synthetic(cfg)
+    }
+}
+
+fn run_synthetic(cfg: BenchConfig) -> Result<()> {
+    let BenchConfig {
+        algo,
+        events,
+        keys,
+        dist,
+        profile,
+        avg_packet_bytes,
+        ..
+    } = cfg;
     let name = match algo {
         Algo::CountMin => "count-min",
         Algo::CountSketch => "count-sketch",
@@ -100,6 +197,15 @@ pub fn run(algo: Algo, events: u64, keys: u64, dist: Dist) -> Result<()> {
         "updates:  {events} in {:.3}s -> {rate:.2}M updates/s/core",
         elapsed.as_secs_f64()
     );
+    print_l3_capacity(
+        events as f64 / elapsed.as_secs_f64(),
+        avg_packet_bytes as f64,
+    );
+    print_profile_projection(
+        profile,
+        avg_packet_bytes as f64,
+        events as f64 / elapsed.as_secs_f64(),
+    );
     println!(
         "memory:   {}",
         flowsketch_planner::format_bytes(sketch.memory_bytes() as u64)
@@ -145,6 +251,129 @@ pub fn run(algo: Algo, events: u64, keys: u64, dist: Dist) -> Result<()> {
     Ok(())
 }
 
+fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
+    let hash = HashSpec::new(cfg.seed);
+    let plans = load_plans(&cfg.queries, cfg.seed)?;
+    let mut engine = if plans.is_empty() {
+        None
+    } else {
+        Some(QueryEngine::new(plans, hash).context("engine construction failed")?)
+    };
+
+    let file =
+        File::open(trace).with_context(|| format!("cannot open trace {}", trace.display()))?;
+    let mut reader = PcapReader::new(BufReader::new(file)).context("cannot read pcap header")?;
+
+    let started = Instant::now();
+    let mut events = 0u64;
+    let mut total_l3_bytes = 0u64;
+    let mut first_ts = None;
+    let mut last_ts = None;
+    while let Some(event) = reader.next_event()? {
+        first_ts.get_or_insert(event.ts_nanos);
+        last_ts = Some(event.ts_nanos);
+        total_l3_bytes += event.bytes as u64;
+        events += 1;
+        if let Some(engine) = &mut engine {
+            engine.process(&event).context("sketch update failed")?;
+        }
+    }
+    if let Some(engine) = &mut engine {
+        engine.finish().context("final window flush failed")?;
+    }
+    let elapsed = started.elapsed();
+    let wall_eps = events as f64 / elapsed.as_secs_f64().max(1e-9);
+    let avg_packet_bytes = if events > 0 {
+        total_l3_bytes as f64 / events as f64
+    } else {
+        cfg.avg_packet_bytes as f64
+    };
+    let trace_duration = match (first_ts, last_ts) {
+        (Some(first), Some(last)) if last > first => (last - first) as f64 / 1e9,
+        _ => 0.0,
+    };
+    let trace_gbps = if trace_duration > 0.0 {
+        total_l3_bytes as f64 * 8.0 / trace_duration / 1e9
+    } else {
+        0.0
+    };
+
+    println!(
+        "trace benchmark: file={} parsed_events={} packets_read={} queries={}",
+        trace.display(),
+        events,
+        reader.packets_read(),
+        cfg.queries.len()
+    );
+    println!(
+        "trace shape: avg_l3_packet_bytes={avg_packet_bytes:.1} duration={trace_duration:.3}s observed_l3_rate={trace_gbps:.3}Gbps"
+    );
+    println!(
+        "throughput: {events} events in {:.3}s -> {:.2}M events/s/core",
+        elapsed.as_secs_f64(),
+        wall_eps / 1e6
+    );
+    print_l3_capacity(wall_eps, avg_packet_bytes);
+    print_profile_projection(cfg.profile, avg_packet_bytes, wall_eps);
+    if let Some(engine) = &mut engine {
+        let estimates = engine.take_estimates();
+        println!(
+            "runtime: estimates={} sketch_memory={} late_events={}",
+            estimates.len(),
+            flowsketch_planner::format_bytes(engine.sketch_memory_bytes() as u64),
+            engine.late_events()
+        );
+    }
+    Ok(())
+}
+
+fn load_plans(query_files: &[PathBuf], seed: u64) -> Result<Vec<Plan>> {
+    let hash = HashSpec::new(seed);
+    query_files
+        .iter()
+        .map(|path| {
+            let yaml = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read query file {}", path.display()))?;
+            let query = parse_query_yaml(&yaml)
+                .with_context(|| format!("invalid query in {}", path.display()))?;
+            plan(query, &hash).with_context(|| format!("planning failed for {}", path.display()))
+        })
+        .collect()
+}
+
+fn print_profile_projection(profile: Option<Profile>, avg_packet_bytes: f64, measured_eps: f64) {
+    let Some(profile) = profile else { return };
+    for profile in profile.selected() {
+        let target_eps = target_events_per_sec(*profile, avg_packet_bytes);
+        let estimated_cores = target_eps / measured_eps.max(1.0);
+        println!(
+            "target: profile={} line_rate={:.0} Gb/s avg_packet_bytes={avg_packet_bytes:.1} requires {:.2}M events/s",
+            profile.name(),
+            profile.gbps(),
+            target_eps / 1e6
+        );
+        println!(
+            "projection: measured {:.2}M events/s/core => estimated_cores_for_target={estimated_cores:.2}",
+            measured_eps / 1e6
+        );
+    }
+}
+
+pub fn target_events_per_sec(profile: Profile, avg_packet_bytes: f64) -> f64 {
+    profile.gbps() * 1e9 / (avg_packet_bytes.max(1.0) * 8.0)
+}
+
+fn print_l3_capacity(measured_eps: f64, avg_packet_bytes: f64) {
+    println!(
+        "capacity: measured_l3_capacity={:.2} Gb/s/core at avg_packet_bytes={avg_packet_bytes:.1}",
+        measured_l3_gbps(measured_eps, avg_packet_bytes)
+    );
+}
+
+pub fn measured_l3_gbps(events_per_sec: f64, avg_packet_bytes: f64) -> f64 {
+    events_per_sec * avg_packet_bytes.max(1.0) * 8.0 / 1e9
+}
+
 fn avg_relative_error(sketch: &dyn Sketch, truth: &[(Vec<u8>, u64)]) -> (f64, usize) {
     let mut total = 0.0;
     for (k, t) in truth {
@@ -152,4 +381,37 @@ fn avg_relative_error(sketch: &dyn Sketch, truth: &[(Vec<u8>, u64)]) -> (f64, us
         total += (est - *t as f64).abs() / *t as f64;
     }
     (total / truth.len() as f64, truth.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_rate_profile_math_is_explicit() {
+        let pps = target_events_per_sec(Profile::TenG, 1_250.0);
+        assert!((pps - 1_000_000.0).abs() < 1.0);
+
+        let pps = target_events_per_sec(Profile::HundredG, 1_250.0);
+        assert!((pps - 10_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn measured_capacity_math_is_explicit() {
+        let gbps = measured_l3_gbps(10_000_000.0, 1_250.0);
+        assert!((gbps - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn all_profile_expands_to_supported_line_rates() {
+        let names: Vec<_> = Profile::All
+            .selected()
+            .iter()
+            .map(|profile| profile.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["1 Gb/s", "10 Gb/s", "25 Gb/s", "40 Gb/s", "100 Gb/s"]
+        );
+    }
 }

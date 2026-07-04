@@ -10,6 +10,7 @@ members = [
     "crates/flowsketch-prometheus",
     "crates/flowsketch-otel",
     "crates/flowsketch-agent",
+    "crates/flowsketch-ebpf",
     "crates/flowsketch-gateway",
     "crates/flowsketch-cli",
 ]

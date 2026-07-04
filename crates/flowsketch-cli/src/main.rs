@@ -99,6 +99,21 @@ enum Command {
         /// Key-frequency distribution
         #[arg(long, value_enum, default_value_t = bench::Dist::Zipf)]
         dist: bench::Dist,
+        /// Line-rate profile for capacity projection
+        #[arg(long, value_enum)]
+        profile: Option<bench::Profile>,
+        /// Average packet size used for synthetic profile projection
+        #[arg(long, default_value_t = 1250)]
+        avg_packet_bytes: u64,
+        /// Benchmark parser/runtime throughput on a classic pcap trace
+        #[arg(long)]
+        trace: Option<PathBuf>,
+        /// Query YAML file(s) to execute while benchmarking --trace
+        #[arg(long = "query")]
+        queries: Vec<PathBuf>,
+        /// Hash seed for trace query execution
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
     },
     /// Generate a synthetic pcap trace (background traffic + heavy talkers + scanners)
     Synth {
@@ -229,7 +244,22 @@ fn main() -> Result<()> {
             events,
             keys,
             dist,
-        } => bench::run(algo, events, keys, dist),
+            profile,
+            avg_packet_bytes,
+            trace,
+            queries,
+            seed,
+        } => bench::run(bench::BenchConfig {
+            algo,
+            events,
+            keys,
+            dist,
+            profile,
+            avg_packet_bytes,
+            trace,
+            queries,
+            seed,
+        }),
         Command::Synth {
             out,
             packets,
