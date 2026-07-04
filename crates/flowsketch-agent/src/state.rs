@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use flowsketch_core::SketchEstimate;
+use flowsketch_ir::logical::Measure;
 use flowsketch_planner::Plan;
 use flowsketch_prometheus::QueryExportInfo;
 use flowsketch_runtime::QueryEngine;
@@ -23,6 +24,20 @@ pub struct QueryInfo {
     pub estimated_memory_bytes: u64,
     pub max_series: usize,
     pub window_size_nanos: u64,
+    /// Which `network.flowsketch.<unit>.estimated` OTLP metric this query
+    /// feeds.
+    pub otlp_unit: String,
+}
+
+/// OTLP unit for a measure: what the estimated number counts.
+fn otlp_unit(measure: &Measure) -> String {
+    match measure {
+        Measure::Count => "count".to_string(),
+        Measure::Sum { value } | Measure::HeavyHitters { value, .. } => value.label_name(),
+        Measure::DistinctCount { .. } => "distinct".to_string(),
+        Measure::Entropy { .. } => "entropy".to_string(),
+        Measure::Quantile { .. } => "quantile".to_string(),
+    }
 }
 
 pub struct PublishedState {
@@ -40,6 +55,8 @@ pub struct PublishedState {
     pub dropped_events: AtomicU64,
     pub sketch_memory_bytes: AtomicU64,
     pub late_events: AtomicU64,
+    pub otlp_exports: AtomicU64,
+    pub otlp_failures: AtomicU64,
 }
 
 impl PublishedState {
@@ -55,6 +72,7 @@ impl PublishedState {
                 estimated_memory_bytes: p.physical.estimated_memory_bytes,
                 max_series: p.query.export.max_series,
                 window_size_nanos: p.query.window.size_nanos,
+                otlp_unit: otlp_unit(&p.query.measure),
             })
             .collect();
         PublishedState {
@@ -69,6 +87,8 @@ impl PublishedState {
             dropped_events: AtomicU64::new(0),
             sketch_memory_bytes: AtomicU64::new(0),
             late_events: AtomicU64::new(0),
+            otlp_exports: AtomicU64::new(0),
+            otlp_failures: AtomicU64::new(0),
         }
     }
 
@@ -129,7 +149,7 @@ impl PublishedState {
     /// Agent health block appended to /metrics.
     pub fn render_health_metrics(&self) -> String {
         let mut out = String::new();
-        let counters: [(&str, &str, u64); 5] = [
+        let counters: [(&str, &str, u64); 7] = [
             (
                 "flowsketch_agent_events_processed_total",
                 "Flow events processed by the sketch engine.",
@@ -154,6 +174,16 @@ impl PublishedState {
                 "flowsketch_agent_sketch_memory_bytes",
                 "Bytes held by sketches across all queries and buckets.",
                 self.sketch_memory_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_otlp_exports_total",
+                "Successful OTLP metric exports.",
+                self.otlp_exports.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_otlp_export_failures_total",
+                "OTLP exports that failed after retries.",
+                self.otlp_failures.load(Ordering::Relaxed),
             ),
         ];
         for (name, help, value) in counters {

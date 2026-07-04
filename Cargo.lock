@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "flowsketch-core",
  "flowsketch-ir",
+ "flowsketch-otel",
  "flowsketch-pcap",
  "flowsketch-planner",
  "flowsketch-prometheus",
@@ -166,6 +167,15 @@ dependencies = [
  "flowsketch-core",
  "serde",
  "serde_yaml",
+ "thiserror",
+]
+
+[[package]]
+name = "flowsketch-otel"
+version = "0.1.0"
+dependencies = [
+ "flowsketch-core",
+ "serde_json",
  "thiserror",
 ]
 

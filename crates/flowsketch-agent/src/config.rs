@@ -44,6 +44,8 @@ pub struct AgentConfig {
     pub flush_interval_ms: u64,
     pub source: SourceConfig,
     pub query_files: Vec<PathBuf>,
+    /// OTLP export, if configured.
+    pub otlp: Option<flowsketch_otel::OtlpConfig>,
 }
 
 impl AgentConfig {
@@ -55,6 +57,22 @@ impl AgentConfig {
                 "agent config must list at least one query file".into(),
             ));
         }
+        let otlp = raw.export.and_then(|e| e.otlp).map(|o| {
+            let interval_ms = o.interval_ms.unwrap_or(5_000).max(100);
+            flowsketch_otel::OtlpConfig {
+                endpoint: o.endpoint,
+                interval_ms,
+            }
+        });
+        if let Some(o) = &otlp {
+            if !o.endpoint.starts_with("http://") {
+                return Err(AgentError::Config(format!(
+                    "export.otlp.endpoint must be http:// (got {:?}); point it at a local \
+                     OpenTelemetry Collector",
+                    o.endpoint
+                )));
+            }
+        }
         Ok(AgentConfig {
             node_name: raw.agent.node_name.unwrap_or_else(|| "unknown".into()),
             listen: raw.agent.listen.unwrap_or_else(|| "127.0.0.1:9464".into()),
@@ -62,6 +80,7 @@ impl AgentConfig {
             flush_interval_ms: raw.agent.flush_interval_ms.unwrap_or(1_000).max(10),
             source: raw.agent.source,
             query_files: raw.queries.into_iter().map(|q| q.file).collect(),
+            otlp,
         })
     }
 
@@ -111,6 +130,23 @@ impl AgentConfig {
 struct RawConfig {
     agent: RawAgent,
     queries: Vec<RawQueryRef>,
+    #[serde(default)]
+    export: Option<RawExport>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExport {
+    #[serde(default)]
+    otlp: Option<RawOtlp>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOtlp {
+    endpoint: String,
+    #[serde(default, rename = "intervalMs", alias = "interval_ms")]
+    interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +210,26 @@ queries:
         }
         // Defaults applied.
         assert_eq!(cfg.listen, "127.0.0.1:9464");
+    }
+
+    #[test]
+    fn parses_otlp_export_block() {
+        let cfg = AgentConfig::from_yaml(
+            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n\
+             export:\n  otlp:\n    endpoint: http://collector:4318\n    intervalMs: 2000\n",
+        )
+        .unwrap();
+        let otlp = cfg.otlp.expect("otlp configured");
+        assert_eq!(otlp.endpoint, "http://collector:4318");
+        assert_eq!(otlp.interval_ms, 2000);
+        assert_eq!(otlp.metrics_url(), "http://collector:4318/v1/metrics");
+
+        // https is rejected with direction (no TLS in v0).
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n\
+             export:\n  otlp:\n    endpoint: https://collector:4318\n",
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,0 +1,13 @@
+[package]
+name = "flowsketch-otel"
+description = "FlowSketch OTLP exporter: sketch estimates as OTLP/HTTP+JSON metrics with OTel semantic conventions, batching, and retry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flowsketch-core = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
