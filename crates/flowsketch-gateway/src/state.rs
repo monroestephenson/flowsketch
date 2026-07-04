@@ -151,13 +151,33 @@ impl GatewayState {
                 continue;
             }
             // Choose the freshest window any node reports, then merge every
-            // node that has exactly that window.
-            let target = per_node
+            // node that has exactly that window. Among nodes sharing the
+            // newest end time, pick the start that the most nodes agree on
+            // (tie-break: the earliest start, i.e. the fullest window). A
+            // node that (re)starts mid-window exports a shorter
+            // `[later_start, end)` covering the same end; without the
+            // majority rule its lone partial window would win the tuple max
+            // and evict every established full-window node during rolling
+            // restarts.
+            let max_end = per_node
                 .values()
-                .map(|nw| (nw.state.window_end_nanos(), nw.state.window_start_nanos()))
+                .map(|nw| nw.state.window_end_nanos())
                 .max()
-                .map(|(end, start)| (start, end))
                 .unwrap();
+            let mut start_votes: BTreeMap<u64, usize> = BTreeMap::new();
+            for nw in per_node.values() {
+                if nw.state.window_end_nanos() == max_end {
+                    *start_votes
+                        .entry(nw.state.window_start_nanos())
+                        .or_default() += 1;
+                }
+            }
+            let target_start = start_votes
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(start, _)| start)
+                .unwrap();
+            let target = (target_start, max_end);
             let mut merged: Option<WindowState> = None;
             let mut nodes_merged = 0usize;
             for nw in per_node.values() {
@@ -330,4 +350,106 @@ pub struct MergedQuery {
     pub nodes_merged: usize,
     pub window_end_nanos: u64,
     pub estimates: Vec<SketchEstimate>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    use flowsketch_core::FlowEvent;
+    use flowsketch_ir::parse_query_yaml;
+    use flowsketch_planner::plan;
+    use flowsketch_runtime::QueryEngine;
+
+    use crate::batch::PushEntry;
+
+    const YAML: &str = "name: scanners\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
+         measure: {type: distinct_count, field: dst.ip, error: {epsilon: 0.02}}\n";
+
+    fn plan_for(seed: u64) -> Plan {
+        plan(parse_query_yaml(YAML).unwrap(), &HashSpec::new(seed)).unwrap()
+    }
+
+    fn event(ts_s: u64, dst: &str) -> FlowEvent {
+        FlowEvent {
+            ts_nanos: ts_s * 1_000_000_000,
+            src_ip: "10.0.1.50".parse::<IpAddr>().unwrap(),
+            dst_ip: dst.parse::<IpAddr>().unwrap(),
+            src_port: 40_000,
+            dst_port: 22,
+            protocol: 6,
+            bytes: 60,
+            ..FlowEvent::default()
+        }
+    }
+
+    /// A push batch from a node whose engine processed one event at each of
+    /// `secs`. Events at 0,10,..,50 fill the 6-bucket ring to the full
+    /// `[0s,60s)` window; a lone event at 55 leaves a partial `[50s,60s)`.
+    fn batch_for(node: &str, secs: &[u64], seed: u64) -> PushBatch {
+        let mut eng = QueryEngine::new(vec![plan_for(seed)], HashSpec::new(seed)).unwrap();
+        for (i, &s) in secs.iter().enumerate() {
+            eng.process(&event(s, &format!("10.9.{}.{}", i / 256, i % 256)))
+                .unwrap();
+        }
+        PushBatch {
+            node: node.to_string(),
+            entries: eng
+                .export_snapshots()
+                .unwrap()
+                .into_iter()
+                .map(|s| PushEntry {
+                    query_name: s.query_name,
+                    component: s.component,
+                    snapshot: s.bytes,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn merge_prefers_window_shared_by_most_nodes() {
+        let state = GatewayState::new(
+            vec![plan_for(0)],
+            HashSpec::new(0),
+            Duration::from_secs(300),
+        );
+        // node-a and node-c hold the established full window [0s,60s);
+        // node-b just (re)started and only has the partial [50s,60s), which
+        // shares the same end time.
+        state.apply_batch(&batch_for("node-a", &[0, 10, 20, 30, 40, 50], 0));
+        state.apply_batch(&batch_for("node-c", &[0, 10, 20, 30, 40, 50], 0));
+        state.apply_batch(&batch_for("node-b", &[55], 0));
+
+        let merged = state.merged();
+        assert_eq!(merged.len(), 1);
+        let m = &merged[0];
+        assert_eq!(m.window_end_nanos, 60_000_000_000);
+        assert_eq!(m.nodes_known, 3);
+        // The two full-window nodes merge; the lone partial window is
+        // excluded rather than evicting the majority.
+        assert_eq!(
+            m.nodes_merged, 2,
+            "partial-window straggler must not displace the established full-window nodes"
+        );
+    }
+
+    #[test]
+    fn merge_uses_freshest_end_time() {
+        let state = GatewayState::new(
+            vec![plan_for(0)],
+            HashSpec::new(0),
+            Duration::from_secs(300),
+        );
+        // node-a is a window behind (ends 60s); node-b advanced to the next
+        // window (ends 70s). The gateway reports the freshest window only.
+        state.apply_batch(&batch_for("node-a", &[0, 10, 20, 30, 40, 50], 0));
+        state.apply_batch(&batch_for("node-b", &[10, 20, 30, 40, 50, 60], 0));
+
+        let merged = state.merged();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].window_end_nanos, 70_000_000_000);
+        assert_eq!(merged[0].nodes_merged, 1);
+    }
 }
