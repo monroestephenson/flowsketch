@@ -26,11 +26,14 @@
 > - **entropy measure** (ungrouped): SpaceSaving-head + HLL-tail estimator
 > - **cross-process sketch merge**: `flowsketch replay --snapshot-out` +
 >   `flowsketch merge-snapshots` (the Phase 7 distributed-merge primitive)
+> - **OTLP metrics export** (Phase 4): the agent pushes estimates to any
+>   OpenTelemetry Collector / Grafana Alloy / Datadog OTel endpoint over
+>   OTLP/HTTP+JSON with OTel semantic conventions, batching, and retry
 >
 > See `docs/operator-guide.md`, `docs/query-language.md`,
 > `docs/accuracy-contracts.md`, and `docs/algorithm-notes.md`. Everything
-> below this block is the original design plan; the remaining phases (OTLP,
-> Kubernetes, eBPF, gateway service) are not yet built.
+> below this block is the original design plan; the remaining phases
+> (Kubernetes, eBPF, gateway service) are not yet built.
 
 ## 0. Core thesis
 

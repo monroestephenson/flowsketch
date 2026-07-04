@@ -64,6 +64,28 @@ when the engine falls behind, capture drops events and counts them in
 A capture failure flips `/healthz` to 503 while `/metrics` keeps serving
 the last good state.
 
+## OTLP export
+
+Add an `export.otlp` block to the agent config to push estimates to any
+OTLP/HTTP endpoint (OpenTelemetry Collector, Grafana Alloy, the Datadog
+OTel path):
+
+```yaml
+export:
+  otlp:
+    endpoint: http://otel-collector:4318   # /v1/metrics appended
+    intervalMs: 5000
+```
+
+Estimates become `network.flowsketch.<unit>.estimated` gauges with
+`service.name`/`host.name` resource attributes and query metadata plus
+group labels as attributes (`src.ip` maps to `source.address`, `protocol`
+to `network.protocol.name`, and so on). Already-exported windows are
+skipped, transient failures retry with exponential backoff, and export
+health shows up in `/metrics` as `flowsketch_agent_otlp_exports_total` /
+`flowsketch_agent_otlp_export_failures_total`. Plain `http://` only in
+v0 — run the collector next to the agent, which is the standard shape.
+
 ## Distributed merge (two-node demo)
 
 ```bash

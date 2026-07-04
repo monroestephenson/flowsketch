@@ -21,3 +21,10 @@ queries:
   - file: queries/top-talkers.yaml
   - file: queries/suspected-scanners.yaml
   - file: queries/flow-size-quantiles.yaml
+# Optional: push estimates to an OpenTelemetry Collector / Grafana Alloy /
+# Datadog OTel pipeline over OTLP/HTTP+JSON (plain http; deploy the
+# collector as a local sidecar/daemonset):
+# export:
+#   otlp:
+#     endpoint: http://otel-collector:4318
+#     intervalMs: 5000
