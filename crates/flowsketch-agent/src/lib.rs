@@ -20,7 +20,9 @@ pub mod source;
 pub mod state;
 
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::Receiver;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,13 +68,14 @@ pub fn run(
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| AgentError::Http(format!("cannot bind {}: {e}", config.listen)))?;
     let addr = listener.local_addr()?;
-    http::serve_in_background(listener, Arc::clone(&published));
+    http::serve_in_background(listener, Arc::clone(&published))
+        .map_err(|e| AgentError::Http(format!("cannot spawn HTTP server: {e}")))?;
     if let Some(otlp) = config.otlp.clone() {
-        spawn_otlp_exporter(otlp, Arc::clone(&published), config.node_name.clone());
+        spawn_otlp_exporter(otlp, Arc::clone(&published), config.node_name.clone())?;
     }
     if let Some(gateway) = config.gateway.clone() {
         published.enable_snapshot_export(Duration::from_millis(gateway.interval_ms));
-        spawn_gateway_pusher(gateway, Arc::clone(&published), config.node_name.clone());
+        spawn_gateway_pusher(gateway, Arc::clone(&published), config.node_name.clone())?;
     }
     on_ready(addr);
 
@@ -82,7 +85,7 @@ pub fn run(
     let capture = std::thread::Builder::new()
         .name("fs-capture".into())
         .spawn(move || source::capture_loop(source_cfg, tx, capture_state))
-        .expect("spawn capture thread");
+        .map_err(AgentError::Io)?;
 
     engine_loop(engine, rx, Arc::clone(&published), config.flush_interval())?;
 
@@ -108,7 +111,7 @@ fn spawn_otlp_exporter(
     cfg: flowsketch_otel::OtlpConfig,
     state: Arc<PublishedState>,
     node_name: String,
-) {
+) -> Result<(), AgentError> {
     use flowsketch_otel::encode::{EncodeOptions, QueryMeta};
 
     let opts = EncodeOptions {
@@ -166,7 +169,8 @@ fn spawn_otlp_exporter(
                 }
             }
         })
-        .expect("spawn otlp thread");
+        .map(|_| ())
+        .map_err(AgentError::Io)
 }
 
 /// Periodically push the engine's current window snapshots to the cluster
@@ -178,7 +182,7 @@ fn spawn_gateway_pusher(
     cfg: flowsketch_gateway::PushConfig,
     state: Arc<PublishedState>,
     node_name: String,
-) {
+) -> Result<(), AgentError> {
     let url = cfg.snapshots_url();
     let interval = Duration::from_millis(cfg.interval_ms);
     std::thread::Builder::new()
@@ -210,10 +214,12 @@ fn spawn_gateway_pusher(
                 }
             }
         })
-        .expect("spawn gateway push thread");
+        .map(|_| ())
+        .map_err(AgentError::Io)
 }
 
 /// Push events into the channel, counting drops instead of blocking.
+#[cfg(target_os = "linux")]
 pub(crate) fn offer_event(
     tx: &SyncSender<FlowEvent>,
     event: FlowEvent,

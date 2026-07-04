@@ -20,9 +20,10 @@
 >
 > Beyond the v0 MVP, the following are also implemented:
 >
-> - **live agent** (`flowsketch-agent`, Phase 3): pcap or AF_PACKET capture
->   feeding the engine, with HTTP `/metrics`, `/healthz`, `/readyz`, and
->   `/v1/queries` (`flowsketch agent --config examples/agent.yaml`)
+> - **live agent** (`flowsketch-agent`, Phase 3): pcap replay on every
+>   supported developer platform, plus Linux AF_PACKET live capture, feeding
+>   the engine with HTTP `/metrics`, `/healthz`, `/readyz`, and `/v1/queries`
+>   (`flowsketch agent --config examples/agent.yaml`)
 > - **KLL quantile sketch** and the `quantile` measure (e.g. packet-size p99)
 > - **entropy measure** (ungrouped): SpaceSaving-head + HLL-tail estimator
 > - **cross-process sketch merge**: `flowsketch replay --snapshot-out` +
@@ -37,9 +38,9 @@
 >   `/v1/nodes` (`flowsketch gateway --config examples/gateway.yaml`)
 >
 > See `docs/operator-guide.md`, `docs/query-language.md`,
-> `docs/accuracy-contracts.md`, and `docs/algorithm-notes.md`. Everything
-> below this block is the original design plan; the remaining phases
-> (Kubernetes, eBPF) are not yet built.
+> `docs/accuracy-contracts.md`, `docs/algorithm-notes.md`, and
+> `docs/security.md`. Everything below this block is the original design
+> plan; the remaining phases (Kubernetes, eBPF) are not yet built.
 
 ## 0. Core thesis
 

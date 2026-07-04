@@ -6,11 +6,15 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
 use flowsketch_core::FlowEvent;
-use flowsketch_pcap::{linktype, parse_packet, PcapReader};
+use flowsketch_pcap::PcapReader;
+#[cfg(target_os = "linux")]
+use flowsketch_pcap::{linktype, parse_packet};
 
 use crate::config::SourceConfig;
+#[cfg(target_os = "linux")]
+use crate::offer_event;
 use crate::state::PublishedState;
-use crate::{offer_event, AgentError};
+use crate::AgentError;
 
 pub fn capture_loop(
     source: SourceConfig,
@@ -51,9 +55,9 @@ fn pcap_loop(
     Ok(())
 }
 
-/// AF_PACKET live capture. Compiled on unix; returns a clear error on
-/// other platforms.
-#[cfg(unix)]
+/// AF_PACKET live capture. Linux only; other platforms return a clear
+/// configuration/runtime error.
+#[cfg(target_os = "linux")]
 fn af_packet_loop(
     interface: &str,
     tx: &SyncSender<FlowEvent>,
@@ -81,7 +85,7 @@ fn af_packet_loop(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn af_packet_loop(
     interface: &str,
     _tx: &SyncSender<FlowEvent>,
@@ -92,7 +96,7 @@ fn af_packet_loop(
     )))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn now_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -101,12 +105,12 @@ fn now_nanos() -> u64 {
 }
 
 /// Thin RAII wrapper over a bound AF_PACKET socket.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 struct AfPacketSocket {
     fd: std::os::fd::OwnedFd,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl AfPacketSocket {
     fn open(interface: &str) -> Result<Self, AgentError> {
         use std::os::fd::FromRawFd;

@@ -3,7 +3,7 @@
 //! plain `http://` only — the expected peer is a local collector.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -18,12 +18,22 @@ pub enum OtlpClientError {
     Io(String, std::io::Error),
     #[error("collector returned HTTP {0}")]
     Status(u16),
+    #[error("encoded OTLP request body is {bytes} bytes, above the {max} byte cap")]
+    BodyTooLarge { bytes: usize, max: usize },
     #[error("gave up after {attempts} attempts; last error: {last}")]
     RetriesExhausted { attempts: u32, last: String },
 }
 
+const MAX_ENDPOINT_LEN: usize = 2_048;
+const MAX_OTLP_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Parse `http://host:port/path` into (authority, path).
 fn parse_url(url: &str) -> Result<(String, String), OtlpClientError> {
+    if url.len() > MAX_ENDPOINT_LEN {
+        return Err(OtlpClientError::BadEndpoint(url.to_string()));
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| OtlpClientError::BadEndpoint(url.to_string()))?;
@@ -31,7 +41,10 @@ fn parse_url(url: &str) -> Result<(String, String), OtlpClientError> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    if authority.is_empty() {
+    if authority.is_empty()
+        || authority.bytes().any(|b| b <= b' ' || b == 0x7f)
+        || path.bytes().any(|b| b <= b' ' || b == 0x7f)
+    {
         return Err(OtlpClientError::BadEndpoint(url.to_string()));
     }
     Ok((authority.to_string(), path.to_string()))
@@ -40,8 +53,28 @@ fn parse_url(url: &str) -> Result<(String, String), OtlpClientError> {
 /// One POST attempt. Returns the HTTP status code.
 fn post_once(url: &str, body: &[u8], timeout: Duration) -> Result<u16, OtlpClientError> {
     let (authority, path) = parse_url(url)?;
-    let mut stream = TcpStream::connect(&authority)
-        .map_err(|e| OtlpClientError::Connect(authority.clone(), e))?;
+    let mut last_connect_error = None;
+    let mut stream = None;
+    for addr in authority
+        .to_socket_addrs()
+        .map_err(|e| OtlpClientError::Connect(authority.clone(), e))?
+    {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_connect_error = Some(e),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        OtlpClientError::Connect(
+            authority.clone(),
+            last_connect_error.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no socket addresses")
+            }),
+        )
+    })?;
     stream
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
@@ -58,8 +91,11 @@ fn post_once(url: &str, body: &[u8], timeout: Duration) -> Result<u16, OtlpClien
         .map_err(|e| OtlpClientError::Io(authority.clone(), e))?;
 
     let mut response = Vec::new();
-    // Read until close; only the status line matters.
-    let _ = stream.take(16 * 1024).read_to_end(&mut response);
+    // Read until close, bounded; only the status line matters.
+    (&mut stream)
+        .take(MAX_HTTP_RESPONSE_BYTES)
+        .read_to_end(&mut response)
+        .map_err(|e| OtlpClientError::Io(authority.clone(), e))?;
     let status_line = response.split(|&b| b == b'\n').next().unwrap_or_default();
     let status: u16 = std::str::from_utf8(status_line)
         .ok()
@@ -80,6 +116,12 @@ fn post_once(url: &str, body: &[u8], timeout: Duration) -> Result<u16, OtlpClien
 /// is final — the payload will not get more acceptable by resending it.
 pub fn post_metrics(url: &str, document: &serde_json::Value) -> Result<(), OtlpClientError> {
     let body = serde_json::to_vec(document).expect("json value serializes");
+    if body.len() > MAX_OTLP_BODY_BYTES {
+        return Err(OtlpClientError::BodyTooLarge {
+            bytes: body.len(),
+            max: MAX_OTLP_BODY_BYTES,
+        });
+    }
     let mut last_error = String::new();
     let mut backoff = Duration::from_millis(200);
     const ATTEMPTS: u32 = 3;
@@ -89,7 +131,7 @@ pub fn post_metrics(url: &str, document: &serde_json::Value) -> Result<(), OtlpC
             std::thread::sleep(backoff);
             backoff *= 4;
         }
-        match post_once(url, &body, Duration::from_secs(5)) {
+        match post_once(url, &body, HTTP_TIMEOUT) {
             Ok(status) if (200..300).contains(&status) => return Ok(()),
             // OTLP retryable set: rate limiting and gateway pressure.
             Ok(status @ (429 | 502 | 503 | 504)) => last_error = format!("HTTP {status}"),
@@ -237,5 +279,28 @@ mod tests {
     fn rejects_non_http_endpoints() {
         let err = post_metrics("https://collector:4318", &serde_json::json!({}));
         assert!(matches!(err, Err(OtlpClientError::BadEndpoint(_))));
+    }
+
+    #[test]
+    fn rejects_malformed_http_endpoints() {
+        let err = post_metrics("http://local host:4318/v1/metrics", &serde_json::json!({}));
+        assert!(matches!(err, Err(OtlpClientError::BadEndpoint(_))));
+
+        let long = format!("http://{}:4318/v1/metrics", "a".repeat(MAX_ENDPOINT_LEN));
+        let err = post_metrics(&long, &serde_json::json!({}));
+        assert!(matches!(err, Err(OtlpClientError::BadEndpoint(_))));
+    }
+
+    #[test]
+    fn rejects_oversized_request_body_before_connecting() {
+        let doc = serde_json::json!({ "payload": "x".repeat(MAX_OTLP_BODY_BYTES) });
+        let err = post_metrics("http://127.0.0.1:1/v1/metrics", &doc);
+        assert!(matches!(
+            err,
+            Err(OtlpClientError::BodyTooLarge {
+                max: MAX_OTLP_BODY_BYTES,
+                ..
+            })
+        ));
     }
 }

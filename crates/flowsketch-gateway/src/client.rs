@@ -5,7 +5,7 @@
 //! exporter's posture.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -43,12 +43,22 @@ pub enum PushClientError {
     Io(String, std::io::Error),
     #[error("gateway returned HTTP {0}")]
     Status(u16),
+    #[error("encoded gateway push body is {bytes} bytes, above the {max} byte cap")]
+    BodyTooLarge { bytes: usize, max: usize },
     #[error("gave up after {attempts} attempts; last error: {last}")]
     RetriesExhausted { attempts: u32, last: String },
 }
 
+const MAX_ENDPOINT_LEN: usize = 2_048;
+const MAX_PUSH_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Parse `http://host:port/path` into (authority, path).
 fn parse_url(url: &str) -> Result<(String, String), PushClientError> {
+    if url.len() > MAX_ENDPOINT_LEN {
+        return Err(PushClientError::BadEndpoint(url.to_string()));
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| PushClientError::BadEndpoint(url.to_string()))?;
@@ -56,7 +66,10 @@ fn parse_url(url: &str) -> Result<(String, String), PushClientError> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    if authority.is_empty() {
+    if authority.is_empty()
+        || authority.bytes().any(|b| b <= b' ' || b == 0x7f)
+        || path.bytes().any(|b| b <= b' ' || b == 0x7f)
+    {
         return Err(PushClientError::BadEndpoint(url.to_string()));
     }
     Ok((authority.to_string(), path.to_string()))
@@ -65,8 +78,28 @@ fn parse_url(url: &str) -> Result<(String, String), PushClientError> {
 /// One POST attempt. Returns the HTTP status code.
 fn post_once(url: &str, body: &[u8], timeout: Duration) -> Result<u16, PushClientError> {
     let (authority, path) = parse_url(url)?;
-    let mut stream = TcpStream::connect(&authority)
-        .map_err(|e| PushClientError::Connect(authority.clone(), e))?;
+    let mut last_connect_error = None;
+    let mut stream = None;
+    for addr in authority
+        .to_socket_addrs()
+        .map_err(|e| PushClientError::Connect(authority.clone(), e))?
+    {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_connect_error = Some(e),
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        PushClientError::Connect(
+            authority.clone(),
+            last_connect_error.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no socket addresses")
+            }),
+        )
+    })?;
     stream
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
@@ -83,8 +116,11 @@ fn post_once(url: &str, body: &[u8], timeout: Duration) -> Result<u16, PushClien
         .map_err(|e| PushClientError::Io(authority.clone(), e))?;
 
     let mut response = Vec::new();
-    // Read until close; only the status line matters.
-    let _ = stream.take(16 * 1024).read_to_end(&mut response);
+    // Read until close, bounded; only the status line matters.
+    (&mut stream)
+        .take(MAX_HTTP_RESPONSE_BYTES)
+        .read_to_end(&mut response)
+        .map_err(|e| PushClientError::Io(authority.clone(), e))?;
     let status_line = response.split(|&b| b == b'\n').next().unwrap_or_default();
     let status: u16 = std::str::from_utf8(status_line)
         .ok()
@@ -105,6 +141,12 @@ fn post_once(url: &str, body: &[u8], timeout: Duration) -> Result<u16, PushClien
 /// (incompatible sketches, unknown query) and will not get more
 /// acceptable by resending it.
 pub fn push_batch(url: &str, body: &[u8]) -> Result<(), PushClientError> {
+    if body.len() > MAX_PUSH_BODY_BYTES {
+        return Err(PushClientError::BodyTooLarge {
+            bytes: body.len(),
+            max: MAX_PUSH_BODY_BYTES,
+        });
+    }
     let mut last_error = String::new();
     let mut backoff = Duration::from_millis(200);
     const ATTEMPTS: u32 = 3;
@@ -114,7 +156,7 @@ pub fn push_batch(url: &str, body: &[u8]) -> Result<(), PushClientError> {
             std::thread::sleep(backoff);
             backoff *= 4;
         }
-        match post_once(url, body, Duration::from_secs(5)) {
+        match post_once(url, body, HTTP_TIMEOUT) {
             Ok(status) if (200..300).contains(&status) => return Ok(()),
             Ok(status @ (429 | 502 | 503 | 504)) => last_error = format!("HTTP {status}"),
             Ok(status) => return Err(PushClientError::Status(status)),
@@ -150,6 +192,29 @@ mod tests {
     fn rejects_non_http_endpoints() {
         let err = push_batch("https://gw:9465/v1/snapshots", &[]).unwrap_err();
         assert!(matches!(err, PushClientError::BadEndpoint(_)));
+    }
+
+    #[test]
+    fn rejects_malformed_http_endpoints() {
+        let err = push_batch("http://local host:9465/v1/snapshots", &[]).unwrap_err();
+        assert!(matches!(err, PushClientError::BadEndpoint(_)));
+
+        let long = format!("http://{}:9465/v1/snapshots", "a".repeat(MAX_ENDPOINT_LEN));
+        let err = push_batch(&long, &[]).unwrap_err();
+        assert!(matches!(err, PushClientError::BadEndpoint(_)));
+    }
+
+    #[test]
+    fn rejects_oversized_push_body_before_connecting() {
+        let body = vec![0u8; MAX_PUSH_BODY_BYTES + 1];
+        let err = push_batch("http://127.0.0.1:1/v1/snapshots", &body).unwrap_err();
+        assert!(matches!(
+            err,
+            PushClientError::BodyTooLarge {
+                max: MAX_PUSH_BODY_BYTES,
+                ..
+            }
+        ));
     }
 
     #[test]

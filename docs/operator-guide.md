@@ -58,13 +58,22 @@ curl -s localhost:9464/healthz                   # capture-source health
 curl -s localhost:9464/v1/queries | jq           # plans, memory, error contracts
 ```
 
-For live capture, set `source.kind: af_packet` with an `interface` — this
-opens an AF_PACKET raw socket and needs CAP_NET_RAW (or root). The agent
-is a capture thread feeding a bounded channel into the engine thread;
-when the engine falls behind, capture drops events and counts them in
-`flowsketch_agent_dropped_events_total` rather than blocking the NIC path.
-A capture failure flips `/healthz` to 503 while `/metrics` keeps serving
-the last good state.
+For live capture on Linux, set `source.kind: af_packet` with an `interface`
+— this opens an AF_PACKET raw socket and needs CAP_NET_RAW (or root). On
+macOS and other non-Linux platforms, `source.kind: pcap` is supported for
+development, demos, and offline analysis; `af_packet` returns a clear
+"Linux only" error. The agent is a capture thread feeding a bounded channel
+into the engine thread; when the engine falls behind, capture drops events
+and counts them in `flowsketch_agent_dropped_events_total` rather than
+blocking the NIC path. A capture failure flips `/healthz` to 503 while
+`/metrics` keeps serving the last good state.
+
+In pcap-source mode, the capture source is finite: once the file is fully
+processed, the agent marks `flowsketch_agent_source_done` and keeps serving
+the final published window until the process is terminated. Thread startup
+failures return errors instead of panicking, and the embedded HTTP server
+caps concurrent connections, request-line/header sizes, and read/write
+timeouts.
 
 ## OTLP export
 
@@ -141,6 +150,9 @@ Semantics and safety:
 - Gateway memory is bounded: one window state per (query, live node),
   each within the planner's budget; nodes that stop pushing are evicted
   after `staleAfterMs`.
+- The gateway HTTP server caps concurrent connections, request-line/header
+  sizes, POST body size, and read/write timeouts. Agent push clients cap
+  endpoint length, request body size, response reads, and retry count.
 - Estimates keep their error contracts: the merged output carries the
   same `algorithm`/`error_kind` labels and series caps as node-local
   export.
@@ -157,9 +169,14 @@ planner rejects queries whose sketch memory exceeds `resources.maxMemory`.
 Headers and metadata only: the pcap parser never reads past the TCP/UDP
 header, and payload bytes are never retained, hashed, or exported.
 
+See `docs/security.md` for the full security posture, including HTTP
+exposure, capture privileges, exporter trust boundaries, and snapshot
+handling.
+
 ## Supported inputs (v0)
 
 Classic pcap (`.pcap`, both endiannesses, µs/ns timestamps) over Ethernet
 (incl. 802.1Q/QinQ), raw-IP, or Linux SLL link types; IPv4/IPv6 (with
-extension-header walking); TCP/UDP ports and TCP flags. pcapng, live
-capture, eBPF, and Hubble/NetFlow receivers are later phases (README §10).
+extension-header walking); TCP/UDP ports and TCP flags. Linux live capture
+is available through AF_PACKET. pcapng, macOS BPF live capture, eBPF, and
+Hubble/NetFlow receivers are later phases (README §10).

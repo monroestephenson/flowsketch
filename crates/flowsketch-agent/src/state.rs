@@ -274,6 +274,18 @@ impl PublishedState {
             self.queries.len()
         ));
         out.push_str(&format!(
+            "# HELP flowsketch_agent_ready Whether the agent engine is ready to process events.\n\
+             # TYPE flowsketch_agent_ready gauge\n\
+             flowsketch_agent_ready {}\n",
+            u8::from(self.ready.load(Ordering::Acquire))
+        ));
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_source_done Whether the configured capture source has completed.\n\
+             # TYPE flowsketch_agent_source_done gauge\n\
+             flowsketch_agent_source_done {}\n",
+            u8::from(self.source_done.load(Ordering::Acquire))
+        ));
+        out.push_str(&format!(
             "# HELP flowsketch_agent_uptime_seconds Seconds since agent start.\n\
              # TYPE flowsketch_agent_uptime_seconds gauge\n\
              flowsketch_agent_uptime_seconds {}\n",

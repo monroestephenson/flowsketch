@@ -1,10 +1,12 @@
 //! Minimal dependency-free HTTP/1.1 server for the gateway: the agent's
-//! read-only server plus one POST route for snapshot pushes. Connection-
-//! per-thread, bounded request bodies, deliberately boring.
+//! read-only server plus one POST route for snapshot pushes. Bounded
+//! connection-per-thread, bounded request bodies, deliberately boring.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::batch::PushBatch;
 use crate::state::GatewayState;
@@ -12,32 +14,67 @@ use crate::state::GatewayState;
 /// Cap on POST bodies. Sketch memory is planner-budgeted (tens of MiB at
 /// the extreme), so a larger push is corrupt or hostile, not legitimate.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Accept connections until the process is terminated.
-pub fn serve(listener: TcpListener, state: Arc<GatewayState>) {
+pub fn serve(listener: TcpListener, state: Arc<GatewayState>) -> std::io::Result<()> {
+    let active_connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let stream = stream?;
+        if !try_acquire_connection(&active_connections) {
+            let _ = respond(stream, 503, "text/plain", "server busy\n");
+            continue;
+        }
         let state = Arc::clone(&state);
-        let _ = std::thread::Builder::new()
+        let active = Arc::clone(&active_connections);
+        let spawn = std::thread::Builder::new()
             .name("fs-gw-conn".into())
             .spawn(move || {
+                let _guard = ConnectionGuard(active);
                 let _ = handle_connection(stream, &state);
             });
+        if spawn.is_err() {
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+        }
     }
+    Ok(())
 }
 
 fn handle_connection(stream: TcpStream, state: &GatewayState) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    let request_line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE_BYTES) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return respond(stream, 400, "text/plain", "bad request\n")
+        }
+        Err(e) => return Err(e),
+    };
 
     // Drain headers, keeping Content-Length for POST bodies.
     let mut content_length = 0usize;
-    let mut line = String::new();
+    let mut header_bytes = 0usize;
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
+        let line = match read_line_bounded(&mut reader, MAX_HEADER_LINE_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return respond(stream, 431, "text/plain", "request headers too large\n")
+            }
+            Err(e) => return Err(e),
+        };
+        header_bytes += line.len();
+        if header_bytes > MAX_HEADER_BYTES {
+            return respond(stream, 431, "text/plain", "request headers too large\n");
+        }
+        if line == "\r\n" || line == "\n" {
             break;
         }
         if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
@@ -123,6 +160,8 @@ fn respond(
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Unknown",
     };
     write!(
@@ -131,4 +170,59 @@ fn respond(
         body.len()
     )?;
     stream.flush()
+}
+
+fn try_acquire_connection(active: &AtomicUsize) -> bool {
+    loop {
+        let current = active.load(Ordering::Acquire);
+        if current >= MAX_CONCURRENT_CONNECTIONS {
+            return false;
+        }
+        if active
+            .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(available.len(), |pos| pos + 1);
+        if buf.len() + take > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP line too long",
+            ));
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if buf.ends_with(b"\n") {
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+    }
 }

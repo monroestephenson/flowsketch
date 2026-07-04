@@ -61,6 +61,6 @@ pub fn run(
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| GatewayError::Http(format!("cannot bind {}: {e}", config.listen)))?;
     on_ready(listener.local_addr()?);
-    http::serve(listener, state);
-    Ok(())
+    http::serve(listener, state)
+        .map_err(|e| GatewayError::Http(format!("gateway HTTP server stopped: {e}")))
 }
