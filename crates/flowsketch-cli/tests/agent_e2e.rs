@@ -120,6 +120,125 @@ fn start_agent(dir: &Path) -> AgentUnderTest {
     AgentUnderTest { child, addr }
 }
 
+/// Mock OTLP collector: accepts POSTs on /v1/metrics until dropped,
+/// pushing each JSON body into a channel.
+fn mock_otlp_collector() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::BufRead;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut content_length = 0usize;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if std::io::Read::read_exact(&mut reader, &mut body).is_ok() {
+                    let mut stream = reader.into_inner();
+                    let _ = Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+#[test]
+fn agent_exports_otlp_metrics_to_collector() {
+    let dir = std::env::temp_dir().join("flowsketch-otlp-e2e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (endpoint, bodies) = mock_otlp_collector();
+
+    // Synthetic trace + config with OTLP export at a fast interval.
+    let pcap = dir.join("otlp.pcap");
+    assert!(flowsketch()
+        .args([
+            "synth",
+            "--out",
+            pcap.to_str().unwrap(),
+            "--packets",
+            "20000",
+            "--seed",
+            "4"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let examples = workspace_root().join("examples/queries");
+    let config = dir.join("agent.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "agent:\n  nodeName: otlp-node\n  listen: 127.0.0.1:0\n  flushIntervalMs: 50\n  \
+             source:\n    kind: pcap\n    path: {}\nqueries:\n  - file: {}\n\
+             export:\n  otlp:\n    endpoint: {}\n    intervalMs: 200\n",
+            pcap.display(),
+            examples.join("top-talkers.yaml").display(),
+            endpoint,
+        ),
+    )
+    .unwrap();
+    let mut child = flowsketch()
+        .args(["agent", "--config", config.to_str().unwrap()])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // The exporter should deliver at least one document.
+    let body = bodies
+        .recv_timeout(Duration::from_secs(30))
+        .expect("no OTLP export received");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let resource = &doc["resourceMetrics"][0]["resource"]["attributes"];
+    assert!(resource
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["key"] == "service.name" && a["value"]["stringValue"] == "flowsketch-agent"));
+    assert!(resource
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["key"] == "host.name" && a["value"]["stringValue"] == "otlp-node"));
+
+    let metric = &doc["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
+    assert_eq!(metric["name"], "network.flowsketch.bytes.estimated");
+    let points = metric["gauge"]["dataPoints"].as_array().unwrap();
+    assert!(!points.is_empty());
+    let attrs = points[0]["attributes"].as_array().unwrap();
+    assert!(
+        attrs
+            .iter()
+            .any(|a| a["key"] == "flowsketch.query.name"
+                && a["value"]["stringValue"] == "top_talkers")
+    );
+    assert!(attrs.iter().any(|a| a["key"] == "source.address"));
+    assert!(attrs.iter().any(|a| a["key"] == "flowsketch.error.kind"
+        && a["value"]["stringValue"] == "candidate-upper-bound"));
+}
+
 #[test]
 fn agent_serves_metrics_health_and_query_inventory() {
     let dir = std::env::temp_dir().join("flowsketch-agent-e2e");

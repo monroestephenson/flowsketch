@@ -8,6 +8,7 @@ members = [
     "crates/flowsketch-runtime",
     "crates/flowsketch-pcap",
     "crates/flowsketch-prometheus",
+    "crates/flowsketch-otel",
     "crates/flowsketch-agent",
     "crates/flowsketch-cli",
 ]
@@ -15,7 +16,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 license = "Apache-2.0"
 repository = "https://github.com/monroestephenson/flowsketch"
 
@@ -34,6 +35,7 @@ flowsketch-planner = { path = "crates/flowsketch-planner", version = "0.1.0" }
 flowsketch-runtime = { path = "crates/flowsketch-runtime", version = "0.1.0" }
 flowsketch-pcap = { path = "crates/flowsketch-pcap", version = "0.1.0" }
 flowsketch-prometheus = { path = "crates/flowsketch-prometheus", version = "0.1.0" }
+flowsketch-otel = { path = "crates/flowsketch-otel", version = "0.1.0" }
 flowsketch-agent = { path = "crates/flowsketch-agent", version = "0.1.0" }
 
 [profile.release]
