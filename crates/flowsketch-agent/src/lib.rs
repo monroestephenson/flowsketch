@@ -67,6 +67,9 @@ pub fn run(
         .map_err(|e| AgentError::Http(format!("cannot bind {}: {e}", config.listen)))?;
     let addr = listener.local_addr()?;
     http::serve_in_background(listener, Arc::clone(&published));
+    if let Some(otlp) = config.otlp.clone() {
+        spawn_otlp_exporter(otlp, Arc::clone(&published), config.node_name.clone());
+    }
     on_ready(addr);
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<FlowEvent>(EVENT_CHANNEL_CAPACITY);
@@ -92,6 +95,74 @@ pub fn run(
         Ok(Err(e)) => Err(e),
         Err(_) => Err(AgentError::Source("capture thread panicked".into())),
     }
+}
+
+/// Periodically export the latest window's estimates over OTLP/HTTP.
+/// Windows already exported are skipped, so an idle agent goes quiet
+/// instead of resending stale gauges.
+fn spawn_otlp_exporter(
+    cfg: flowsketch_otel::OtlpConfig,
+    state: Arc<PublishedState>,
+    node_name: String,
+) {
+    use flowsketch_otel::encode::{EncodeOptions, QueryMeta};
+
+    let opts = EncodeOptions {
+        service_name: "flowsketch-agent".to_string(),
+        host_name: node_name,
+        queries: state
+            .queries
+            .iter()
+            .map(|q| {
+                (
+                    q.name.clone(),
+                    QueryMeta {
+                        unit: q.otlp_unit.clone(),
+                        window: q.window.clone(),
+                        error_kind: q.error_kind.clone(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    let url = cfg.metrics_url();
+    let interval = Duration::from_millis(cfg.interval_ms);
+
+    std::thread::Builder::new()
+        .name("fs-otlp".into())
+        .spawn(move || {
+            let mut last_end: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            loop {
+                std::thread::sleep(interval);
+                let estimates: Vec<_> = state
+                    .latest_estimates()
+                    .into_iter()
+                    .filter(|e| {
+                        last_end
+                            .get(&e.query_name)
+                            .is_none_or(|&t| e.window_end_nanos > t)
+                    })
+                    .collect();
+                let Some(doc) = flowsketch_otel::encode_estimates(&estimates, &opts) else {
+                    continue;
+                };
+                match flowsketch_otel::post_metrics(&url, &doc) {
+                    Ok(()) => {
+                        for e in &estimates {
+                            let entry = last_end.entry(e.query_name.clone()).or_insert(0);
+                            *entry = (*entry).max(e.window_end_nanos);
+                        }
+                        state.otlp_exports.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        state.otlp_failures.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("otlp export failed: {err}");
+                    }
+                }
+            }
+        })
+        .expect("spawn otlp thread");
 }
 
 /// Push events into the channel, counting drops instead of blocking.
