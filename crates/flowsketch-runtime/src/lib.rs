@@ -9,7 +9,7 @@ use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, KllSketch, SpaceSavi
 use flowsketch_core::field::{field_value_into, group_key_into};
 use flowsketch_core::hash::HashSpec;
 use flowsketch_core::snapshot::read_snapshot;
-use flowsketch_core::{FlowEvent, Sketch, SketchError, SketchEstimate};
+use flowsketch_core::{Field, FlowEvent, Sketch, SketchError, SketchEstimate};
 use flowsketch_ir::logical::Measure;
 use flowsketch_ir::physical::PhysicalSketch;
 use flowsketch_planner::{ErrorKind, Plan};
@@ -419,9 +419,9 @@ struct Bucket {
 /// One planned query running inside the engine.
 struct RunningQuery {
     plan: Plan,
-    group_fields: Vec<flowsketch_core::Field>,
-    distinct_field: Option<flowsketch_core::Field>,
-    value_field: Option<flowsketch_core::Field>,
+    group_fields: Vec<Field>,
+    distinct_field: Option<Field>,
+    value_field: Option<Field>,
     hash: HashSpec,
     buckets: VecDeque<Bucket>,
     /// Estimates emitted at each window close.
@@ -478,10 +478,9 @@ impl RunningQuery {
         })
     }
 
-    /// Advance time to `ts`, closing any windows that end at or before it.
-    fn advance_to(&mut self, ts: u64) -> Result<(), SketchError> {
+    /// Advance time to `target`, closing any windows that end at or before it.
+    fn advance_to_bucket(&mut self, target: u64) -> Result<(), SketchError> {
         let slide = self.slide_nanos();
-        let target = self.bucket_start_for(ts);
         if self.buckets.is_empty() {
             self.buckets.push_back(self.new_bucket(target)?);
             return Ok(());
@@ -523,7 +522,6 @@ impl RunningQuery {
         if !self.plan.query.filter.matches(event) {
             return Ok(());
         }
-        self.advance_to(event.ts_nanos)?;
         let bucket_start = self.bucket_start_for(event.ts_nanos);
         let bucket_index = if self
             .buckets
@@ -532,6 +530,7 @@ impl RunningQuery {
         {
             self.buckets.len() - 1
         } else {
+            self.advance_to_bucket(bucket_start)?;
             let Some(index) = self
                 .buckets
                 .iter()
@@ -549,8 +548,8 @@ impl RunningQuery {
             Some(f) => f.extract_value(event),
             None => 1,
         };
-        self.distinct_buf.clear();
         if let Some(f) = self.distinct_field {
+            self.distinct_buf.clear();
             field_value_into(f, event, &mut self.distinct_buf);
         }
 
@@ -558,9 +557,10 @@ impl RunningQuery {
             .buckets
             .get_mut(bucket_index)
             .expect("bucket index was just resolved");
-        bucket
-            .state
-            .update(&self.key_buf, weight, &self.distinct_buf);
+        match &mut bucket.state {
+            QueryState::HeavyHitters { ss } => ss.add_key_buf(&mut self.key_buf, weight),
+            state => state.update(&self.key_buf, weight, &self.distinct_buf),
+        }
         Ok(())
     }
 

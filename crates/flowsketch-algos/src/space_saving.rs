@@ -161,6 +161,50 @@ impl SpaceSaving {
         self.push_heap_entry(key, min.count + weight);
     }
 
+    /// Add using a caller-owned key scratch buffer.
+    ///
+    /// If the key is new, the encoded bytes are moved into the summary instead
+    /// of copied. `key` is left as an empty scratch buffer for the caller to
+    /// reuse on the next event.
+    pub fn add_key_buf(&mut self, key: &mut Vec<u8>, weight: u64) {
+        self.total_weight += weight;
+        self.updates += 1;
+        if let Some(e) = self.entries.get_mut(key.as_slice()) {
+            e.count += weight;
+            key.clear();
+            return;
+        }
+
+        if self.entries.len() < self.capacity {
+            let mut owned_key = Vec::with_capacity(key.capacity());
+            std::mem::swap(&mut owned_key, key);
+            self.push_heap_entry(&owned_key, weight);
+            self.entries.insert(
+                owned_key,
+                Entry {
+                    count: weight,
+                    error: 0,
+                },
+            );
+            return;
+        }
+
+        // Evict the current minimum and inherit its count as error. Reuse the
+        // evicted key allocation as the caller's next scratch buffer.
+        let min_key = self.min_entry_key().expect("capacity > 0");
+        let (mut scratch, min) = self.entries.remove_entry(&min_key).unwrap();
+        scratch.clear();
+        let owned_key = std::mem::replace(key, scratch);
+        self.push_heap_entry(&owned_key, min.count + weight);
+        self.entries.insert(
+            owned_key,
+            Entry {
+                count: min.count + weight,
+                error: min.count,
+            },
+        );
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<&Entry> {
         self.entries.get(key)
     }
@@ -382,6 +426,27 @@ mod tests {
         for i in 1..=5u64 {
             assert!(s.get(format!("k{i}").as_bytes()).is_some());
         }
+    }
+
+    #[test]
+    fn add_key_buf_matches_borrowed_add_and_reuses_scratch() {
+        let mut borrowed = SpaceSaving::new(5, HashSpec::new(1)).unwrap();
+        let mut owned = SpaceSaving::new(5, HashSpec::new(1)).unwrap();
+        let mut scratch = Vec::with_capacity(64);
+
+        for i in 0..100u32 {
+            let key = format!("k{}", i % 13);
+            let weight = (i % 7 + 1) as u64;
+            borrowed.add(key.as_bytes(), weight);
+
+            scratch.extend_from_slice(key.as_bytes());
+            owned.add_key_buf(&mut scratch, weight);
+            assert!(scratch.is_empty());
+            assert!(scratch.capacity() >= key.len());
+        }
+
+        assert_eq!(borrowed.top_k(5), owned.top_k(5));
+        assert_eq!(borrowed.total_weight(), owned.total_weight());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::Write as _;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -145,7 +146,6 @@ pub fn group_key(fields: &[Field], event: &FlowEvent) -> Vec<u8> {
 /// Encode the group-by key of `fields` into a caller-owned buffer.
 pub fn group_key_into(fields: &[Field], event: &FlowEvent, out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(fields.len() * 16);
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             out.push(GROUP_KEY_SEP);
@@ -157,26 +157,57 @@ pub fn group_key_into(fields: &[Field], event: &FlowEvent, out: &mut Vec<u8>) {
 /// Encode one field's canonical display value into a caller-owned buffer.
 pub fn field_value_into(field: Field, event: &FlowEvent, out: &mut Vec<u8>) {
     match field {
-        Field::SrcIp => write!(out, "{}", event.src_ip).expect("write to Vec cannot fail"),
-        Field::DstIp => write!(out, "{}", event.dst_ip).expect("write to Vec cannot fail"),
-        Field::SrcPort => write!(out, "{}", event.src_port).expect("write to Vec cannot fail"),
-        Field::DstPort => write!(out, "{}", event.dst_port).expect("write to Vec cannot fail"),
+        Field::SrcIp => append_ip(out, event.src_ip),
+        Field::DstIp => append_ip(out, event.dst_ip),
+        Field::SrcPort => append_decimal(out, event.src_port as u64),
+        Field::DstPort => append_decimal(out, event.dst_port as u64),
         Field::Protocol => match event.protocol {
             protocol::ICMP => out.extend_from_slice(b"icmp"),
             protocol::TCP => out.extend_from_slice(b"tcp"),
             protocol::UDP => out.extend_from_slice(b"udp"),
             protocol::ICMPV6 => out.extend_from_slice(b"icmpv6"),
-            other => write!(out, "{other}").expect("write to Vec cannot fail"),
+            other => append_decimal(out, other as u64),
         },
-        Field::TcpFlags => write!(out, "{}", event.tcp_flags).expect("write to Vec cannot fail"),
+        Field::TcpFlags => append_decimal(out, event.tcp_flags as u64),
         Field::Direction => out.extend_from_slice(event.direction.name().as_bytes()),
-        Field::Bytes => write!(out, "{}", event.bytes).expect("write to Vec cannot fail"),
-        Field::Packets => write!(out, "{}", event.packets).expect("write to Vec cannot fail"),
-        Field::InterfaceIndex => {
-            write!(out, "{}", event.interface_index).expect("write to Vec cannot fail")
-        }
-        Field::NodeId => write!(out, "{}", event.node_id).expect("write to Vec cannot fail"),
+        Field::Bytes => append_decimal(out, event.bytes as u64),
+        Field::Packets => append_decimal(out, event.packets as u64),
+        Field::InterfaceIndex => append_decimal(out, event.interface_index as u64),
+        Field::NodeId => append_decimal(out, event.node_id),
     }
+}
+
+fn append_ip(out: &mut Vec<u8>, ip: IpAddr) {
+    match ip {
+        IpAddr::V4(addr) => append_ipv4(out, addr),
+        IpAddr::V6(addr) => write!(out, "{addr}").expect("write to Vec cannot fail"),
+    }
+}
+
+fn append_ipv4(out: &mut Vec<u8>, addr: Ipv4Addr) {
+    let octets = addr.octets();
+    for (i, octet) in octets.into_iter().enumerate() {
+        if i > 0 {
+            out.push(b'.');
+        }
+        append_decimal(out, octet as u64);
+    }
+}
+
+fn append_decimal(out: &mut Vec<u8>, mut value: u64) {
+    if value == 0 {
+        out.push(b'0');
+        return;
+    }
+
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    out.extend_from_slice(&buf[i..]);
 }
 
 /// Decode a group key produced by `group_key` back into per-field values.
