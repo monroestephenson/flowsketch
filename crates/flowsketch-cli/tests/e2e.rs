@@ -226,7 +226,8 @@ fn bench_trace_profile_runs_on_generated_pcap() {
             .args(["--trace", pcap.to_str().unwrap()])
             .arg("--query")
             .arg(example("top-talkers.yaml"))
-            .args(["--profile", "10g"]),
+            .args(["--profile", "10g"])
+            .args(["--core-budget", "100"]),
     );
     let text = stdout(&out);
     assert!(text.contains("trace benchmark:"), "{text}");
@@ -234,6 +235,8 @@ fn bench_trace_profile_runs_on_generated_pcap() {
     assert!(text.contains("measured_l3_capacity="), "{text}");
     assert!(text.contains("target: profile=10 Gb/s"), "{text}");
     assert!(text.contains("estimated_cores_for_target="), "{text}");
+    assert!(text.contains("readiness: profile=10 Gb/s"), "{text}");
+    assert!(text.contains("status=pass"), "{text}");
     assert!(text.contains("runtime: estimates="), "{text}");
 }
 

@@ -53,6 +53,34 @@ kubectl kustomize deploy/kubernetes
 
 The workspace test suite currently has 140 passing tests.
 
+## Live Capture Today
+
+FlowSketch currently has two agent source modes:
+
+| Source | Where it works | What it proves |
+| ------ | -------------- | -------------- |
+| `pcap` | macOS, Linux, CI, local demos | runtime correctness against repeatable packet traces |
+| `af_packet` | Linux only, needs root or `CAP_NET_RAW` | live packets can be captured from a Linux interface and fed into the runtime |
+
+The live Linux path is functional but early. It uses a simple AF_PACKET raw
+socket, parses Ethernet/IP/TCP/UDP headers, and pushes `FlowEvent`s into the
+same sketch runtime used by replay. It does not yet use PACKET_MMAP/TPACKET,
+eBPF, XDP, AF_XDP, RSS-aware sharding, or explicit kernel drop accounting.
+
+GitHub Actions can run a true live functional test by creating a veth pair,
+running the agent on one side with `source.kind: af_packet`, generating packets
+from a network namespace on the other side, and asserting that the agent's
+Prometheus counters increase. That proves the Linux live capture path works.
+It does not prove 10 Gb/s line rate because GitHub-hosted runners do not expose
+a dedicated 10G NIC or stable packet generator.
+
+For local Linux VMs, the same smoke test can be run with:
+
+```bash
+cargo build --release -p flowsketch-cli
+bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
+```
+
 ## Current Performance
 
 The current benchmark baseline is recorded in
@@ -110,6 +138,19 @@ target/release/flowsketch bench \
   --query examples/queries/top-talkers.yaml \
   --profile all
 ```
+
+Gate a 10 Gb/s projection against a CPU budget:
+
+```bash
+target/release/flowsketch bench \
+  --trace /tmp/flowsketch-bench.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile 10g \
+  --core-budget 5
+```
+
+This is a projection gate for the measured trace path. It is useful for CI and
+regression tracking, but it is not a substitute for live Linux NIC validation.
 
 ## Quick Start
 
@@ -1029,6 +1070,30 @@ The current harness reports:
 - runtime memory, estimate count, and late events
 
 See [`benchmarks/README.md`](benchmarks/README.md).
+
+## Milestones
+
+These are the project milestones that matter now. Each one should be backed by
+commands, datasets, and acceptance criteria rather than vague performance
+claims.
+
+| Milestone | Target | Status | Acceptance criteria |
+| --------- | ------ | ------ | ------------------- |
+| M0: credible v0 | useful offline approximate telemetry | substantially done | pcap replay, synthetic traces, YAML queries, explain output, Prometheus output, exact-vs-approx tests |
+| M1: local agent | live userspace telemetry on Linux | baseline done | AF_PACKET source, HTTP health/readiness, `/metrics`, bounded memory, safe startup/shutdown |
+| M2: distributed v0 | node-local agents plus cluster merge | baseline done | snapshot push, compatibility validation, gateway `/metrics`, node inventory |
+| M3: 10 Gb/s projected path | 10 Gb/s mixed-packet projection within a CPU budget | in progress | `flowsketch bench --trace ... --profile 10g --core-budget 5` passes on representative traces |
+| M4: 10 Gb/s live Linux | real 10 Gb/s capture without silent loss | live smoke only | AF_PACKET/eBPF live replay, drop counters, CPU profile, accuracy checked against exact replay |
+| M5: Kubernetes v1 | normal platform-team deployment | partial | Helm, ServiceMonitor/PodMonitor, PrometheusRule, metadata enrichment, resource defaults |
+| M6: eBPF collector | production Linux ingest path | prepared | tc ingress program, ring-buffer drop counters, verifier-safe parser, userspace fallback |
+| M7: 25/40 Gb/s | serious infrastructure traffic | not done | sharded runtime, RSS queue mapping, CPU pinning, live replay, p99 latency and drop metrics |
+| M8: 100 Gb/s mixed traffic | realistic 100G packet-size distribution | not done | XDP/eBPF or AF_XDP path, sharded userspace, live NIC validation, public benchmark report |
+| M9: 100 Gb/s minimum packets | 148.8Mpps worst case | research/hardware tier | XDP prefiltering, AF_XDP/DPDK or hardware offload, sampling/preaggregation strategy |
+| M10: production v1 | trusted operational deployment | not done | security posture, auth/TLS guidance, HA gateway story, dashboards, alerts, runbooks, upgrade tests |
+
+The immediate milestone is M3, then M4. M3 makes regressions visible in the
+current benchmark harness. M4 is the first milestone that can honestly claim
+"10 Gb/s" in a live environment.
 
 ## Roadmap
 

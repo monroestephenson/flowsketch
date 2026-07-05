@@ -1,0 +1,58 @@
+name: Linux live
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-live.yml"
+      - "scripts/linux-afpacket-live-smoke.sh"
+      - "crates/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/linux-live.yml"
+      - "scripts/linux-afpacket-live-smoke.sh"
+      - "crates/**"
+      - "examples/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  afpacket-live:
+    name: AF_PACKET live smoke and Linux projection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release CLI
+        run: cargo build --release -p flowsketch-cli
+      - name: AF_PACKET live smoke on veth
+        run: bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
+      - name: Linux 10 Gb/s projection summary
+        run: |
+          BIN=target/release/flowsketch
+          $BIN synth --out /tmp/flowsketch-linux-projection.pcap \
+            --packets 200000 \
+            --scanners 2 \
+            --heavy-talkers 3 \
+            --duration-secs 120 \
+            --seed 77
+          $BIN bench --trace /tmp/flowsketch-linux-projection.pcap \
+            --query examples/queries/top-talkers.yaml \
+            --profile 10g | tee /tmp/flowsketch-linux-projection.txt
+          {
+            echo "## Linux 10 Gb/s projection"
+            echo
+            echo "This is a GitHub-hosted runner projection from pcap replay, not a live 10 Gb/s NIC validation."
+            echo
+            echo '```text'
+            cat /tmp/flowsketch-linux-projection.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

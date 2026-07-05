@@ -6,7 +6,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 
 use flowsketch_algos::{
@@ -105,6 +105,8 @@ pub struct BenchConfig {
     /// Query files to execute while replaying `trace`.
     pub queries: Vec<PathBuf>,
     pub seed: u64,
+    /// Optional CPU-core budget for selected line-rate profile projections.
+    pub core_budget: Option<f64>,
 }
 
 /// Zipf(s=1) sampler over `n` keys via inverse-CDF on a precomputed table.
@@ -149,6 +151,7 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
         dist,
         profile,
         avg_packet_bytes,
+        core_budget,
         ..
     } = cfg;
     let name = match algo {
@@ -201,11 +204,12 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
         events as f64 / elapsed.as_secs_f64(),
         avg_packet_bytes as f64,
     );
-    print_profile_projection(
+    let projections = print_profile_projection(
         profile,
         avg_packet_bytes as f64,
         events as f64 / elapsed.as_secs_f64(),
     );
+    enforce_core_budget(&projections, core_budget)?;
     println!(
         "memory:   {}",
         flowsketch_planner::format_bytes(sketch.memory_bytes() as u64)
@@ -262,7 +266,8 @@ fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
 
     let file =
         File::open(trace).with_context(|| format!("cannot open trace {}", trace.display()))?;
-    let mut reader = PcapReader::new(BufReader::new(file)).context("cannot read pcap header")?;
+    let mut reader = PcapReader::new(BufReader::with_capacity(1024 * 1024, file))
+        .context("cannot read pcap header")?;
 
     let started = Instant::now();
     let mut events = 0u64;
@@ -314,7 +319,8 @@ fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
         wall_eps / 1e6
     );
     print_l3_capacity(wall_eps, avg_packet_bytes);
-    print_profile_projection(cfg.profile, avg_packet_bytes, wall_eps);
+    let projections = print_profile_projection(cfg.profile, avg_packet_bytes, wall_eps);
+    enforce_core_budget(&projections, cfg.core_budget)?;
     if let Some(engine) = &mut engine {
         let estimates = engine.take_estimates();
         println!(
@@ -341,8 +347,21 @@ fn load_plans(query_files: &[PathBuf], seed: u64) -> Result<Vec<Plan>> {
         .collect()
 }
 
-fn print_profile_projection(profile: Option<Profile>, avg_packet_bytes: f64, measured_eps: f64) {
-    let Some(profile) = profile else { return };
+#[derive(Clone, Copy, Debug)]
+struct LineRateProjection {
+    profile: Profile,
+    estimated_cores: f64,
+}
+
+fn print_profile_projection(
+    profile: Option<Profile>,
+    avg_packet_bytes: f64,
+    measured_eps: f64,
+) -> Vec<LineRateProjection> {
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    let mut projections = Vec::new();
     for profile in profile.selected() {
         let target_eps = target_events_per_sec(*profile, avg_packet_bytes);
         let estimated_cores = target_eps / measured_eps.max(1.0);
@@ -356,7 +375,40 @@ fn print_profile_projection(profile: Option<Profile>, avg_packet_bytes: f64, mea
             "projection: measured {:.2}M events/s/core => estimated_cores_for_target={estimated_cores:.2}",
             measured_eps / 1e6
         );
+        projections.push(LineRateProjection {
+            profile: *profile,
+            estimated_cores,
+        });
     }
+    projections
+}
+
+fn enforce_core_budget(projections: &[LineRateProjection], core_budget: Option<f64>) -> Result<()> {
+    let Some(core_budget) = core_budget else {
+        return Ok(());
+    };
+    if projections.is_empty() {
+        bail!("--core-budget requires --profile so there is a line-rate target to check");
+    }
+    if !core_budget.is_finite() || core_budget <= 0.0 {
+        bail!("--core-budget must be a positive finite number");
+    }
+
+    let mut failed = false;
+    for projection in projections {
+        let passed = projection.estimated_cores <= core_budget;
+        println!(
+            "readiness: profile={} estimated_cores={:.2} core_budget={core_budget:.2} status={}",
+            projection.profile.name(),
+            projection.estimated_cores,
+            if passed { "pass" } else { "fail" }
+        );
+        failed |= !passed;
+    }
+    if failed {
+        bail!("line-rate readiness check exceeded --core-budget");
+    }
+    Ok(())
 }
 
 pub fn target_events_per_sec(profile: Profile, avg_packet_bytes: f64) -> f64 {
@@ -413,5 +465,16 @@ mod tests {
             names,
             ["1 Gb/s", "10 Gb/s", "25 Gb/s", "40 Gb/s", "100 Gb/s"]
         );
+    }
+
+    #[test]
+    fn core_budget_gate_accepts_and_rejects_projections() {
+        let projections = [LineRateProjection {
+            profile: Profile::TenG,
+            estimated_cores: 3.9,
+        }];
+        enforce_core_budget(&projections, Some(4.0)).unwrap();
+        enforce_core_budget(&projections, Some(2.0)).unwrap_err();
+        enforce_core_budget(&[], Some(4.0)).unwrap_err();
     }
 }

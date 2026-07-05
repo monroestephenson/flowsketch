@@ -1,6 +1,6 @@
 # Current benchmark baseline
 
-Measured on 2026-07-04 from the release binary on a local Mac development
+Measured on 2026-07-05 from the release binary on a local Mac development
 machine. These are capacity projections, not live NIC validation results.
 
 ## Count-Min hot loop
@@ -56,13 +56,19 @@ Result:
 
 - parsed packets/events: 200000
 - average L3 packet size: 631.8 bytes
-- throughput: 0.51M events/s/core
-- projected L3 capacity at 631.8-byte packets: 2.56 Gb/s/core
+- throughput: 0.49M events/s/core
+- projected L3 capacity at 631.8-byte packets: 2.45 Gb/s/core
 - 100 Gb/s target at 631.8-byte packets: 19.78M events/s
-- projected cores for 100 Gb/s: 39.07
+- projected cores for 100 Gb/s: 40.77
 - runtime estimates: 1300
 - sketch memory: 336.9 KiB
 - late events: 0
+
+10 Gb/s projection:
+
+- target at 631.8-byte packets: 1.98M events/s
+- projected cores for 10 Gb/s: 4.08
+- M3 projection gate: `--profile 10g --core-budget 5`
 
 Interpretation: current pcap parsing plus runtime query execution needs
 parallel capture/sharding, eBPF or XDP ingestion, and drop accounting before a

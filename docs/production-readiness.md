@@ -41,6 +41,20 @@ Interpret `100g` as **100 Gb/s** line-rate projection and `all` as the
 1/10/25/40/100 Gb/s sweep. Confirm live capture separately with packet
 generation or hardware replay.
 
+For the current 10 Gb/s projection milestone, gate a representative trace with
+a CPU budget:
+
+```bash
+flowsketch bench --trace /data/caida-or-mawi.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile 10g \
+  --core-budget 5
+```
+
+Passing this gate means the measured trace path projects to 10 Gb/s within
+five cores on that machine and packet-size distribution. It is not a live NIC
+claim until validated with packet-drop counters on Linux.
+
 ## Kubernetes
 
 - Start from `deploy/kubernetes/`.

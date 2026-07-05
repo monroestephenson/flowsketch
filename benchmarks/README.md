@@ -31,18 +31,36 @@ It does not create a 100 Gb/s NIC test in CI. The harness reports:
 - target events/sec for the selected 1/10/25/40/100 Gb/s profile(s) at the
   measured average packet size
 - estimated cores needed to meet the selected target
+- optional pass/fail readiness when `--core-budget` is provided
 - runtime memory, estimate count, and late-event count when queries are run
 
 For example, 100 Gb/s at 1250-byte packets is 10 million packets/events per
 second. At 64-byte packets, the packet rate is much higher. Always interpret
 the result with the trace's average packet size.
 
+## 10 Gb/s projection gate
+
+Use `--core-budget` when you want a benchmark to fail if the measured path
+needs too many cores for a target line rate:
+
+```bash
+target/release/flowsketch bench \
+  --trace /data/caida-or-mawi.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile 10g \
+  --core-budget 5
+```
+
+This is the current M3 milestone gate: **10 Gb/s projected mixed-traffic
+capacity within a five-core CPU budget**. It is not the M4 milestone, which requires
+live Linux capture validation with explicit packet-drop accounting.
+
 ## CI-safe benchmark tests
 
 The normal test suite generates small synthetic pcaps and runs:
 
 ```bash
-flowsketch bench --trace synthetic.pcap --query examples/queries/top-talkers.yaml --profile 10g
+flowsketch bench --trace synthetic.pcap --query examples/queries/top-talkers.yaml --profile 10g --core-budget 100
 ```
 
 This verifies the real-trace harness and line-rate math without checking in

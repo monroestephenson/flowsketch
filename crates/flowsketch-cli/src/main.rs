@@ -114,6 +114,9 @@ enum Command {
         /// Hash seed for trace query execution
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Fail if selected line-rate profile projection needs more cores than this budget
+        #[arg(long)]
+        core_budget: Option<f64>,
     },
     /// Generate a synthetic pcap trace (background traffic + heavy talkers + scanners)
     Synth {
@@ -249,6 +252,7 @@ fn main() -> Result<()> {
             trace,
             queries,
             seed,
+            core_budget,
         } => bench::run(bench::BenchConfig {
             algo,
             events,
@@ -259,6 +263,7 @@ fn main() -> Result<()> {
             trace,
             queries,
             seed,
+            core_budget,
         }),
         Command::Synth {
             out,
