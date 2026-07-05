@@ -1,273 +1,317 @@
-# FlowSketch: complete implementation plan
+# FlowSketch
 
-> ## Implementation status
->
-> The **minimum credible v0** (§26, build order §30) is implemented as a Rust
-> workspace: `flowsketch-core`, `flowsketch-algos` (Count-Min, CountSketch,
-> HyperLogLog, HLLMap, SpaceSaving, Misra-Gries + exact baseline),
-> `flowsketch-ir`, `flowsketch-planner`, `flowsketch-runtime`,
-> `flowsketch-pcap`, `flowsketch-prometheus`, `flowsketch-gateway`, and
-> `flowsketch-cli`.
->
-> ```bash
-> cargo build --release
-> target/release/flowsketch synth --out demo.pcap --packets 200000
-> target/release/flowsketch explain examples/queries/suspected-scanners.yaml
-> target/release/flowsketch replay demo.pcap \
->   --query examples/queries/top-talkers.yaml \
->   --query examples/queries/suspected-scanners.yaml
-> ```
->
-> Beyond the v0 MVP, the following are also implemented:
->
-> - **live agent** (`flowsketch-agent`, Phase 3): pcap replay on every
->   supported developer platform, plus Linux AF_PACKET live capture, feeding
->   the engine with HTTP `/metrics`, `/healthz`, `/readyz`, and `/v1/queries`
->   (`flowsketch agent --config examples/agent.yaml`)
-> - **KLL quantile sketch** and the `quantile` measure (e.g. packet-size p99)
-> - **entropy measure** (ungrouped): SpaceSaving-head + HLL-tail estimator
-> - **cross-process sketch merge**: `flowsketch replay --snapshot-out` +
->   `flowsketch merge-snapshots` (the Phase 7 distributed-merge primitive)
-> - **OTLP metrics export** (Phase 4): the agent pushes estimates to any
->   OpenTelemetry Collector / Grafana Alloy / Datadog OTel endpoint over
->   OTLP/HTTP+JSON with OTel semantic conventions, batching, and retry
-> - **cluster gateway** (`flowsketch-gateway`, Phase 7): agents push their
->   window's FSK1 sketch snapshots (`export.gateway` in the agent config);
->   the gateway validates merge compatibility, combines them across nodes,
->   and serves cluster-level estimates on `/metrics` plus node inventory on
->   `/v1/nodes` (`flowsketch gateway --config examples/gateway.yaml`)
->
-> See `docs/operator-guide.md`, `docs/query-language.md`,
-> `docs/accuracy-contracts.md`, `docs/algorithm-notes.md`, and
-> `docs/security.md`, `docs/production-readiness.md`,
-> `docs/ebpf-roadmap.md`, and `benchmarks/README.md`. Everything below
-> this block is the original design plan; Kubernetes manifests and the
-> eBPF event-contract crate exist, but the eBPF collector itself is not
-> yet built.
+FlowSketch is a Rust runtime for approximate network telemetry. It answers
+high-cardinality questions such as top talkers, scanner fan-out, distinct
+destinations, entropy shifts, packet-size quantiles, and traffic-matrix changes
+with bounded memory and explicit error contracts.
 
-## 0. Core thesis
+The goal is not to be another sketch library. The goal is to make streaming
+and sketching algorithms usable as production network observability
+infrastructure: operators declare a network question, FlowSketch plans a
+bounded sketch, runs it near traffic, and exports normal Prometheus or
+OpenTelemetry signals.
 
-Build **FlowSketch** as a **portable sketch-based network telemetry runtime**, not as a generic sketch library.
+## Current Status
 
-The existing OSS gap is not “nobody has implemented Count-Min Sketch or HyperLogLog.” Apache DataSketches already provides production-quality sketch libraries across Java, C++, Python, Rust, and Go, including count-distinct, quantiles, frequent-items, and system integrations.
+FlowSketch is a credible v0 with several production-prep pieces already in
+place. It is not yet a broadly production-ready 100 Gb/s collector.
 
-The greenfield opportunity is this:
+Implemented today:
 
-> **A production network telemetry system that lets operators declare high-cardinality network questions, compiles those questions into bounded-memory sketches, runs them close to traffic, and exports normal OpenTelemetry/Prometheus signals.**
+| Area | Status |
+| ---- | ------ |
+| Core sketches | Count-Min, CountSketch, HyperLogLog, HLLMap, SpaceSaving, Misra-Gries, KLL, exact baseline |
+| Query model | YAML queries, logical IR, physical plans, memory estimates, explain output |
+| Runtime | Windowing, filtering, grouped estimates, snapshot serialization, merge compatibility checks |
+| CLI | `synth`, `replay`, `bench`, `explain`, `validate`, `merge-snapshots`, `agent`, `gateway` |
+| Sources | Synthetic pcap generation, pcap replay, Linux AF_PACKET live capture |
+| Exports | Prometheus text output, HTTP `/metrics`, OTLP/HTTP+JSON metrics export |
+| Distributed merge | Agents can push FSK1 snapshots to a gateway, which validates and merges compatible windows |
+| Deployment prep | Dockerfile, systemd units, baseline Kubernetes manifests, CI on Ubuntu and macOS |
+| eBPF prep | `flowsketch-ebpf` contract crate and roadmap |
 
-This is directly aligned with recent research. Sketch-based telemetry is considered attractive because sketches offer resource efficiency and accuracy guarantees, but adoption is blocked by unresolved systems problems: translating operator intent into sketches, managing resources, composing sketch types, and deploying across heterogeneous network platforms.
+Not implemented yet:
 
----
+| Gap | Why it matters |
+| --- | -------------- |
+| eBPF tc/XDP collector | Needed for credible Linux production packet collection |
+| Parallel high-rate ingest | Required for 25/40/100 Gb/s packet rates |
+| Kernel/drop accounting | Operators need to know when observations are incomplete |
+| Kubernetes CRD/operator/Helm chart | Needed for normal platform-team adoption |
+| Kubernetes metadata enrichment | Needed for namespace, pod, service, and workload queries |
+| Gateway HA/sharding | The gateway is currently an in-memory merge point |
+| Real 100 Gb/s validation | Current benchmarks are local projections, not live NIC proof |
 
-# 1. What the system should be
+Most recent full code validation before this README-only rewrite:
 
-## One-sentence product
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+kubectl kustomize deploy/kubernetes
+```
 
-**FlowSketch is an approximate network telemetry agent and runtime for answering real-time high-cardinality questions such as top talkers, distinct destinations, fan-out, entropy shifts, scanning behavior, and traffic-matrix changes with fixed memory and explicit error bounds.**
+The workspace test suite currently has 140 passing tests.
 
-## What it is not
+## Current Performance
 
-It should **not** be:
+The current benchmark baseline is recorded in
+[`benchmarks/current-results.md`](benchmarks/current-results.md).
 
-| Bad framing            | Why it fails                                                                                    |
-| ---------------------- | ----------------------------------------------------------------------------------------------- |
-| “A sketch library”     | Apache DataSketches already covers much of that library category.                               |
-| “A packet sniffer”     | tcpdump/Wireshark/pcap already exist.                                                           |
-| “A Cilium competitor”  | Cilium/Hubble already provides exact/near-exact Kubernetes network visibility and service maps. |
-| “A new SIEM”           | Datadog, Splunk, Elastic, CrowdStrike, etc. already own that workflow.                          |
-| “A new network stack”  | Too much adoption drag.                                                                         |
-| “A new query database” | Wrong layer.                                                                                    |
+Measured on a local Mac release build:
 
-## Correct framing
+| Path | Result |
+| ---- | ------ |
+| Count-Min hot loop | 19.53M updates/s/core |
+| Projected L3 capacity for 1250-byte packets | 195.31 Gb/s/core |
+| pcap parse + runtime + one query | 0.51M events/s/core |
+| Projected L3 capacity on the generated trace | 2.56 Gb/s/core |
+| Projected cores for 100 Gb/s on that trace shape | 39.07 cores |
+
+Interpretation:
+
+- The sketch update loop is fast enough that it is not the current 100 Gb/s
+  blocker for large packets.
+- The end-to-end userspace pcap/runtime path is the bottleneck.
+- Real 100 Gb/s networking is packet-rate dominated. At roughly 632-byte L3
+  packets, 100 Gb/s is about 19.8M packets/s. At minimum Ethernet frame size,
+  line rate is roughly 148.8M packets/s on the wire.
+- FlowSketch needs eBPF/XDP or DPDK-style ingestion, receive-queue sharding,
+  CPU pinning, drop counters, and live replay validation before making a real
+  100 Gb/s claim.
+
+Run the benchmark sweep:
+
+```bash
+cargo build --release -p flowsketch-cli
+
+target/release/flowsketch bench \
+  --algo count-min \
+  --events 5000000 \
+  --keys 100000 \
+  --dist zipf \
+  --profile all \
+  --avg-packet-bytes 1250
+```
+
+Run the parser/runtime benchmark:
+
+```bash
+target/release/flowsketch synth \
+  --out /tmp/flowsketch-bench.pcap \
+  --packets 200000 \
+  --scanners 2 \
+  --heavy-talkers 3 \
+  --duration-secs 120 \
+  --seed 77
+
+target/release/flowsketch bench \
+  --trace /tmp/flowsketch-bench.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile all
+```
+
+## Quick Start
+
+Build the workspace:
+
+```bash
+cargo build --release
+```
+
+Generate a synthetic trace:
+
+```bash
+target/release/flowsketch synth \
+  --out demo.pcap \
+  --packets 200000
+```
+
+Explain a query:
+
+```bash
+target/release/flowsketch explain examples/queries/suspected-scanners.yaml
+```
+
+Replay the trace against several queries:
+
+```bash
+target/release/flowsketch replay demo.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --query examples/queries/suspected-scanners.yaml
+```
+
+Serve a local agent from a config file:
+
+```bash
+target/release/flowsketch agent --config examples/agent.yaml
+```
+
+Run a gateway that receives agent snapshot pushes:
+
+```bash
+target/release/flowsketch gateway --config examples/gateway.yaml
+```
+
+## What FlowSketch Is
+
+FlowSketch is an approximate network telemetry agent and runtime. It is meant
+for questions where exact per-flow storage is too expensive, but where bounded
+error and bounded memory are acceptable:
+
+- top source/destination pairs by bytes or packets
+- distinct destinations per source
+- scanner and fan-out detection
+- source entropy during DDoS-like shifts
+- packet-size or flow-size quantiles
+- approximate service or namespace traffic matrices
+- change detection over adjacent windows
+
+It should feel operationally familiar to teams that already use the
+OpenTelemetry Collector, Prometheus exporters, Grafana Alloy, Datadog Agent,
+Cilium/Hubble, or node-local infrastructure agents.
+
+Algorithmically, it is based on streaming and sketching techniques: Count-Min,
+CountSketch, HyperLogLog, heavy-hitter sketches, quantile sketches, and related
+mergeable data structures.
+
+## What It Is Not
+
+| Not this | Reason |
+| -------- | ------ |
+| A generic sketch library | Apache DataSketches and similar projects already cover that space well |
+| A packet sniffer | tcpdump, Wireshark, and pcap tools already exist |
+| A Cilium replacement | Cilium/Hubble provide exact and near-exact Kubernetes flow visibility |
+| A SIEM | Datadog, Splunk, Elastic, CrowdStrike, and others own that workflow |
+| A database | FlowSketch should export estimates, not store all history itself |
+| A new network stack | Adoption would be too hard |
+
+The defensible framing is:
 
 ```text
-Existing traffic / packets / flow logs
-        ↓
-FlowSketch collector
-        ↓
-Sketch runtime + query planner
-        ↓
-Approximate telemetry results
-        ↓
-OpenTelemetry / Prometheus / Kafka / ClickHouse / Datadog / Grafana
+existing packets / pcaps / flow logs
+    -> FlowSketch collector
+    -> sketch runtime and query planner
+    -> approximate telemetry estimates
+    -> Prometheus / OpenTelemetry / Kafka / ClickHouse / Datadog / Grafana
 ```
 
-It should feel operationally similar to:
-
-* OpenTelemetry Collector
-* Prometheus node exporter
-* Cilium/Hubble
-* Grafana Alloy
-* Datadog Agent
-
-But algorithmically, it should be based on streaming/sketching techniques.
-
----
-
-# 2. Reference architecture
-
-## High-level architecture
-
-```text
-┌────────────────────────────────────────────────────────────┐
-│                       Control Plane                         │
-│                                                            │
-│  Config API / CLI / Kubernetes CRD / Policy Validator       │
-│                         ↓                                  │
-│  Query Parser → Logical IR → Physical Sketch Planner        │
-│                         ↓                                  │
-│  Resource Budgeter / Error Estimator / Deployment Planner   │
-└────────────────────────────────────────────────────────────┘
-                              ↓
-┌────────────────────────────────────────────────────────────┐
-│                        Data Plane                           │
-│                                                            │
-│  Packet / Flow Sources                                     │
-│  - pcap / AF_PACKET                                        │
-│  - eBPF tc/XDP                                             │
-│  - AF_XDP later                                            │
-│  - Cilium/Hubble receiver                                  │
-│  - NetFlow/IPFIX/sFlow later                               │
-│                         ↓                                  │
-│  Normalizer → Metadata Enricher → Sketch Runtime            │
-│                         ↓                                  │
-│  Window Manager → Local Aggregator → Merge Engine           │
-│                         ↓                                  │
-│  Exporters: Prometheus / OTLP / Kafka / ClickHouse / gRPC   │
-└────────────────────────────────────────────────────────────┘
-```
-
-The key design choice: **keep the kernel/eBPF program small** and place most complexity in userspace. eBPF is powerful because it can safely run sandboxed programs in privileged kernel contexts and is widely used for networking, observability, and security, but the verifier, maps, helper calls, and kernel compatibility constraints make complex in-kernel logic risky.
-
----
-
-# 3. End-to-end packet lifecycle
-
-## Example: detecting scanners
-
-Query:
-
-```yaml
-queries:
-  - name: suspected_scanners
-    every: 10s
-    window: 60s
-    group_by:
-      - src.ip
-    estimate:
-      distinct_count: dst.ip
-    where:
-      protocol: tcp
-      dst.port: [22, 80, 443, 5432, 6379]
-    alert_if:
-      gt: 5000
-    export:
-      metrics: true
-      exemplars: true
-```
-
-Runtime lifecycle:
-
-```text
-Packet arrives
-    ↓
-Collector extracts 5-tuple:
-(src_ip, dst_ip, src_port, dst_port, proto, bytes, timestamp)
-    ↓
-Normalizer maps packet → FlowEvent
-    ↓
-Metadata enricher attaches:
-node, interface, k8s namespace, pod, service, workload
-    ↓
-Query planner maps query:
-distinct_count(dst.ip) grouped by src.ip
-    ↓
-Physical plan:
-HLL-per-heavy-source OR HLLMap-like sketch
-    ↓
-Runtime updates sketch
-    ↓
-Every 10s:
-emit src_ip values whose estimated distinct dst_ip count > 5000
-    ↓
-Export as:
-- OTLP metric
-- Prometheus metric
-- optional structured log/event
-```
-
-This is the right wedge because it gives security/SRE teams a useful signal without storing every flow record.
-
----
-
-# 4. Module breakdown
-
-## 4.1 Repository structure
-
-A serious Apache-style project should be multi-crate/multi-module from the start.
+## Repository Layout
 
 ```text
 flowsketch/
   crates/
-    flowsketch-core/          # sketch traits, hashers, common types
-    flowsketch-algos/         # Count-Min, CountSketch, HLL, SpaceSaving, etc.
-    flowsketch-ir/            # logical/physical query IR
-    flowsketch-planner/       # sketch selection + memory/error planning
-    flowsketch-runtime/       # windows, sharding, merge, scheduler
-    flowsketch-agent/         # host agent daemon
-    flowsketch-ebpf/          # eBPF C/Rust skeletons
-    flowsketch-pcap/          # offline replay
-    flowsketch-k8s/           # Kubernetes metadata, CRDs, Helm
-    flowsketch-otel/          # OTLP exporter/receiver integration
-    flowsketch-prometheus/    # /metrics exporter
-    flowsketch-clickhouse/    # optional batch export
-    flowsketch-kafka/         # optional event export
-    flowsketch-api/           # gRPC/HTTP API
-    flowsketch-cli/           # CLI
-  proto/
-    flowsketch/v1/*.proto
+    flowsketch-core/          common event, field, hash, estimate, snapshot traits
+    flowsketch-algos/         Count-Min, CountSketch, HLL, HLLMap, KLL, heavy hitters
+    flowsketch-ir/            logical and physical query IR
+    flowsketch-planner/       sketch selection, memory estimates, error contracts
+    flowsketch-runtime/       filtering, windowing, sketch execution, merges
+    flowsketch-pcap/          pcap parser and writer
+    flowsketch-prometheus/    Prometheus exposition
+    flowsketch-otel/          OTLP metrics encoding and HTTP client
+    flowsketch-agent/         host agent daemon
+    flowsketch-gateway/       distributed snapshot merge gateway
+    flowsketch-ebpf/          eBPF/userspace event contract
+    flowsketch-cli/           command-line interface
+  examples/
+    agent.yaml
+    gateway.yaml
+    queries/*.yaml
   deploy/
-    helm/
+    kubernetes/
     systemd/
-    docker/
-  benchmarks/
-    caida/
-    mawi/
-    synthetic/
   docs/
     query-language.md
     accuracy-contracts.md
-    operator-guide.md
     algorithm-notes.md
+    operator-guide.md
+    security.md
+    production-readiness.md
+    ebpf-roadmap.md
+  benchmarks/
+    README.md
+    current-results.md
 ```
 
-Recommended implementation language: **Rust userspace + C or Aya/libbpf eBPF layer**.
+The implementation language is Rust for userspace. The production collector
+path should be Rust userspace plus a small C/libbpf or Aya eBPF layer. The
+eBPF side should parse, filter, and emit compact metadata; userspace should do
+the sketching, planning, windowing, enrichment, and export.
 
-Reason: Rust is appropriate for a low-level agent with memory safety, concurrency, and C ABI support; eBPF programs still often require C-like restrictions because the kernel verifier is the real target.
+## Architecture
 
----
+FlowSketch separates the control plane from the data plane.
 
-# 5. Data model
+```text
+Control plane
+  query files / CLI / future Kubernetes CRD
+    -> parser
+    -> logical IR
+    -> physical sketch planner
+    -> resource and error checks
 
-## 5.1 Raw event
+Data plane
+  packet or flow source
+    -> normalizer
+    -> optional metadata enrichment
+    -> sketch runtime
+    -> window manager
+    -> local estimates or snapshots
+    -> Prometheus / OTLP / gateway
+```
+
+Supported and planned sources:
+
+| Source | Status | Notes |
+| ------ | ------ | ----- |
+| pcap replay | Implemented | Deterministic testing and offline analysis |
+| synthetic pcap | Implemented | Repeatable benchmark and correctness traces |
+| Linux AF_PACKET | Implemented | Simple live Linux capture path |
+| eBPF tc/XDP | Planned | First serious production collector |
+| Cilium/Hubble receiver | Planned | Avoid duplicate capture in Cilium clusters |
+| NetFlow/IPFIX/sFlow | Planned | Enterprise and ISP flow-log environments |
+| AF_XDP | Later | Higher performance, higher operational burden |
+| DPDK | Later | Specialized packet-processing deployments |
+| P4/SmartNIC/DPU | Later | Research or vendor-partner tier |
+
+The core design rule is simple: keep privileged packet collection small and
+auditable. Put the query planner and sketch runtime in userspace.
+
+## Packet Lifecycle
+
+For a scanner query, the runtime flow looks like this:
+
+```text
+packet arrives
+    -> collector extracts timestamp, 5-tuple, protocol, flags, byte count
+    -> normalizer produces a FlowEvent
+    -> optional enricher attaches node, interface, pod, namespace, service
+    -> planner maps distinct_count(dst.ip) by src.ip to a bounded sketch plan
+    -> runtime updates the active window bucket
+    -> flush emits sources above the threshold
+    -> exporter sends Prometheus or OTLP metrics
+```
+
+The wedge is useful because security and SRE teams get signals like
+"sources scanning too many destinations" without storing every flow record.
+
+## Data Model
+
+The runtime normalizes traffic into `FlowEvent`:
 
 ```rust
 pub struct FlowEvent {
     pub ts_nanos: u64,
-
     pub src_ip: IpAddr128,
     pub dst_ip: IpAddr128,
     pub src_port: u16,
     pub dst_port: u16,
     pub protocol: u8,
-
     pub bytes: u32,
     pub packets: u32,
-
     pub direction: Direction,
     pub tcp_flags: u8,
     pub interface_index: u32,
-
     pub node_id: u64,
     pub namespace_id: Option<u64>,
     pub pod_id: Option<u64>,
@@ -275,9 +319,9 @@ pub struct FlowEvent {
 }
 ```
 
-This deliberately excludes payload content. The privacy posture should be: **headers and metadata only by default**.
+Payload capture is deliberately out of scope by default.
 
-## 5.2 Logical dimensions
+Logical dimensions include:
 
 ```text
 src.ip
@@ -297,89 +341,73 @@ k8s.service.name
 k8s.workload.name
 ```
 
-For Kubernetes, FlowSketch should reuse OpenTelemetry semantic conventions where possible. OTel’s Kubernetes resource conventions define attributes such as `k8s.cluster.name`, `k8s.node.name`, `k8s.namespace.name`, `k8s.pod.uid`, `k8s.pod.name`, `k8s.pod.ip`, and pod labels.
+Where Kubernetes metadata is available, FlowSketch should reuse OpenTelemetry
+semantic conventions such as `k8s.cluster.name`, `k8s.node.name`,
+`k8s.namespace.name`, `k8s.pod.uid`, `k8s.pod.name`, and `k8s.pod.ip`.
 
-## 5.3 Aggregation output
+Estimates carry approximation metadata:
 
 ```rust
 pub struct SketchEstimate {
-    pub query_name: String;
-    pub window_start_nanos: u64;
-    pub window_end_nanos: u64;
-
-    pub group: Vec<(String, String)>;
-
-    pub estimate: f64;
-    pub lower_bound: Option<f64>;
-    pub upper_bound: Option<f64>;
-    pub confidence: Option<f64>;
-
-    pub algorithm: String;
-    pub sketch_bytes: u64;
-    pub update_count: u64;
+    pub query_name: String,
+    pub window_start_nanos: u64,
+    pub window_end_nanos: u64,
+    pub group: Vec<(String, String)>,
+    pub estimate: f64,
+    pub lower_bound: Option<f64>,
+    pub upper_bound: Option<f64>,
+    pub confidence: Option<f64>,
+    pub algorithm: String,
+    pub sketch_bytes: u64,
+    pub update_count: u64,
 }
 ```
 
-The `algorithm`, `sketch_bytes`, and error/confidence fields are important. They make the approximation visible instead of hiding it.
+The algorithm, memory, and error fields are part of the product. Approximation
+must be visible to operators.
 
----
+## Query Language
 
-# 6. Query language
+The current query language is YAML. YAML is easier than SQL to validate,
+version, ship in ConfigMaps, and eventually wrap in Kubernetes CRDs.
 
-## 6.1 MVP YAML DSL
-
-Start with YAML, not SQL. YAML is easier to validate, version, ship as Kubernetes CRDs, and translate into an internal IR.
+Example current query:
 
 ```yaml
-apiVersion: flowsketch.io/v1alpha1
-kind: SketchQuery
-metadata:
-  name: top-talkers
-spec:
-  interval: 10s
-  window:
-    size: 60s
-    slide: 10s
-
-  match:
-    protocol: tcp
-    interfaces: ["eth0"]
-
-  groupBy:
-    - src.ip
-    - dst.ip
-
-  measure:
-    type: heavy_hitters
-    value: bytes
-    limit: 100
-    error:
-      epsilon: 0.001
-      delta: 0.01
-
-  export:
-    prometheus:
-      enabled: true
-    otlp:
-      enabled: true
+name: top_talkers
+window:
+  size: 60s
+  slide: 10s
+groupBy:
+  - src.ip
+  - dst.ip
+measure:
+  type: heavy_hitters
+  value: bytes
+  limit: 100
+  error:
+    epsilon: 0.001
+export:
+  prometheus: true
+  maxSeries: 100
+resources:
+  maxMemory: 64MiB
 ```
 
-## 6.2 Query primitives
+Supported and planned primitives:
 
-| Primitive                 | Example                             | Algorithm family                              |
-| ------------------------- | ----------------------------------- | --------------------------------------------- |
-| `count()`                 | packets per source                  | Count-Min, exact counters for low-cardinality |
-| `sum(bytes)`              | bytes per 5-tuple                   | Count-Min / CountSketch                       |
-| `heavy_hitters(bytes)`    | top talkers                         | SpaceSaving, Misra-Gries, Count-Min + heap    |
-| `distinct_count(dst.ip)`  | fan-out per source                  | HyperLogLog / CPC / HLLMap-style              |
-| `entropy(src.ip)`         | entropy shifts during DDoS          | UnivMon-style or sampled distribution sketch  |
-| `change(metric)`          | sudden traffic change               | paired sketches over adjacent windows         |
-| `quantile(value)`         | latency/inter-arrival distributions | KLL / t-digest                                |
-| `traffic_matrix(src,dst)` | approximate service traffic matrix  | Count-Min / CountSketch / heavy-hitter matrix |
+| Primitive | Example | Algorithm family |
+| --------- | ------- | ---------------- |
+| `count()` | packets per source | Count-Min or exact counters for low cardinality |
+| `sum(bytes)` | bytes per source/destination | Count-Min or CountSketch |
+| `heavy_hitters(bytes)` | top talkers | SpaceSaving, Misra-Gries, Count-Min plus candidates |
+| `distinct_count(dst.ip)` | fan-out per source | HyperLogLog, HLLMap |
+| `entropy(src.ip)` | DDoS distribution shift | SpaceSaving-head plus HLL-tail, UnivMon-like future |
+| `quantile(value)` | packet-size p99 | KLL |
+| `change(metric)` | adjacent-window change | paired sketches |
+| `traffic_matrix(src,dst)` | service matrix | Count-Min, CountSketch, heavy-hitter matrix |
 
-## 6.3 Longer-term SQL-like layer
-
-Later:
+Longer term, FlowSketch can add a SQL-like layer:
 
 ```sql
 SELECT src.ip, APPROX_COUNT_DISTINCT(dst.ip) AS fanout
@@ -390,13 +418,15 @@ GROUP BY src.ip
 HAVING fanout > 5000;
 ```
 
-Do **not** start here. SQL introduces parsing and semantics debates before the runtime is proven.
+That should come after the runtime and planner are proven. Starting with SQL
+would create parsing and semantics debates too early.
 
----
+## Planner And IR
 
-# 7. Internal IR
+The planner is the main differentiator. Users should not need to know which
+sketch to choose.
 
-## 7.1 Logical IR
+Logical measures include:
 
 ```rust
 pub enum Measure {
@@ -408,222 +438,106 @@ pub enum Measure {
     Change { measure: Box<Measure>, baseline: WindowSpec },
     Quantile { field: Field, q: f64 },
 }
-
-pub struct LogicalQuery {
-    pub name: String,
-    pub filter: Predicate,
-    pub group_by: Vec<Field>,
-    pub measure: Measure,
-    pub window: WindowSpec,
-    pub error: ErrorSpec,
-    pub export: ExportSpec,
-}
 ```
 
-## 7.2 Physical IR
+Physical sketch choices include:
 
 ```rust
 pub enum PhysicalSketch {
-    CountMin {
-        width: usize,
-        depth: usize,
-        conservative_update: bool,
-    },
-    CountSketch {
-        width: usize,
-        depth: usize,
-    },
-    SpaceSaving {
-        capacity: usize,
-    },
-    MisraGries {
-        capacity: usize,
-    },
-    HyperLogLog {
-        precision: u8,
-    },
-    HllMap {
-        max_keys: usize,
-        precision: u8,
-    },
-    Kll {
-        k: usize,
-    },
-    Composite {
-        stages: Vec<PhysicalSketch>,
-    },
+    CountMin { width: usize, depth: usize, conservative_update: bool },
+    CountSketch { width: usize, depth: usize },
+    SpaceSaving { capacity: usize },
+    MisraGries { capacity: usize },
+    HyperLogLog { precision: u8 },
+    HllMap { max_keys: usize, precision: u8 },
+    Kll { k: usize },
+    Composite { stages: Vec<PhysicalSketch> },
 }
 ```
 
-## 7.3 Planner job
+Planner decisions:
 
-The planner converts:
+| Query | Preferred plan | Why |
+| ----- | -------------- | --- |
+| `sum(bytes) by src.ip` | Count-Min | nonnegative point estimates |
+| `topk(src.ip, bytes)` | SpaceSaving or Misra-Gries | need candidate identities |
+| `distinct_count(dst.ip) by src.ip` | HLLMap or heavy-source plus HLL | avoids unbounded HLL per source |
+| `entropy(src.ip)` | distribution sketch | entropy needs more than point counts |
+| `change(topk)` | paired sketches | compare current and baseline windows |
+| `traffic_matrix(src.service,dst.service)` | exact if small, sketch if large | service labels may be manageable |
 
-```yaml
-measure:
-  type: distinct_count
-  field: dst.ip
-groupBy:
-  - src.ip
-```
-
-into something like:
+Every explain plan should show:
 
 ```text
-Candidate plan A:
-  HLL per src.ip
-  Risk: unbounded number of src.ip keys
-
-Candidate plan B:
-  SpaceSaving(src.ip) to track heavy sources
-  + HLL per retained src.ip
-  Risk: misses low-volume scanners
-
-Candidate plan C:
-  HLLMap-like bounded keyed cardinality sketch
-  Risk: approximate both key retention and cardinality
-
-Chosen:
-  HLLMap if key cardinality is large and memory cap exists.
+algorithm
+memory budget
+window size and bucket count
+estimated value semantics
+error model and confidence
+known failure modes
+export series cap
 ```
 
-This is exactly where the project becomes interesting. The planner is the differentiator.
+## Algorithms
 
----
+| Algorithm | Use in FlowSketch | Notes |
+| --------- | ----------------- | ----- |
+| Count-Min Sketch | approximate packet and byte counts, traffic matrices | mergeable, compact, biased high for nonnegative updates |
+| CountSketch | signed updates, L2-heavy hitters, variance reduction | useful for turnstile-style extensions |
+| HyperLogLog | distinct source or destination counts | compact, standard, mergeable cardinality estimator |
+| HLLMap | grouped distinct counts | bounded keyed cardinality for fan-out queries |
+| SpaceSaving | top-k talkers and elephant flows | practical bounded candidate tracking |
+| Misra-Gries | deterministic heavy-hitter candidates | simple and useful as a baseline |
+| KLL | packet-size and flow-size quantiles | distribution summaries, not just counts |
+| ExactCounter | tests and ground truth | not for unbounded production queries |
 
-# 8. Algorithm catalogue and paper/source map
+The project should learn from:
 
-## 8.1 Core algorithms for v0/v1
+| System or body of work | What to take from it |
+| ---------------------- | -------------------- |
+| Apache DataSketches | production-grade algorithm engineering and mergeability |
+| Sonata | high-level query intent over streaming traffic |
+| PSketch | commodity Linux eBPF sketch monitoring direction |
+| Sketchy With a Chance of Adoption | adoption blockers: intent translation, resource allocation, composition, heterogeneous targets |
+| Cilium/Hubble | Kubernetes-native network visibility and service-map integration |
+| OpenTelemetry | normal telemetry pipeline integration instead of a proprietary backend |
 
-| Algorithm                                 | Use in FlowSketch                                                         | Why it matters                                                    | Source lineage                                                                                                                                                      |
-| ----------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Count-Min Sketch**                      | Approximate per-key packet/byte counts, traffic matrices, point queries   | Simple, mergeable, bounded memory, good for nonnegative updates   | Cormode/Muthukrishnan’s Count-Min Sketch is a sublinear-space frequency table with probabilistic overestimation guarantees.                                         |
-| **CountSketch**                           | L2-heavy hitters, signed updates, variance reduction, change signals      | Better for signed/turnstile-like settings and L2-heavy hitters    | CountSketch was introduced by Charikar, Chen, and Farach-Colton for frequent items/frequency moments in data streams.                                               |
-| **HyperLogLog**                           | Distinct destination counts, distinct source counts, fan-out/fan-in       | Standard approximate cardinality estimator; compact and mergeable | HyperLogLog estimates count-distinct using much less memory than exact sets; the original paper is Flajolet et al. 2007.                                            |
-| **CPC / Theta Sketches**                  | Future higher-accuracy cardinality and set operations                     | Useful for unions/intersections of traffic sets                   | Apache DataSketches documents CPC, Theta, HLL, tuple, frequent-items, and quantiles families.                                                                       |
-| **Misra-Gries**                           | Deterministic heavy-hitter candidate generation                           | Simple, deterministic, mergeable variants exist                   | Misra-Gries is one of the earliest heavy-hitter/frequent-item algorithms.                                                                                           |
-| **SpaceSaving / frequent-items variants** | Top-k talkers, elephant flows, service pairs                              | Practical heavy-hitter tracking with bounded candidates           | SpaceSaving-family work targets frequency estimation, frequent items, and top-k with limited space; recent variants emphasize mergeability in distributed settings. |
-| **KLL / t-digest / quantile sketches**    | Inter-arrival-time distributions, latency-like telemetry where measurable | Needed for distribution summaries, not just counts                | Apache DataSketches includes quantile families including KLL and t-digest-style sketches.                                                                           |
+## Runtime Design
 
-## 8.2 Network-telemetry-specific systems to learn from
+High-throughput telemetry should avoid global locks.
 
-| System / paper                                    | What to learn                                                                                                                               | Relevance                                                                                                                      |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Sketchy With a Chance of Adoption**             | Adoption blockers: intent translation, resource allocation, sketch composition, heterogeneous targets                                       | This is almost the design brief for FlowSketch.                                                                                |
-| **Compact Data Structures for Network Telemetry** | Current research direction: programmable switches/NICs, compact data structures, memory/compute constraints                                 | Confirms the field is active and relevant to modern telemetry.                                                                 |
-| **Survey of sketches in traffic measurement**     | Existing sketch landscape: design, aggregation, decoding, applications, implementation                                                      | Useful for algorithm selection and benchmarking against prior designs.                                                         |
-| **Sonata**                                        | High-level query interface that drives traffic collection/analysis; query partitioning between switch and stream processor; use of sketches | Strong inspiration for FlowSketch’s query compiler and runtime.                                                                |
-| **PSketch**                                       | eBPF-based in-kernel priority-aware sketching on commodity Linux                                                                            | Shows eBPF sketch monitoring is plausible, but also validates that FlowSketch should generalize beyond one research prototype. |
-| **Cilium/Hubble**                                 | Kubernetes-native network observability, local node visibility, Hubble Relay, service map                                                   | FlowSketch should integrate with or complement this, not fight it.                                                             |
+```text
+per-core collector
+    -> per-core sketch shard
+    -> periodic local flush
+    -> node-local merge
+    -> export or gateway push
+```
 
-## 8.3 What should be copied vs avoided
-
-| Copy                                                   | Avoid                                             |
-| ------------------------------------------------------ | ------------------------------------------------- |
-| Sonata’s high-level intent idea                        | Requiring programmable switches for the MVP       |
-| PSketch’s commodity-Linux/eBPF direction               | Putting the whole planner/runtime in kernel       |
-| DataSketches’ production-quality algorithm engineering | Becoming only another algorithm library           |
-| Cilium/Hubble’s Kubernetes-native deployment model     | Competing with exact flow visibility/service maps |
-| OpenTelemetry’s collector/export model                 | Inventing a proprietary telemetry pipeline        |
-
----
-
-# 9. Runtime design
-
-## 9.1 Core traits
+The core sketch trait shape is:
 
 ```rust
 pub trait Sketch {
-    type Key;
-    type Value;
-    type Estimate;
-
-    fn update(&mut self, key: Self::Key, value: Self::Value);
-    fn estimate(&self, key: &Self::Key) -> Self::Estimate;
+    fn update(&mut self, key: &[u8], value: u64);
+    fn estimate(&self, key: &[u8]) -> f64;
     fn merge(&mut self, other: &Self) -> Result<(), SketchError>;
     fn memory_bytes(&self) -> usize;
     fn reset(&mut self);
 }
-
-pub trait WindowedSketch {
-    fn update_at(&mut self, ts_nanos: u64, event: &FlowEvent);
-    fn flush_ready(&mut self, now_nanos: u64) -> Vec<SketchEstimate>;
-}
 ```
 
-## 9.2 Sharding model
+Windowing model:
 
-High-throughput network telemetry should avoid global locks.
+| Window | Use |
+| ------ | --- |
+| Tumbling | simple periodic summaries |
+| Sliding | detection over rolling intervals |
+| Exponential decay | future long-running trend summaries |
 
-```text
-per-core collector
-    ↓
-per-core sketch shard
-    ↓
-periodic local flush
-    ↓
-node-local merge
-    ↓
-export
-```
+The MVP model is a sliding window implemented as a ring of tumbling buckets.
+For example, a 60 second window with a 10 second slide is six buckets.
 
-Implementation:
-
-```rust
-pub struct ShardedSketch<S> {
-    shards: Vec<S>,
-    shard_count: usize,
-}
-
-impl<S: Sketch> ShardedSketch<S> {
-    pub fn update(&mut self, cpu_id: usize, key: S::Key, value: S::Value) {
-        let shard = cpu_id % self.shard_count;
-        self.shards[shard].update(key, value);
-    }
-
-    pub fn merge_all(&self) -> S {
-        // combine compatible sketches
-    }
-}
-```
-
-## 9.3 Windowing
-
-Support three window types:
-
-| Window            | Use                                     |
-| ----------------- | --------------------------------------- |
-| Tumbling          | Simple periodic summaries               |
-| Sliding           | Detection over rolling intervals        |
-| Exponential decay | Long-running trend without full history |
-
-MVP should implement:
-
-```text
-tumbling window
-sliding window as ring of smaller tumbling buckets
-```
-
-Example:
-
-```text
-60s sliding window, 10s slide
-= 6 buckets of 10s each
-```
-
-Each bucket has independent sketches. Query result merges the relevant buckets.
-
-## 9.4 Hashing
-
-Hashing is not an implementation detail. It affects accuracy and adversarial behavior.
-
-Implement:
-
-* fixed seeded hash families
-* per-query seed isolation
-* stable cross-node seeds for mergeability
-* optional secret seeds for adversarial environments
-* hash-version metadata in exported estimates
+Hashing is treated as part of compatibility:
 
 ```rust
 pub struct HashSpec {
@@ -633,131 +547,55 @@ pub struct HashSpec {
 }
 ```
 
----
+FlowSketch needs fixed seeded hash families, per-query seed isolation, stable
+cross-node seeds for mergeability, optional secret seeds for adversarial
+environments, and hash-version metadata in exported estimates.
 
-# 10. Collector architecture
+## Distributed Aggregation
 
-## 10.1 v0 collector: offline and userspace
+Node-local agents are useful, but cluster-wide questions need merging:
 
-Start with:
-
-| Source                    | Reason                                  |
-| ------------------------- | --------------------------------------- |
-| pcap file replay          | Deterministic testing                   |
-| live AF_PACKET/raw socket | Simple Linux live capture               |
-| synthetic generator       | Benchmarking correctness and throughput |
-
-This gives an MVP without kernel complexity.
-
-## 10.2 v1 collector: eBPF tc/XDP
-
-The first serious production collector should be eBPF-based.
-
-Use eBPF to extract minimal packet metadata:
-
-```c
-struct flow_event {
-    __u64 ts;
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u8  proto;
-    __u32 bytes;
-    __u8  tcp_flags;
-    __u32 ifindex;
-};
+```text
+agent on node A --\
+agent on node B ----> flowsketch-gateway -> Prometheus / OTLP / Kafka
+agent on node C --/
 ```
 
-Then send to userspace via ring buffer or perf buffer.
+Implemented today:
 
-Important rule:
+- agents can push FSK1 snapshot batches to the gateway
+- the gateway validates algorithm, hash seed, sketch parameters, and windows
+- compatible snapshots are merged
+- cluster-level `/metrics` and `/v1/nodes` are served by the gateway
 
-> The eBPF program should parse and filter. The userspace runtime should sketch.
-
-Why: eBPF can run safely and efficiently inside the kernel, but it has verifier constraints, finite program complexity limits, map restrictions, and privilege requirements.
-
-## 10.3 Later collectors
-
-| Collector                    | Phase | Notes                                                        |
-| ---------------------------- | ----: | ------------------------------------------------------------ |
-| Cilium/Hubble receiver       | v1/v2 | Consume existing flow visibility where Cilium exists.        |
-| NetFlow/IPFIX/sFlow receiver |    v2 | Important for ISPs and enterprises.                          |
-| AF_XDP                       | v2/v3 | Higher performance, higher operational complexity.           |
-| DPDK                         |    v3 | For specialized packet-processing shops.                     |
-| P4/Tofino                    |    v4 | Research/high-end network hardware.                          |
-| SmartNIC/DPU                 |    v4 | NVIDIA BlueField, AMD Pensando, Intel IPU-style future path. |
-
----
-
-# 11. Planner design
-
-The planner is the core differentiator.
-
-## 11.1 Planner inputs
-
-```yaml
-measure:
-  type: heavy_hitters
-  value: bytes
-  limit: 100
-error:
-  epsilon: 0.001
-  delta: 0.01
-resources:
-  maxMemory: 128MiB
-  maxCpuPct: 2
-  maxExportSeries: 10000
-deployment:
-  target: linux-ebpf
-```
-
-## 11.2 Planner outputs
-
-```yaml
-physicalPlan:
-  sketches:
-    - id: hh_src_dst_bytes
-      algorithm: spacesaving
-      capacity: 4096
-      shardBy: cpu
-      windowBuckets: 6
-  expected:
-    memoryBytes: 10485760
-    cpuCost: medium
-    mergeable: true
-    exportSeriesUpperBound: 100
-    error:
-      kind: additive
-      epsilon: 0.001
-```
-
-## 11.3 Planner decision table
-
-| Query                                     | Preferred plan                                | Why                                       |
-| ----------------------------------------- | --------------------------------------------- | ----------------------------------------- |
-| `sum(bytes) by src.ip`                    | Count-Min                                     | Simple nonnegative point estimates        |
-| `topk(src.ip, bytes)`                     | SpaceSaving or Misra-Gries                    | Need identities, not just point estimates |
-| `distinct_count(dst.ip) by src.ip`        | HLLMap / heavy-source + HLL                   | Avoid unbounded HLL per source            |
-| `entropy(src.ip)`                         | distribution sketch / UnivMon-like plan       | Entropy needs distributional summary      |
-| `change(topk)`                            | paired sketches over current/baseline windows | Compare adjacent windows                  |
-| `traffic_matrix(src.service,dst.service)` | Count-Min if huge, exact if low-cardinality   | Service labels may be manageable          |
-
-## 11.4 Accuracy contracts
-
-Every query should expose:
+Sketches can only merge if these match:
 
 ```text
 algorithm
-memory budget
-window size
-estimated value
-error model
-confidence level if applicable
-known failure modes
+version
+hash family
+seed
+width / depth / precision / capacity
+window boundaries
+key encoding
+snapshot format
 ```
 
-Example Prometheus labels:
+Incompatible merges must be rejected and exposed as health metrics.
+
+## Export APIs
+
+Prometheus:
+
+```text
+GET /metrics
+GET /healthz
+GET /readyz
+GET /v1/queries
+GET /v1/nodes          # gateway
+```
+
+Example metric shape:
 
 ```text
 flowsketch_query_estimate{
@@ -768,201 +606,19 @@ flowsketch_query_estimate{
 } 7132
 ```
 
-Approximation must be explicit because production operators need to know whether the number is exact, approximate, biased high, biased low, or candidate-based.
-
----
-
-# 12. Export APIs
-
-## 12.1 Prometheus endpoint
-
-Expose `/metrics`.
-
-Prometheus’s text exposition format is line-oriented over HTTP, supports Counter, Gauge, Histogram, Summary, and Untyped primitives, and is intentionally easy to assemble for minimal cases.
-
-Example:
-
-```text
-# HELP flowsketch_top_bytes Estimated bytes for heavy hitter flow
-# TYPE flowsketch_top_bytes gauge
-flowsketch_top_bytes{
-  query="top_talkers",
-  src_ip="10.0.1.15",
-  dst_ip="10.0.2.20",
-  protocol="tcp",
-  algorithm="spacesaving",
-  window="60s"
-} 18422391
-
-# HELP flowsketch_distinct_dst Estimated distinct destinations per source
-# TYPE flowsketch_distinct_dst gauge
-flowsketch_distinct_dst{
-  query="suspected_scanners",
-  src_ip="10.0.1.50",
-  algorithm="hll",
-  window="60s"
-} 9231
-```
-
-## 12.2 OTLP metrics exporter
-
-OpenTelemetry Collector config is built from receivers, processors, exporters, connectors, extensions, and service pipelines; that structure is exactly why FlowSketch should export OTLP instead of inventing a pipeline.
-
-FlowSketch config:
+OTLP:
 
 ```yaml
 export:
   otlp:
-    endpoint: http://otel-collector.observability.svc:4317
-    protocol: grpc
-    temporality: delta
+    endpoint: http://otel-collector.observability.svc:4318/v1/metrics
 ```
 
-OTel Collector config:
+OpenTelemetry resource attributes should include `service.name`,
+`host.name`, `k8s.cluster.name`, `k8s.node.name`, `k8s.namespace.name`,
+`k8s.pod.name`, `cloud.provider`, and `cloud.region` where available.
 
-```yaml
-receivers:
-  otlp:
-    protocols:
-      grpc:
-      http:
-
-processors:
-  batch:
-  memory_limiter:
-    check_interval: 5s
-    limit_mib: 512
-
-exporters:
-  prometheusremotewrite:
-    endpoint: http://mimir/api/v1/push
-  otlp/datadog:
-    endpoint: datadog-agent.default.svc:4317
-
-service:
-  pipelines:
-    metrics:
-      receivers: [otlp]
-      processors: [memory_limiter, batch]
-      exporters: [prometheusremotewrite, otlp/datadog]
-```
-
-## 12.3 Native gRPC API
-
-Use native gRPC for control and raw sketch estimates.
-
-```proto
-syntax = "proto3";
-
-package flowsketch.v1;
-
-service FlowSketchControl {
-  rpc ApplyQuery(ApplyQueryRequest) returns (ApplyQueryResponse);
-  rpc DeleteQuery(DeleteQueryRequest) returns (DeleteQueryResponse);
-  rpc ListQueries(ListQueriesRequest) returns (ListQueriesResponse);
-  rpc ExplainQuery(ExplainQueryRequest) returns (ExplainQueryResponse);
-  rpc StreamEstimates(StreamEstimatesRequest) returns (stream SketchEstimate);
-}
-
-message ApplyQueryRequest {
-  string name = 1;
-  string yaml = 2;
-  bool dry_run = 3;
-}
-
-message ExplainQueryResponse {
-  string logical_plan = 1;
-  string physical_plan = 2;
-  uint64 estimated_memory_bytes = 3;
-  string error_contract = 4;
-}
-```
-
-The `ExplainQuery` endpoint is essential. It gives the operator confidence before deployment.
-
-## 12.4 Kafka / ClickHouse export
-
-For larger users:
-
-```yaml
-export:
-  kafka:
-    brokers:
-      - kafka-1:9092
-    topic: flowsketch.estimates
-    format: protobuf
-```
-
-This lets Datadog/Splunk/Elastic/Kentik-style platforms consume sketch results as events, not just metrics.
-
----
-
-# 13. OpenTelemetry integration plan
-
-## 13.1 Two integration modes
-
-### Mode A: FlowSketch as OTLP producer
-
-```text
-FlowSketch agent
-    ↓ OTLP metrics/logs
-OpenTelemetry Collector / Grafana Alloy / Datadog Collector
-    ↓
-backend
-```
-
-This is the simplest and should be the default.
-
-### Mode B: FlowSketch as OpenTelemetry Collector receiver
-
-Later, implement a custom OTel receiver:
-
-```yaml
-receivers:
-  flowsketch:
-    queries:
-      - /etc/flowsketch/queries/*.yaml
-    source:
-      ebpf:
-        interfaces: ["eth0"]
-
-service:
-  pipelines:
-    metrics:
-      receivers: [flowsketch]
-      exporters: [otlp, prometheusremotewrite]
-```
-
-This makes FlowSketch embeddable into existing OTel collector distributions.
-
-## 13.2 Semantic mapping
-
-Use OTel metric names like:
-
-```text
-network.flowsketch.bytes.estimated
-network.flowsketch.packets.estimated
-network.flowsketch.distinct_destinations.estimated
-network.flowsketch.heavy_hitters.rank
-network.flowsketch.entropy.estimated
-network.flowsketch.change_score
-```
-
-Resource attributes:
-
-```text
-service.name = "flowsketch-agent"
-host.name
-k8s.cluster.name
-k8s.node.name
-k8s.namespace.name
-k8s.pod.name
-k8s.pod.uid
-cloud.provider
-cloud.region
-```
-
-Metric attributes:
+Metric attributes should include:
 
 ```text
 flowsketch.query.name
@@ -978,168 +634,58 @@ source.port
 destination.port
 ```
 
-Be conservative with IP labels. Exporting raw IPs as Prometheus labels can create its own cardinality explosion.
+Raw IP labels must be capped, hashed, prefix-aggregated, or omitted where
+cardinality would harm the backend.
 
-## 13.3 Cardinality guardrails
-
-FlowSketch must have export caps:
-
-```yaml
-export:
-  maxSeriesPerQuery: 1000
-  redact:
-    ipMode: hash_prefix
-    prefixLengthV4: 24
-  dropLabels:
-    - src.port
-```
-
-This is non-negotiable. An approximate high-cardinality telemetry tool must not create a high-cardinality metrics disaster.
-
----
-
-# 14. Grafana integration
-
-Grafana Labs would care if FlowSketch exports through **Prometheus** or **OTLP**.
-
-Grafana Alloy is an open-source telemetry collector, an OpenTelemetry Collector distribution with built-in Prometheus pipelines and native support for Loki, Pyroscope, and other observability backends.
-
-## 14.1 Grafana Alloy config
-
-```hcl
-otelcol.receiver.otlp "flowsketch" {
-  grpc {
-    endpoint = "0.0.0.0:4317"
-  }
-
-  http {
-    endpoint = "0.0.0.0:4318"
-  }
-
-  output {
-    metrics = [otelcol.processor.batch.default.input]
-    logs    = [otelcol.processor.batch.default.input]
-  }
-}
-
-otelcol.processor.batch "default" {
-  output {
-    metrics = [otelcol.exporter.otlp.grafana.input]
-    logs    = [otelcol.exporter.otlp.grafana.input]
-  }
-}
-
-otelcol.exporter.otlp "grafana" {
-  client {
-    endpoint = "grafana-otlp-endpoint:4317"
-  }
-}
-```
-
-## 14.2 Grafana dashboard package
-
-Ship official dashboards:
-
-| Dashboard             | Panels                                                   |
-| --------------------- | -------------------------------------------------------- |
-| Network Heavy Hitters | top src/dst pairs, bytes, packets, rank, error           |
-| Scanner Detection     | distinct destinations by source, threshold events        |
-| Service Fan-Out       | namespace/service fan-out over time                      |
-| DDoS Signals          | entropy, source cardinality, heavy hitters               |
-| Agent Health          | CPU, dropped events, ring buffer pressure, sketch memory |
-| Accuracy/Resource     | query memory, sketch width/depth, export series count    |
-
-## 14.3 Why Grafana could adopt it
-
-Grafana does not need to own the agent. It only needs:
-
-* OTLP ingest
-* Prometheus scrape
-* dashboards
-* alert rules
-* Alloy config examples
-
-That makes adoption low-friction.
-
----
-
-# 15. Datadog integration
-
-Datadog already has OpenTelemetry support, network monitoring products, custom integrations, OpenMetrics checks, and a recommended Datadog OpenTelemetry Collector path. The Datadog docs expose OpenTelemetry setup paths, semantic mapping, integrations, and ways to build Agent-based integrations, dashboards, monitors, and Cloud SIEM rules.
-
-## 15.1 Datadog ingestion options
-
-| Option                              | Difficulty | Notes                                             |
-| ----------------------------------- | ---------: | ------------------------------------------------- |
-| OTLP metrics to Datadog Collector   |        Low | Best first path                                   |
-| OpenMetrics scrape by Datadog Agent |        Low | Good for self-managed clusters                    |
-| Datadog Agent integration           |     Medium | Best if Datadog wants first-class product support |
-| Cloud SIEM detection rules          |     Medium | Useful for scanner/exfiltration signals           |
-| Datadog Observability Pipelines     |     Medium | Useful for routing/transforming FlowSketch events |
-
-## 15.2 Datadog-facing config
-
-FlowSketch:
-
-```yaml
-export:
-  otlp:
-    endpoint: http://datadog-otel-collector.default.svc:4317
-    protocol: grpc
-  tags:
-    env: prod
-    team: platform
-    source: flowsketch
-```
-
-Datadog-style metric examples:
+Future native APIs:
 
 ```text
-flowsketch.network.bytes.estimated
-flowsketch.network.distinct_destinations.estimated
-flowsketch.network.heavy_hitter.rank
-flowsketch.network.entropy.estimated
-flowsketch.agent.dropped_events
-flowsketch.agent.sketch_memory_bytes
+ApplyQuery
+DeleteQuery
+ListQueries
+ExplainQuery
+StreamEstimates
+PushSketch
+StreamSketches
 ```
 
-Suggested tags:
+gRPC should be used for control-plane sync and high-volume structured
+snapshot transport once the HTTP prototype is outgrown.
 
-```text
-env
-service
-team
-cluster_name
-kube_namespace
-kube_service
-query_name
-algorithm
-window
-```
+## Kubernetes
 
-Again: raw IP tags should be capped or hashed.
-
----
-
-# 16. Kubernetes integration
-
-## 16.1 Deployment model
-
-Use a DaemonSet:
+The intended deployment model is:
 
 ```text
 one FlowSketch agent per node
-    ↓
-node-local packet observation
-    ↓
-node-local sketches
-    ↓
-cluster gateway merges estimates
-    ↓
-OTel/Prometheus export
+    -> node-local packet observation
+    -> node-local sketches
+    -> gateway merges compatible snapshots
+    -> OTel / Prometheus export
 ```
 
-## 16.2 Components
+Current deployment assets:
+
+- `deploy/kubernetes/namespace.yaml`
+- `deploy/kubernetes/rbac.yaml`
+- `deploy/kubernetes/config.yaml`
+- `deploy/kubernetes/gateway.yaml`
+- `deploy/kubernetes/agent-daemonset.yaml`
+- `deploy/kubernetes/pdb.yaml`
+- `deploy/kubernetes/networkpolicy.yaml` as an optional template
+- `deploy/kubernetes/kustomization.yaml`
+
+Deploy the baseline manifests:
+
+```bash
+kubectl apply -k deploy/kubernetes
+```
+
+The optional NetworkPolicy must be reviewed before use. The agent uses
+`hostNetwork: true`, and some CNIs classify that traffic by node IP rather
+than pod labels.
+
+Future Kubernetes surface:
 
 ```text
 flowsketch-agent DaemonSet
@@ -1149,9 +695,10 @@ SketchQuery CRD
 Helm chart
 Grafana dashboards
 PrometheusRule templates
+ServiceMonitor / PodMonitor templates
 ```
 
-## 16.3 CRD
+Future CRD shape:
 
 ```yaml
 apiVersion: flowsketch.io/v1alpha1
@@ -1180,112 +727,13 @@ spec:
     prometheus: true
 ```
 
-## 16.4 Operator responsibilities
+The operator should validate queries, explain physical plans in status, roll
+out configs to agents, enforce team or namespace budgets, manage gateways, and
+surface health.
 
-| Responsibility   | Description                                             |
-| ---------------- | ------------------------------------------------------- |
-| Validate queries | Reject unsafe/unbounded query shapes                    |
-| Explain plans    | Attach physical plan and estimated memory as CRD status |
-| Roll out configs | Push query config to agents                             |
-| Track health     | Agent readiness, dropped events, sketch pressure        |
-| Manage gateways  | Cluster-level merge/aggregation                         |
-| Enforce limits   | Namespace/team-level memory and series budgets          |
+## Security And Privacy
 
----
-
-# 17. Distributed aggregation
-
-## 17.1 Why distributed merge matters
-
-A node-local agent is useful, but Apache-scale value comes from network-wide queries:
-
-```text
-top talkers across cluster
-distinct destinations across all nodes
-service-to-service traffic matrix
-cluster-wide entropy shift
-```
-
-Many sketches are mergeable. Count-Min, CountSketch, and HyperLogLog-style sketches can be combined when configured compatibly; Apache DataSketches also emphasizes mergeability and cross-language compatible binary representations for production use.
-
-## 17.2 Merge architecture
-
-```text
-agent on node A ─┐
-agent on node B ─┼─> flowsketch-gateway ──> OTLP / Prometheus / Kafka
-agent on node C ─┘
-```
-
-## 17.3 Compatibility requirements
-
-Sketches can only merge if:
-
-```text
-same algorithm
-same hash family
-same seeds
-same width/depth/precision
-same window boundaries
-same key encoding
-same version
-```
-
-Represent this explicitly:
-
-```rust
-pub struct SketchCompatibility {
-    pub algorithm: String,
-    pub version: u16,
-    pub hash_family: String,
-    pub seed: u64,
-    pub params_hash: u64,
-}
-```
-
-If incompatible, reject merge and emit health metrics.
-
----
-
-# 18. Storage design
-
-FlowSketch should not become a database.
-
-But it needs short-term local state:
-
-| State                | Storage                                                         |
-| -------------------- | --------------------------------------------------------------- |
-| Active sketches      | memory                                                          |
-| Config               | file / Kubernetes ConfigMap / CRD                               |
-| Crash recovery       | optional local snapshot                                         |
-| Debug samples        | bounded ring buffer                                             |
-| Historical estimates | external backend: Prometheus, Mimir, ClickHouse, Kafka, Datadog |
-
-## 18.1 Snapshot format
-
-Use a versioned binary format:
-
-```text
-magic: FSK1
-version: u16
-algorithm_id: u16
-hash_spec
-params
-window_start
-window_end
-payload_len
-payload
-checksum
-```
-
-Do this early. Stable serialization is necessary for distributed merge, tests, and future language bindings.
-
----
-
-# 19. Security and privacy model
-
-## 19.1 Default privacy posture
-
-Default behavior:
+Default posture:
 
 ```text
 no payload capture
@@ -1295,22 +743,10 @@ bounded debug sampling
 IP hashing available
 prefix aggregation available
 label allowlist required
+query memory and series caps
 ```
 
-## 19.2 RBAC
-
-Kubernetes permissions should be minimal:
-
-| Permission                              | Why                                                                    |
-| --------------------------------------- | ---------------------------------------------------------------------- |
-| Read pods/namespaces/services/endpoints | Metadata enrichment                                                    |
-| Read nodes                              | Node identity                                                          |
-| Watch SketchQuery CRDs                  | Query config                                                           |
-| No secret read                          | Should not need secrets except exporter credentials via mounted secret |
-
-## 19.3 Runtime safety
-
-Expose health metrics:
+Runtime safety signals should include:
 
 ```text
 flowsketch_agent_dropped_events_total
@@ -1323,466 +759,15 @@ flowsketch_agent_queries_active
 flowsketch_agent_queries_rejected_total
 ```
 
----
+Kubernetes permissions should be minimal: read pods, namespaces, services,
+endpoints, nodes, and future `SketchQuery` CRDs. The agent should not need
+secret reads except through explicitly mounted exporter credentials.
 
-# 20. MVP implementation phases
+See [`docs/security.md`](docs/security.md) for the current security notes.
 
-## Phase 0 — Scope lock
+## Example Queries
 
-**Goal:** prevent the project from becoming too broad.
-
-### Deliverables
-
-* Project charter
-* Query primitives list
-* Supported algorithms list
-* Supported export paths
-* Explicit non-goals
-
-### Non-goals for first 6 months
-
-```text
-No P4
-No DPDK
-No SmartNIC
-No inline packet modification
-No packet payload capture
-No custom database
-No full SIEM
-No full SQL parser
-```
-
----
-
-## Phase 1 — Core algorithm crate
-
-**Goal:** build correct, tested sketch primitives.
-
-### Implement
-
-```text
-flowsketch-core
-flowsketch-algos
-```
-
-Algorithms:
-
-* Count-Min Sketch
-* CountSketch
-* HyperLogLog
-* SpaceSaving
-* Misra-Gries
-* simple exact counter for baseline comparison
-* optional KLL later
-
-### Tests
-
-| Test            | Description                                             |
-| --------------- | ------------------------------------------------------- |
-| Unit tests      | update/query/merge                                      |
-| Property tests  | merge equivalence, reset, serialization                 |
-| Golden tests    | deterministic output with fixed seeds                   |
-| Error tests     | synthetic distributions: uniform, Zipf, adversarial-ish |
-| Benchmark tests | update throughput, memory footprint                     |
-
-### Acceptance criteria
-
-```text
->5M updates/sec/core in userspace synthetic benchmark
-stable serialization format
-merge compatibility checks
-documented error model for each algorithm
-```
-
----
-
-## Phase 2 — Offline replay prototype
-
-**Goal:** prove useful answers from traffic traces.
-
-### Implement
-
-```text
-flowsketch-pcap
-flowsketch-cli
-basic query YAML
-Prometheus text output
-```
-
-CLI:
-
-```bash
-flowsketch replay trace.pcap --query top-talkers.yaml
-flowsketch explain top-talkers.yaml
-flowsketch bench --algo count-min --events 10000000
-```
-
-Example output:
-
-```text
-QUERY top_talkers window=60s algorithm=spacesaving
-rank src_ip        dst_ip        estimate_bytes
-1    10.0.1.10    10.0.2.50    812312381
-2    10.0.1.11    10.0.2.51    553123900
-```
-
-### Acceptance criteria
-
-```text
-reads pcap
-extracts IPv4/IPv6/TCP/UDP
-runs 3 useful queries
-exports Prometheus text
-has reproducible benchmark suite
-```
-
-This phase is where you avoid building a complicated agent before you know the query model is useful.
-
----
-
-## Phase 3 — Userspace live agent
-
-**Goal:** live passive monitoring without eBPF yet.
-
-### Implement
-
-```text
-flowsketch-agent
-AF_PACKET/raw socket input
-HTTP /metrics endpoint
-HTTP /healthz
-config reload
-```
-
-Agent config:
-
-```yaml
-agent:
-  nodeName: node-a
-  interfaces:
-    - eth0
-  capture:
-    mode: af_packet
-  resourceLimits:
-    maxMemory: 256MiB
-    maxCpuPct: 5
-
-queries:
-  - file: /etc/flowsketch/queries/top-talkers.yaml
-
-export:
-  prometheus:
-    listen: 0.0.0.0:9464
-```
-
-### Acceptance criteria
-
-```text
-runs as systemd service
-runs in Docker with host networking
-scrapable by Prometheus
-safe failure mode
-bounded memory
-```
-
----
-
-## Phase 4 — OTLP exporter
-
-**Goal:** make it usable by real observability teams.
-
-### Implement
-
-```text
-flowsketch-otel
-OTLP metrics exporter
-OTLP logs/events exporter for anomalies
-batching
-retry/backoff
-resource attributes
-```
-
-The OpenTelemetry Collector already expects pipelines made of receivers, processors, and exporters, and supports OTLP over gRPC/HTTP in common configurations.
-
-### Acceptance criteria
-
-```text
-exports to OpenTelemetry Collector
-exports to Grafana Alloy
-exports to Datadog OTel path
-resource attributes follow OTel conventions where practical
-```
-
----
-
-## Phase 5 — Kubernetes-native MVP
-
-**Goal:** make adoption look normal for platform teams.
-
-### Implement
-
-```text
-Helm chart
-DaemonSet
-ServiceMonitor
-SketchQuery CRD
-basic operator
-Kubernetes metadata enricher
-```
-
-Deployment:
-
-```bash
-helm install flowsketch flowsketch/flowsketch \
-  --namespace observability \
-  --set export.otlp.endpoint=http://otel-collector:4317
-```
-
-### Acceptance criteria
-
-```text
-one agent per node
-pod/service/namespace enrichment
-Prometheus scrape works
-OTLP export works
-SketchQuery CRD works
-Grafana dashboard package works
-```
-
----
-
-## Phase 6 — eBPF collector
-
-**Goal:** credible production packet collection.
-
-### Implement
-
-```text
-flowsketch-ebpf
-tc ingress hook first
-XDP optional
-ring buffer export
-kernel capability checks
-fallback to userspace mode
-```
-
-Design:
-
-```text
-eBPF:
-  parse L2/L3/L4
-  apply cheap filters
-  emit compact FlowEvent
-
-userspace:
-  enrich
-  sketch
-  window
-  export
-```
-
-PSketch is a recent example showing that eBPF-based sketch monitoring on commodity Linux is plausible; it reports top-k flow detection on 10 Gbps traces with low throughput degradation.
-
-### Acceptance criteria
-
-```text
-loads on supported kernels
-fails closed if verifier rejects program
-does not alter packets
-overhead benchmarked
-supports tc ingress
-supports IPv4/IPv6/TCP/UDP
-```
-
----
-
-## Phase 7 — Cluster gateway and distributed merge
-
-**Goal:** network-wide approximate queries.
-
-### Implement
-
-```text
-flowsketch-gateway
-agent-to-gateway gRPC
-sketch snapshot transport
-merge compatibility validation
-cluster-level estimates
-```
-
-Gateway API:
-
-```proto
-service FlowSketchIngest {
-  rpc PushSketch(PushSketchRequest) returns (PushSketchResponse);
-  rpc StreamSketches(stream SketchFrame) returns (PushSketchResponse);
-}
-```
-
-### Acceptance criteria
-
-```text
-cluster-wide top-k
-cluster-wide distinct counts
-node-level and cluster-level exports
-merge errors observable
-bounded gateway memory
-```
-
----
-
-## Phase 8 — Query planner v1
-
-**Goal:** stop forcing users to think in algorithms.
-
-### Implement
-
-```text
-logical IR
-physical IR
-memory estimator
-error estimator
-query explain
-query rejection
-```
-
-Example:
-
-```bash
-flowsketch explain suspected-scanners.yaml
-```
-
-Output:
-
-```text
-Logical query:
-  group by src.ip
-  estimate distinct_count(dst.ip)
-  window 60s slide 10s
-
-Physical plan:
-  HLLMap(precision=12, max_keys=4096)
-  6 window buckets
-  estimated memory: 18.7 MiB
-  export series upper bound: 500
-
-Warnings:
-  raw src.ip labels may create high series cardinality
-  use ipMode=hash_prefix or maxSeries cap for Prometheus
-```
-
-### Acceptance criteria
-
-```text
-planner chooses algorithms
-planner estimates memory
-planner rejects unsafe plans
-explain output is useful to operators
-```
-
-This is a major project milestone. It moves FlowSketch from “tool” to “runtime.”
-
----
-
-## Phase 9 — Advanced integrations
-
-**Goal:** become ecosystem infrastructure.
-
-### Add
-
-| Integration                           | Why                                               |
-| ------------------------------------- | ------------------------------------------------- |
-| Cilium/Hubble receiver                | Avoid duplicate packet capture in Cilium clusters |
-| OpenTelemetry Collector receiver      | Embed into collector distributions                |
-| Grafana Alloy component               | First-class Grafana path                          |
-| Datadog Agent/OpenMetrics integration | First-class Datadog path                          |
-| ClickHouse sink                       | Large event analytics                             |
-| Kafka sink                            | Security/event pipelines                          |
-| Terraform/Helm modules                | Enterprise adoption                               |
-| PrometheusRule templates              | Alerting out of the box                           |
-
-Cilium/Hubble already gives node, cluster, and multi-cluster visibility, flow filtering, and service maps; FlowSketch should use that ecosystem where present rather than duplicate all visibility logic.
-
----
-
-## Phase 10 — Advanced backends
-
-Only after v1.
-
-| Backend            | Why later                                          |
-| ------------------ | -------------------------------------------------- |
-| AF_XDP             | More performance, more complexity                  |
-| DPDK               | Too invasive for normal users                      |
-| P4                 | Great research story, not MVP                      |
-| SmartNIC/DPU       | Vendor partnerships needed                         |
-| WASM plugin engine | Useful but creates security/reliability complexity |
-
----
-
-# 21. Public API surface
-
-## 21.1 CLI
-
-```bash
-flowsketch agent --config /etc/flowsketch/config.yaml
-flowsketch replay trace.pcap --query query.yaml
-flowsketch explain query.yaml
-flowsketch validate query.yaml
-flowsketch status
-flowsketch top --query top-talkers --window 60s
-flowsketch export snapshot --query top-talkers
-flowsketch bench --profile 10g
-```
-
-## 21.2 HTTP API
-
-```text
-GET  /healthz
-GET  /readyz
-GET  /metrics
-GET  /v1/queries
-POST /v1/queries
-GET  /v1/queries/{name}/explain
-GET  /v1/queries/{name}/estimates
-DELETE /v1/queries/{name}
-```
-
-## 21.3 gRPC API
-
-Use gRPC for:
-
-* streaming estimates
-* pushing snapshots
-* gateway aggregation
-* control-plane sync
-
-## 21.4 Kubernetes API
-
-```text
-SketchQuery
-SketchQueryStatus
-FlowSketchAgent
-FlowSketchGateway
-```
-
-`SketchQueryStatus` should include:
-
-```yaml
-status:
-  accepted: true
-  physicalPlan:
-    algorithm: hllmap
-    memoryBytes: 19608320
-  warnings:
-    - raw IP labels are capped to 500 series
-  lastApplied: "2026-07-03T12:00:00Z"
-```
-
----
-
-# 22. Example queries to ship
-
-## 22.1 Top talkers
+Top talkers:
 
 ```yaml
 name: top_talkers
@@ -1798,13 +783,16 @@ measure:
   limit: 100
 ```
 
-## 22.2 Suspected scanners
+Suspected scanners:
 
 ```yaml
 name: suspected_scanners
 window:
   size: 60s
   slide: 10s
+match:
+  protocol: tcp
+  dst.port: [22, 80, 443, 5432, 6379]
 groupBy:
   - src.ip
 measure:
@@ -1814,58 +802,175 @@ alertIf:
   gt: 5000
 ```
 
-## 22.3 Namespace fan-out
+Protocol bytes:
 
 ```yaml
-name: namespace_fanout
-window:
-  size: 5m
-  slide: 30s
-groupBy:
-  - k8s.namespace.name
-measure:
-  type: distinct_count
-  field: dst.ip
-```
-
-## 22.4 Service traffic matrix
-
-```yaml
-name: service_traffic_matrix
+name: protocol_bytes
 window:
   size: 60s
   slide: 10s
 groupBy:
-  - src.service
-  - dst.service
+  - protocol
 measure:
   type: sum
   field: bytes
 ```
 
-## 22.5 DDoS entropy shift
+Packet-size quantiles:
 
 ```yaml
-name: ddos_entropy_shift
+name: flow_size_quantiles
 window:
-  size: 30s
-  slide: 5s
-groupBy:
-  - dst.ip
+  size: 60s
+  slide: 10s
+measure:
+  type: quantile
+  field: bytes
+  q: 0.99
+```
+
+Source entropy:
+
+```yaml
+name: source_entropy
+window:
+  size: 60s
+  slide: 10s
 measure:
   type: entropy
   field: src.ip
-change:
-  baseline: 5m
 ```
 
----
+Future examples include namespace fan-out, service traffic matrices, DDoS
+entropy shifts, and adjacent-window change detection once Kubernetes metadata
+and change queries land.
 
-# 23. Benchmarking plan
+## Integrations
 
-## 23.1 Correctness benchmarks
+### OpenTelemetry
 
-Datasets:
+FlowSketch should primarily act as an OTLP producer:
+
+```text
+FlowSketch agent
+    -> OTLP metrics
+    -> OpenTelemetry Collector / Grafana Alloy / Datadog Collector
+    -> backend
+```
+
+Later, FlowSketch can become an OpenTelemetry Collector receiver:
+
+```yaml
+receivers:
+  flowsketch:
+    queries:
+      - /etc/flowsketch/queries/*.yaml
+    source:
+      ebpf:
+        interfaces: ["eth0"]
+
+service:
+  pipelines:
+    metrics:
+      receivers: [flowsketch]
+      exporters: [otlp, prometheusremotewrite]
+```
+
+### Grafana
+
+Grafana adoption should go through Prometheus and OTLP first.
+
+Grafana would want:
+
+- Alloy examples
+- official dashboards
+- Prometheus recording rules
+- Mimir-compatible metrics
+- Loki anomaly-event export later
+- Helm chart and Kubernetes dashboards
+
+Dashboards to ship:
+
+| Dashboard | Panels |
+| --------- | ------ |
+| Network Heavy Hitters | top source/destination pairs, bytes, packets, rank, error |
+| Scanner Detection | distinct destinations by source, threshold events |
+| Service Fan-Out | namespace and service fan-out over time |
+| DDoS Signals | entropy, source cardinality, heavy hitters |
+| Agent Health | CPU, drops, queue pressure, sketch memory |
+| Accuracy and Resource | memory, width/depth, export series count |
+
+### Datadog
+
+Datadog adoption should start with OTLP metrics or OpenMetrics scrape.
+
+Datadog would want:
+
+- stable metric names
+- bounded tag cardinality
+- dashboard JSON
+- monitor templates
+- OpenMetrics integration option
+- Cloud SIEM rule examples
+- Kubernetes and service ownership tags
+
+Metric names should look like:
+
+```text
+flowsketch.network.bytes.estimated
+flowsketch.network.distinct_destinations.estimated
+flowsketch.network.heavy_hitter.rank
+flowsketch.network.entropy.estimated
+flowsketch.agent.dropped_events
+flowsketch.agent.sketch_memory_bytes
+```
+
+Suggested tags:
+
+```text
+env
+service
+team
+cluster_name
+kube_namespace
+kube_service
+query_name
+algorithm
+window
+```
+
+Raw IP tags need strict caps or hashing.
+
+### Cilium And Hubble
+
+FlowSketch should complement Cilium/Hubble, not compete with it.
+
+A Hubble receiver would let Cilium clusters reuse existing flow visibility and
+add approximate high-cardinality summaries on top:
+
+```text
+Cilium/Hubble flow visibility
+    -> FlowSketch Hubble receiver
+    -> approximate high-cardinality summaries
+```
+
+### Cloud Providers
+
+The cloud-provider shape is one of:
+
+```text
+node/host agent
+VPC flow-log pre-aggregation
+managed Kubernetes telemetry add-on
+```
+
+The value is cheaper high-cardinality telemetry, privacy-preserving summaries,
+tenant-safe aggregation, and DDoS/security signals without exporting all raw
+flow records.
+
+## Benchmarks
+
+Correctness datasets:
 
 ```text
 synthetic uniform
@@ -1874,271 +979,401 @@ synthetic scanner
 synthetic DDoS
 CAIDA traces where legally available
 MAWI traces where legally available
-pcap fixtures
+small pcap fixtures
 ```
 
-Metrics:
+Correctness metrics:
 
-| Metric             | Meaning                |
-| ------------------ | ---------------------- |
-| ARE                | average relative error |
-| AAE                | average absolute error |
-| precision@k        | top-k correctness      |
-| recall@k           | missed heavy hitters   |
-| false positives    | scanner/DDoS signals   |
-| false negatives    | missed anomalies       |
-| update throughput  | events/sec/core        |
-| memory/query       | bytes                  |
-| export cardinality | time series emitted    |
-| dropped events     | collector pressure     |
+| Metric | Meaning |
+| ------ | ------- |
+| ARE | average relative error |
+| AAE | average absolute error |
+| precision@k | top-k correctness |
+| recall@k | missed heavy hitters |
+| false positives | incorrect scanner or DDoS signals |
+| false negatives | missed anomalies |
+| update throughput | events/sec/core |
+| memory/query | bytes |
+| export cardinality | emitted time series |
+| dropped events | collector pressure |
 
-## 23.2 Systems benchmarks
-
-Targets:
+Systems targets:
 
 ```text
 1 Gb/s: easy MVP
 10 Gb/s: credible v1
 25/40 Gb/s: serious infrastructure
-100 Gb/s: future/DPDK/P4/SmartNIC tier
+100 Gb/s: future high-performance collector tier
 ```
 
-Test matrix:
+Test modes:
 
-| Mode            | Target                        |
-| --------------- | ----------------------------- |
-| pcap replay     | correctness and repeatability |
-| AF_PACKET       | simple live baseline          |
-| eBPF tc         | production Linux path         |
-| XDP             | higher-performance Linux path |
-| Hubble receiver | Kubernetes/Cilium path        |
+| Mode | Target |
+| ---- | ------ |
+| pcap replay | correctness and repeatability |
+| AF_PACKET | simple live baseline |
+| eBPF tc | production Linux path |
+| XDP | higher-performance Linux path |
+| Hubble receiver | Kubernetes/Cilium path |
+| AF_XDP or DPDK | specialized 100G+ deployments |
 
-## 23.3 Public benchmark artifacts
+The current harness reports:
 
-Ship:
+- parsed events and packets read
+- average L3 packet size
+- observed timestamp rate from the trace
+- measured parser/runtime throughput
+- direct projected L3 Gb/s per core
+- target events/sec for 1/10/25/40/100 Gb/s
+- estimated cores needed for the selected target
+- runtime memory, estimate count, and late events
+
+See [`benchmarks/README.md`](benchmarks/README.md).
+
+## Roadmap
+
+### Phase 0: Scope Lock
+
+Define the charter, supported query primitives, supported algorithms, export
+paths, and non-goals.
+
+First-six-month non-goals:
 
 ```text
-benchmark harness
-synthetic trace generator
-ground-truth exact aggregator
-standard query suite
-results dashboard
-reproducible Docker environment
+No P4
+No DPDK
+No SmartNIC
+No inline packet modification
+No packet payload capture
+No custom database
+No full SIEM
+No full SQL parser
 ```
 
-Implemented v0 harness:
+### Phase 1: Core Algorithms
 
-```bash
-flowsketch bench --trace /data/caida-or-mawi.pcap \
-  --query examples/queries/top-talkers.yaml \
-  --profile all
-```
+Implemented substantially today.
 
-This reports measured parser/runtime throughput and projects the CPU cores
-needed for 1/10/25/40/100 Gb/s at the trace's observed average packet size.
-It also reports direct projected L3 Gb/s per core. It does not replace live
-NIC validation. See `benchmarks/README.md`.
-
-This is crucial for trust. Operators will not install this based on theory alone.
-
----
-
-# 24. What Datadog, Grafana, and others would need
-
-## 24.1 Datadog
-
-Datadog adoption path:
+Scope:
 
 ```text
-FlowSketch OTLP metrics
-    ↓
-Datadog OTel Collector / Agent integration
-    ↓
-Datadog dashboards + monitors + Cloud SIEM rules
+flowsketch-core
+flowsketch-algos
+Count-Min
+CountSketch
+HyperLogLog
+HLLMap
+SpaceSaving
+Misra-Gries
+KLL
+exact baseline
 ```
 
-Datadog would want:
-
-* stable metric names
-* bounded tag cardinality
-* Datadog dashboard JSON
-* monitor templates
-* OpenMetrics integration option
-* Cloud SIEM rule examples
-* Kubernetes tags
-* service ownership tags
-
-## 24.2 Grafana Labs
-
-Grafana adoption path:
+Acceptance criteria:
 
 ```text
-FlowSketch OTLP / Prometheus
-    ↓
-Grafana Alloy
-    ↓
-Mimir / Prometheus / Loki / Grafana dashboards
+>5M updates/sec/core in userspace synthetic benchmark
+stable serialization format
+merge compatibility checks
+documented error model for each algorithm
 ```
 
-Grafana Alloy already positions itself as a unified telemetry collector with OTel and Prometheus pipelines, which is exactly the compatibility layer FlowSketch should target.
+### Phase 2: Offline Replay
 
-Grafana would want:
+Implemented substantially today.
 
-* official dashboard bundle
-* Alloy example configs
-* Prometheus recording rules
-* Mimir-compatible metrics
-* Loki anomaly event export
-* Helm chart
-* Kubernetes dashboards
-
-## 24.3 Cilium / Isovalent / Cisco
-
-Adoption path:
+Scope:
 
 ```text
-Cilium/Hubble flow visibility
-    ↓
-FlowSketch Hubble receiver
-    ↓
-approximate high-cardinality summaries
+flowsketch-pcap
+flowsketch-cli
+basic query YAML
+Prometheus text output
+synthesized pcap traces
 ```
 
-They would care if FlowSketch becomes:
-
-* a Hubble extension
-* a Cilium-compatible summarization backend
-* an approximate query layer over flows
-* a way to reduce flow export volume
-
-## 24.4 Cloud providers
-
-Adoption path:
+Acceptance criteria:
 
 ```text
-node/host agent
-or
-VPC flow-log pre-aggregation
-or
-managed Kubernetes telemetry add-on
+reads pcap
+extracts IPv4/IPv6/TCP/UDP
+runs useful queries
+exports Prometheus text
+has reproducible benchmark suite
 ```
 
-They would care about:
+### Phase 3: Userspace Live Agent
 
-* reducing telemetry volume
-* cheaper high-cardinality queries
-* tenant-safe aggregation
-* privacy-preserving summaries
-* DDoS/security signals
+Implemented as a baseline.
 
----
-
-# 25. Engineering effort estimate
-
-## 25.1 Solo founder / small OSS start
-
-| Milestone                         | Time estimate |                               People |
-| --------------------------------- | ------------: | -----------------------------------: |
-| Core sketches + replay CLI        |    1–2 months |            1 strong systems engineer |
-| Live userspace agent + Prometheus |    2–3 months |                                  1–2 |
-| OTLP export + basic dashboards    |       1 month |                                    1 |
-| Kubernetes DaemonSet + metadata   |    2–3 months |                                  1–2 |
-| eBPF collector                    |    3–6 months |              1 eBPF-capable engineer |
-| Distributed gateway               |    2–4 months |                                  1–2 |
-| Planner v1                        |    3–6 months | 1 strong algorithms/systems engineer |
-
-A credible public MVP is probably **4–6 months** for a very strong small team.
-
-A production-trustworthy v1 is more like **12–18 months**.
-
-Apache-scale maturity is **multi-year**.
-
-## 25.2 Difficulty by subsystem
-
-| Subsystem                      | Difficulty |
-| ------------------------------ | ---------: |
-| Basic sketch algorithms        |       4/10 |
-| Correct merge/window semantics |       7/10 |
-| Query planner                  |       8/10 |
-| Prometheus export              |       3/10 |
-| OTLP export                    |       5/10 |
-| Kubernetes metadata            |       6/10 |
-| eBPF collector                 |       8/10 |
-| High-throughput reliability    |       8/10 |
-| Distributed merge              |       7/10 |
-| Enterprise trust/security      |       9/10 |
-
----
-
-# 26. The minimum credible v0
-
-The first release should include exactly this:
+Scope:
 
 ```text
-1. Rust sketch runtime
-2. pcap replay
-3. live Linux userspace capture
-4. Count-Min, CountSketch, HLL, SpaceSaving
-5. YAML query config
-6. top talkers
-7. distinct destinations per source
-8. service/namespace fan-out if Kubernetes metadata available
-9. Prometheus /metrics
-10. OTLP metrics exporter
-11. flowsketch explain
-12. benchmarks against exact ground truth
+flowsketch-agent
+pcap source
+Linux AF_PACKET source
+HTTP /metrics
+HTTP /healthz and /readyz
+/v1/queries
+bounded HTTP handling
 ```
 
-Do **not** wait for eBPF to release the first version.
-
-The first proof is:
-
-> “Given real or replayed traffic, FlowSketch answers useful high-cardinality questions with bounded memory and exports them into existing observability systems.”
-
----
-
-# 27. What makes it Apache-scale
-
-The Apache-scale version has to be more than an agent.
-
-It needs:
-
-| Layer             | Apache-scale surface                                           |
-| ----------------- | -------------------------------------------------------------- |
-| Algorithm runtime | Many sketch implementations, stable traits, serialization      |
-| Query planner     | Vendor-neutral approximate telemetry compiler                  |
-| Backends          | pcap, AF_PACKET, eBPF, Hubble, NetFlow/IPFIX, AF_XDP, DPDK, P4 |
-| Integrations      | OTel, Prometheus, Grafana, Datadog, Kafka, ClickHouse          |
-| Kubernetes        | CRDs, operator, Helm, dashboards                               |
-| Governance        | pluggable algorithms, pluggable exporters, conformance suite   |
-| Benchmarks        | public, reproducible, vendor-neutral                           |
-| Spec              | sketch query language + binary sketch snapshot format          |
-
-The most defensible Apache identity is:
-
-> **FlowSketch: the open standard runtime for approximate network telemetry.**
-
----
-
-# 28. Why this is genuinely related to Jelani Nelson’s world
-
-Jelani Nelson’s Berkeley page lists his role in the Berkeley theory group and teaching/notes on sketching and streaming algorithms, including “Sketching Algorithms” and “Sketching Algorithms for Big Data.”
-
-FlowSketch is downstream of that theoretical lineage:
+Still needed:
 
 ```text
-streaming/sketching theory
-    ↓
-Count-Min / CountSketch / HLL / heavy hitters / dimensionality reduction
-    ↓
-network telemetry algorithms
-    ↓
-FlowSketch production runtime
+config reload
+better lifecycle controls
+capture drop counters
+more live Linux soak tests
 ```
 
-But the implementation project is **systems engineering**, not pure theory.
+### Phase 4: OTLP Export
 
-The project’s hard parts are:
+Implemented as OTLP/HTTP+JSON metrics export.
+
+Still needed:
+
+```text
+more semantic convention coverage
+larger collector compatibility matrix
+anomaly event/log export
+TLS/auth story through sidecar, mesh, or collector
+```
+
+### Phase 5: Kubernetes-Native MVP
+
+Partially implemented through raw manifests.
+
+Implemented:
+
+```text
+Namespace
+RBAC
+ConfigMaps
+agent DaemonSet
+gateway Deployment and Service
+PodDisruptionBudget
+optional NetworkPolicy template
+```
+
+Still needed:
+
+```text
+Helm chart
+ServiceMonitor / PodMonitor
+SketchQuery CRD
+operator
+Kubernetes metadata enrichment
+Grafana dashboards
+PrometheusRule templates
+```
+
+### Phase 6: eBPF Collector
+
+Prepared but not implemented.
+
+Current status:
+
+```text
+flowsketch-ebpf contract crate exists
+docs/ebpf-roadmap.md exists
+userspace FlowEvent conversion is tested
+```
+
+Target design:
+
+```text
+eBPF:
+  parse L2/L3/L4
+  apply cheap filters
+  emit compact FlowEvent
+
+userspace:
+  enrich
+  sketch
+  window
+  export
+```
+
+Acceptance criteria:
+
+```text
+loads on supported kernels
+fails closed if verifier rejects the program
+does not alter packets
+overhead benchmarked
+supports tc ingress
+supports IPv4/IPv6/TCP/UDP
+exposes ring-buffer drop counters
+```
+
+### Phase 7: Cluster Gateway
+
+Implemented as an HTTP snapshot gateway.
+
+Still needed:
+
+```text
+gateway HA and sharding
+larger merge benchmarks
+gRPC transport
+backpressure and admission controls
+persistent or replicated state story
+```
+
+### Phase 8: Query Planner v1
+
+Partially implemented.
+
+Implemented:
+
+```text
+logical IR
+physical IR
+memory estimation
+error contracts
+query explain
+query rejection for unsafe shapes
+```
+
+Still needed:
+
+```text
+more query primitives
+more adaptive plan choices
+cost model tied to benchmark data
+Kubernetes-aware planning
+```
+
+### Phase 9: Advanced Integrations
+
+Future:
+
+| Integration | Why |
+| ----------- | --- |
+| Cilium/Hubble receiver | avoid duplicate packet capture in Cilium clusters |
+| OpenTelemetry Collector receiver | embed into collector distributions |
+| Grafana Alloy component | first-class Grafana path |
+| Datadog Agent/OpenMetrics integration | first-class Datadog path |
+| ClickHouse sink | large event analytics |
+| Kafka sink | security and event pipelines |
+| Terraform/Helm modules | enterprise adoption |
+| PrometheusRule templates | alerting out of the box |
+
+### Phase 10: Advanced Backends
+
+Later:
+
+| Backend | Why later |
+| ------- | --------- |
+| AF_XDP | more performance, more operational complexity |
+| DPDK | invasive for normal users |
+| P4 | good research story, not an MVP |
+| SmartNIC/DPU | requires vendor-specific work |
+| WASM plugins | useful, but adds security and reliability risk |
+
+## Production Readiness
+
+FlowSketch is close to a serious v0, not close to a fully production-hardened
+100 Gb/s system.
+
+What is solid:
+
+- tested sketch algorithms
+- deterministic pcap replay
+- query parsing and explain output
+- Prometheus and OTLP export paths
+- bounded HTTP handling in agent/gateway paths
+- snapshot format and merge compatibility checks
+- cross-platform developer CI
+- Docker/systemd/Kubernetes starting points
+
+What is missing before a production v1:
+
+- live Linux capture validation under real traffic
+- drop counters and loss accounting
+- eBPF tc/XDP collector
+- parallel ingestion and sharded runtime execution
+- gateway HA/sharding or clear single-writer semantics
+- TLS/auth/deployment guidance for non-local HTTP endpoints
+- Kubernetes metadata, Helm, CRD, and operator
+- real trace benchmark suite using legally available traces
+- live 10/25/40/100 Gb/s validation on actual NICs
+- dashboards, alerts, and runbooks
+
+See [`docs/production-readiness.md`](docs/production-readiness.md).
+
+## Highest-Value Improvements
+
+If the next work is about making FlowSketch more real, prioritize this order:
+
+1. Build the eBPF tc ingress collector and expose ring-buffer drop counters.
+2. Add parallel runtime sharding so RSS queues can map cleanly to sketch shards.
+3. Benchmark AF_PACKET, eBPF tc, and XDP on Linux with real CAIDA/MAWI-style traces and hardware replay where available.
+4. Add Kubernetes metadata enrichment for node, namespace, pod, service, and workload dimensions.
+5. Turn the manifests into a Helm chart and add ServiceMonitor, PodMonitor, and PrometheusRule templates.
+6. Add gateway HA strategy: sharding, leader election, replicated state, or explicit single-gateway semantics.
+7. Add auth/TLS guidance through mesh, reverse proxy, or collector-side deployment patterns.
+8. Publish Grafana dashboards and Datadog/OpenMetrics examples.
+9. Add a conformance suite for sketch snapshots and query-planner behavior.
+10. Keep tightening benchmark documentation so claims are tied to commands and datasets.
+
+## Engineering Effort
+
+Rough estimates for a strong small team:
+
+| Milestone | Estimate |
+| --------- | -------- |
+| Core sketches and replay CLI | 1-2 months |
+| Live userspace agent and Prometheus | 2-3 months |
+| OTLP export and basic dashboards | 1 month |
+| Kubernetes DaemonSet and metadata | 2-3 months |
+| eBPF collector | 3-6 months |
+| Distributed gateway | 2-4 months |
+| Planner v1 | 3-6 months |
+
+A credible public MVP is realistic in 4-6 months for a strong small team.
+A production-trustworthy v1 is more like 12-18 months.
+Apache-scale maturity is a multi-year project.
+
+Difficulty by subsystem:
+
+| Subsystem | Difficulty |
+| --------- | ---------- |
+| Basic sketch algorithms | 4/10 |
+| Correct merge and window semantics | 7/10 |
+| Query planner | 8/10 |
+| Prometheus export | 3/10 |
+| OTLP export | 5/10 |
+| Kubernetes metadata | 6/10 |
+| eBPF collector | 8/10 |
+| High-throughput reliability | 8/10 |
+| Distributed merge | 7/10 |
+| Enterprise trust and security | 9/10 |
+
+## Risks
+
+| Risk | Mitigation |
+| ---- | ---------- |
+| It becomes just another sketch crate | Lead with agent, planner, and standard exports |
+| Prometheus cardinality explosion | Hard caps, top-k defaults, hashed or prefix IP labels, query rejection |
+| eBPF complexity dominates the project | Keep pcap and AF_PACKET useful; keep kernel logic minimal |
+| Existing vendors absorb the idea | Stay neutral, portable, and backend-agnostic |
+| Approximate results are not trusted | Expose error contracts, exact-vs-approx benchmarks, and explain plans |
+| 100 Gb/s claims outrun reality | Tie every performance claim to benchmark commands and hardware context |
+
+## Why This Could Matter
+
+FlowSketch sits downstream of the streaming and sketching research lineage:
+
+```text
+streaming algorithms
+    -> Count-Min, CountSketch, HLL, heavy hitters, quantiles
+    -> network telemetry sketches
+    -> production runtime, planner, collector, and exporters
+```
+
+The hard part is not only the math. The hard part is systems engineering:
 
 ```text
 packet collection
@@ -2153,118 +1388,55 @@ observability integration
 operator trust
 ```
 
-So the right mental model is:
+That is the gap FlowSketch is trying to fill: the production systems layer
+that makes sketching useful to SRE, network, security, and observability teams.
 
-> Jelani Nelson-style research gives the mathematical foundation. FlowSketch would be the production systems layer that makes that family of ideas usable by SRE, network, security, and observability teams.
+## Build Order
 
----
-
-# 29. Biggest risks
-
-## Risk 1: It becomes just another sketch crate
-
-Mitigation:
+The practical order remains:
 
 ```text
-Lead with agent + query planner + OTel/Prometheus export.
-Keep raw algorithm APIs secondary.
+1. flowsketch-core
+2. flowsketch-algos
+3. flowsketch-pcap
+4. flowsketch-cli
+5. flowsketch-prometheus
+6. flowsketch-agent
+7. flowsketch-otel
+8. flowsketch-gateway
+9. Kubernetes metadata and Helm
+10. eBPF tc/XDP collector
+11. planner v1 expansion
+12. Hubble, Datadog, Grafana, ClickHouse, Kafka
+13. AF_XDP, DPDK, P4, SmartNIC
 ```
 
-## Risk 2: Prometheus cardinality explosion
+The project has already moved through the early runtime and agent pieces. The
+next major threshold is credible Linux production ingestion.
 
-Mitigation:
+## Documentation
 
-```text
-Hard export caps.
-Hash/prefix IP labels.
-Default top-k only.
-Reject unsafe queries.
-```
+- [`docs/operator-guide.md`](docs/operator-guide.md)
+- [`docs/query-language.md`](docs/query-language.md)
+- [`docs/accuracy-contracts.md`](docs/accuracy-contracts.md)
+- [`docs/algorithm-notes.md`](docs/algorithm-notes.md)
+- [`docs/security.md`](docs/security.md)
+- [`docs/production-readiness.md`](docs/production-readiness.md)
+- [`docs/ebpf-roadmap.md`](docs/ebpf-roadmap.md)
+- [`benchmarks/README.md`](benchmarks/README.md)
+- [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md)
 
-## Risk 3: eBPF complexity eats the project
+## Final Position
 
-Mitigation:
+The weak version of this project is "we implemented sketches."
 
-```text
-Start with pcap + userspace live capture.
-Make eBPF a collector backend, not the whole system.
-```
+The strong version is:
 
-## Risk 4: Cilium/Datadog/Kentik absorbs the idea
+> FlowSketch is the runtime that compiles network observability intent into
+> bounded-memory sketch execution, then exports the results through normal
+> Prometheus and OpenTelemetry pipelines.
 
-Mitigation:
-
-```text
-Be neutral, portable, and backend-agnostic.
-Integrate with them instead of competing head-on.
-Own the query language, planner, sketch runtime, and conformance suite.
-```
-
-## Risk 5: Approximate results are not trusted
-
-Mitigation:
-
-```text
-Expose error contracts.
-Expose algorithm metadata.
-Ship exact-vs-approx benchmarks.
-Provide explain plans.
-Show resource savings.
-```
-
----
-
-# 30. My concrete build order
-
-## Build this first
-
-```text
-flowsketch-core
-flowsketch-algos
-flowsketch-pcap
-flowsketch-cli
-flowsketch-prometheus
-```
-
-Then:
-
-```text
-flowsketch-agent
-flowsketch-otel
-flowsketch-k8s
-```
-
-Then:
-
-```text
-flowsketch-ebpf
-flowsketch-gateway
-flowsketch-planner
-```
-
-Only then:
-
-```text
-Hubble receiver
-Datadog integration
-Grafana Alloy integration
-ClickHouse/Kafka
-AF_XDP
-P4/SmartNIC
-```
-
----
-
-# 31. Final verdict
-
-This is hard, but it is a coherent project.
-
-The defensible version is not:
-
-> “We implemented sketches.”
-
-It is:
-
-> “We built the missing production runtime that compiles network observability intent into bounded-memory sketch execution and exports the results through OpenTelemetry and Prometheus.”
-
-That has a realistic path to production use, a real research lineage, a clear OSS gap, and enough surface area to plausibly become Apache-scale.
+That is coherent, technically defensible, and useful. It is also still early.
+The core is promising; production credibility now depends on Linux ingest,
+drop accounting, Kubernetes integration, and public benchmarks that make the
+performance claims reproducible.
