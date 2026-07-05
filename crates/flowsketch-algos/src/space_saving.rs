@@ -126,6 +126,7 @@ impl SpaceSaving {
             {
                 return Some(candidate.key);
             }
+            self.rebuild_heap();
         }
     }
 
@@ -134,8 +135,6 @@ impl SpaceSaving {
         self.updates += 1;
         if let Some(e) = self.entries.get_mut(key) {
             e.count += weight;
-            let count = e.count;
-            self.push_heap_entry(key, count);
             return;
         }
         if self.entries.len() < self.capacity {

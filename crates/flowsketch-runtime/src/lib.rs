@@ -525,6 +525,25 @@ impl RunningQuery {
         }
         self.advance_to(event.ts_nanos)?;
         let bucket_start = self.bucket_start_for(event.ts_nanos);
+        let bucket_index = if self
+            .buckets
+            .back()
+            .is_some_and(|b| b.start_nanos == bucket_start)
+        {
+            self.buckets.len() - 1
+        } else {
+            let Some(index) = self
+                .buckets
+                .iter()
+                .position(|b| b.start_nanos == bucket_start)
+            else {
+                // Late event older than the earliest open bucket.
+                self.late_events += 1;
+                return Ok(());
+            };
+            index
+        };
+
         group_key_into(&self.group_fields, event, &mut self.key_buf);
         let weight = match self.value_field {
             Some(f) => f.extract_value(event),
@@ -535,16 +554,10 @@ impl RunningQuery {
             field_value_into(f, event, &mut self.distinct_buf);
         }
 
-        let Some(bucket) = self
+        let bucket = self
             .buckets
-            .iter_mut()
-            .find(|b| b.start_nanos == bucket_start)
-        else {
-            // Late event older than the earliest open bucket.
-            self.late_events += 1;
-            return Ok(());
-        };
-
+            .get_mut(bucket_index)
+            .expect("bucket index was just resolved");
         bucket
             .state
             .update(&self.key_buf, weight, &self.distinct_buf);

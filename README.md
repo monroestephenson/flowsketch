@@ -92,9 +92,9 @@ Measured on a local Mac release build:
 | ---- | ------ |
 | Count-Min hot loop | 19.53M updates/s/core |
 | Projected L3 capacity for 1250-byte packets | 195.31 Gb/s/core |
-| pcap parse + runtime + one query | 1.56M events/s/core |
-| Projected L3 capacity on the generated trace | 7.90 Gb/s/core |
-| Projected cores for 100 Gb/s on that trace shape | 12.65 cores |
+| pcap parse + runtime + one query | 1.54M events/s/core |
+| Projected L3 capacity on the generated trace | 7.77 Gb/s/core |
+| Projected cores for 100 Gb/s on that trace shape | 12.87 cores |
 
 Interpretation:
 

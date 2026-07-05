@@ -56,24 +56,24 @@ Result:
 
 - parsed packets/events: 2000000
 - average L3 packet size: 632.4 bytes
-- throughput: 1.56M events/s/core
-- projected L3 capacity at 632.4-byte packets: 7.90 Gb/s/core
+- throughput: 1.54M events/s/core
+- projected L3 capacity at 632.4-byte packets: 7.77 Gb/s/core
 - 100 Gb/s target at 632.4-byte packets: 19.76M events/s
-- projected cores for 100 Gb/s: 12.65
+- projected cores for 100 Gb/s: 12.87
 - runtime estimates: 1300
-- sketch memory: 2.9 MiB
+- sketch memory: 752.2 KiB
 - late events: 0
 
 10 Gb/s projection:
 
 - target at 632.4-byte packets: 1.98M events/s
-- projected cores for 10 Gb/s: 1.27
+- projected cores for 10 Gb/s: 1.29
 - M3 projection gate: `--profile 10g --core-budget 2`
 
 100 Gb/s projection:
 
 - target at 632.4-byte packets: 19.76M events/s
-- projected cores for 100 Gb/s: 12.65
+- projected cores for 100 Gb/s: 12.87
 - projection gate: `--profile 100g --core-budget 14`
 
 Interpretation: current pcap parsing plus runtime query execution needs
@@ -95,10 +95,10 @@ target/release/flowsketch bench \
 
 Result:
 
-- parse preload: 9.78M events/s/core
-- 16-shard runtime aggregate: 6.20M events/s
-- projected aggregate L3 capacity: 31.39 Gb/s across 16 shards
-- projected cores for 100 Gb/s from per-core shard rate: 50.97
+- parse preload: 8.26M events/s/core
+- 16-shard runtime aggregate: 7.14M events/s
+- projected aggregate L3 capacity: 36.12 Gb/s across 16 shards
+- projected cores for 100 Gb/s from per-core shard rate: 44.30
 
 Interpretation: runtime sharding now works as a benchmark mode, but this
 naive userspace split is not the production 100 Gb/s answer yet. The next
@@ -112,7 +112,7 @@ Packet size controls how hard 100 Gb/s is:
 | Packet shape | Approximate packet rate for 100 Gb/s | Current pcap/runtime core projection |
 | ------------ | ------------------------------------ | ------------------------------------ |
 | 1250-byte L3 packets | 10.00M packets/s | depends on the trace/query path |
-| 632.4-byte generated trace average | 19.76M packets/s | about 7.3% of target per core |
+| 632.4-byte generated trace average | 19.76M packets/s | about 7.8% of target per core |
 | minimum Ethernet frames on wire | about 148.8M packets/s | below 1% of target per core |
 
 The current hot loop is good. The current end-to-end ingest/runtime path is
