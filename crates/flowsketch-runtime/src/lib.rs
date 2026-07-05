@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, KllSketch, SpaceSaving};
-use flowsketch_core::field::group_key;
+use flowsketch_core::field::{field_value_into, group_key_into};
 use flowsketch_core::hash::HashSpec;
 use flowsketch_core::snapshot::read_snapshot;
 use flowsketch_core::{FlowEvent, Sketch, SketchError, SketchEstimate};
@@ -428,6 +428,9 @@ struct RunningQuery {
     emitted: Vec<SketchEstimate>,
     /// Events dropped because they arrived before the earliest open bucket.
     late_events: u64,
+    /// Reused hot-path buffers for encoded keys.
+    key_buf: Vec<u8>,
+    distinct_buf: Vec<u8>,
 }
 
 impl RunningQuery {
@@ -450,6 +453,8 @@ impl RunningQuery {
             buckets: VecDeque::new(),
             emitted: Vec::new(),
             late_events: 0,
+            key_buf: Vec::with_capacity(64),
+            distinct_buf: Vec::with_capacity(32),
             plan,
         })
     }
@@ -520,6 +525,16 @@ impl RunningQuery {
         }
         self.advance_to(event.ts_nanos)?;
         let bucket_start = self.bucket_start_for(event.ts_nanos);
+        group_key_into(&self.group_fields, event, &mut self.key_buf);
+        let weight = match self.value_field {
+            Some(f) => f.extract_value(event),
+            None => 1,
+        };
+        self.distinct_buf.clear();
+        if let Some(f) = self.distinct_field {
+            field_value_into(f, event, &mut self.distinct_buf);
+        }
+
         let Some(bucket) = self
             .buckets
             .iter_mut()
@@ -530,16 +545,9 @@ impl RunningQuery {
             return Ok(());
         };
 
-        let key = group_key(&self.group_fields, event);
-        let weight = match self.value_field {
-            Some(f) => f.extract_value(event),
-            None => 1,
-        };
-        let distinct_item = self
-            .distinct_field
-            .map(|f| f.extract(event).into_bytes())
-            .unwrap_or_default();
-        bucket.state.update(&key, weight, &distinct_item);
+        bucket
+            .state
+            .update(&self.key_buf, weight, &self.distinct_buf);
         Ok(())
     }
 

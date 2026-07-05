@@ -48,12 +48,28 @@ target/release/flowsketch bench \
   --trace /data/caida-or-mawi.pcap \
   --query examples/queries/top-talkers.yaml \
   --profile 10g \
-  --core-budget 5
+  --core-budget 2
 ```
 
 This is the current M3 milestone gate: **10 Gb/s projected mixed-traffic
-capacity within a five-core CPU budget**. It is not the M4 milestone, which requires
+capacity within a two-core CPU budget**. It is not the M4 milestone, which requires
 live Linux capture validation with explicit packet-drop accounting.
+
+## Sharded runtime benchmark
+
+Use `--runtime-shards` to preload parsed trace events and process the runtime
+updates across multiple independent query engines:
+
+```bash
+target/release/flowsketch bench \
+  --trace /data/caida-or-mawi.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile 100g \
+  --runtime-shards 8
+```
+
+This measures runtime sharding after parsing. It is useful for estimating how
+the query engine scales, but it is not an end-to-end live capture result.
 
 ## CI-safe benchmark tests
 

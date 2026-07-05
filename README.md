@@ -92,15 +92,17 @@ Measured on a local Mac release build:
 | ---- | ------ |
 | Count-Min hot loop | 19.53M updates/s/core |
 | Projected L3 capacity for 1250-byte packets | 195.31 Gb/s/core |
-| pcap parse + runtime + one query | 0.51M events/s/core |
-| Projected L3 capacity on the generated trace | 2.56 Gb/s/core |
-| Projected cores for 100 Gb/s on that trace shape | 39.07 cores |
+| pcap parse + runtime + one query | 1.56M events/s/core |
+| Projected L3 capacity on the generated trace | 7.90 Gb/s/core |
+| Projected cores for 100 Gb/s on that trace shape | 12.65 cores |
 
 Interpretation:
 
 - The sketch update loop is fast enough that it is not the current 100 Gb/s
   blocker for large packets.
-- The end-to-end userspace pcap/runtime path is the bottleneck.
+- The end-to-end userspace pcap/runtime path is still the bottleneck, but the
+  current top-talkers path is materially faster after SpaceSaving hot-path
+  optimization.
 - Real 100 Gb/s networking is packet-rate dominated. At roughly 632-byte L3
   packets, 100 Gb/s is about 19.8M packets/s. At minimum Ethernet frame size,
   line rate is roughly 148.8M packets/s on the wire.
@@ -146,7 +148,7 @@ target/release/flowsketch bench \
   --trace /tmp/flowsketch-bench.pcap \
   --query examples/queries/top-talkers.yaml \
   --profile 10g \
-  --core-budget 5
+  --core-budget 2
 ```
 
 This is a projection gate for the measured trace path. It is useful for CI and
@@ -1082,7 +1084,7 @@ claims.
 | M0: credible v0 | useful offline approximate telemetry | substantially done | pcap replay, synthetic traces, YAML queries, explain output, Prometheus output, exact-vs-approx tests |
 | M1: local agent | live userspace telemetry on Linux | baseline done | AF_PACKET source, HTTP health/readiness, `/metrics`, bounded memory, safe startup/shutdown |
 | M2: distributed v0 | node-local agents plus cluster merge | baseline done | snapshot push, compatibility validation, gateway `/metrics`, node inventory |
-| M3: 10 Gb/s projected path | 10 Gb/s mixed-packet projection within a CPU budget | in progress | `flowsketch bench --trace ... --profile 10g --core-budget 5` passes on representative traces |
+| M3: 10 Gb/s projected path | 10 Gb/s mixed-packet projection within a CPU budget | in progress | `flowsketch bench --trace ... --profile 10g --core-budget 2` passes on representative traces |
 | M4: 10 Gb/s live Linux | real 10 Gb/s capture without silent loss | live smoke only | AF_PACKET/eBPF live replay, drop counters, CPU profile, accuracy checked against exact replay |
 | M5: Kubernetes v1 | normal platform-team deployment | partial | Helm, ServiceMonitor/PodMonitor, PrometheusRule, metadata enrichment, resource defaults |
 | M6: eBPF collector | production Linux ingest path | prepared | tc ingress program, ring-buffer drop counters, verifier-safe parser, userspace fallback |

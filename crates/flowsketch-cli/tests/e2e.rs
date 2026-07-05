@@ -241,6 +241,21 @@ fn bench_trace_profile_runs_on_generated_pcap() {
     assert!(text.contains("readiness: profile=10 Gb/s"), "{text}");
     assert!(text.contains("status=pass"), "{text}");
     assert!(text.contains("runtime: estimates="), "{text}");
+
+    let out = run_ok(
+        flowsketch()
+            .arg("bench")
+            .args(["--trace", pcap.to_str().unwrap()])
+            .arg("--query")
+            .arg(example("top-talkers.yaml"))
+            .args(["--profile", "10g"])
+            .args(["--runtime-shards", "2"])
+            .args(["--core-budget", "1000"]),
+    );
+    let text = stdout(&out);
+    assert!(text.contains("preload:"), "{text}");
+    assert!(text.contains("sharded_runtime: shards=2"), "{text}");
+    assert!(text.contains("aggregate_l3_capacity="), "{text}");
 }
 
 #[test]

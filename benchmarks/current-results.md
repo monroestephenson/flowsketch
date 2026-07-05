@@ -35,8 +35,8 @@ Trace command:
 
 ```bash
 target/release/flowsketch synth \
-  --out /tmp/flowsketch-bench.pcap \
-  --packets 200000 \
+  --out /tmp/flowsketch-bench-2m.pcap \
+  --packets 2000000 \
   --scanners 2 \
   --heavy-talkers 3 \
   --duration-secs 120 \
@@ -47,32 +47,63 @@ Benchmark command:
 
 ```bash
 target/release/flowsketch bench \
-  --trace /tmp/flowsketch-bench.pcap \
+  --trace /tmp/flowsketch-bench-2m.pcap \
   --query examples/queries/top-talkers.yaml \
   --profile all
 ```
 
 Result:
 
-- parsed packets/events: 200000
-- average L3 packet size: 631.8 bytes
-- throughput: 0.49M events/s/core
-- projected L3 capacity at 631.8-byte packets: 2.45 Gb/s/core
-- 100 Gb/s target at 631.8-byte packets: 19.78M events/s
-- projected cores for 100 Gb/s: 40.77
+- parsed packets/events: 2000000
+- average L3 packet size: 632.4 bytes
+- throughput: 1.56M events/s/core
+- projected L3 capacity at 632.4-byte packets: 7.90 Gb/s/core
+- 100 Gb/s target at 632.4-byte packets: 19.76M events/s
+- projected cores for 100 Gb/s: 12.65
 - runtime estimates: 1300
-- sketch memory: 336.9 KiB
+- sketch memory: 2.9 MiB
 - late events: 0
 
 10 Gb/s projection:
 
-- target at 631.8-byte packets: 1.98M events/s
-- projected cores for 10 Gb/s: 4.08
-- M3 projection gate: `--profile 10g --core-budget 5`
+- target at 632.4-byte packets: 1.98M events/s
+- projected cores for 10 Gb/s: 1.27
+- M3 projection gate: `--profile 10g --core-budget 2`
+
+100 Gb/s projection:
+
+- target at 632.4-byte packets: 19.76M events/s
+- projected cores for 100 Gb/s: 12.65
+- projection gate: `--profile 100g --core-budget 14`
 
 Interpretation: current pcap parsing plus runtime query execution needs
 parallel capture/sharding, eBPF or XDP ingestion, and drop accounting before a
 credible 100 Gb/s live claim.
+
+## Sharded runtime projection
+
+The sharded runtime mode preloads parsed events, then processes them across
+independent userspace query engines:
+
+```bash
+target/release/flowsketch bench \
+  --trace /tmp/flowsketch-bench-2m.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile 100g \
+  --runtime-shards 16
+```
+
+Result:
+
+- parse preload: 9.78M events/s/core
+- 16-shard runtime aggregate: 6.20M events/s
+- projected aggregate L3 capacity: 31.39 Gb/s across 16 shards
+- projected cores for 100 Gb/s from per-core shard rate: 50.97
+
+Interpretation: runtime sharding now works as a benchmark mode, but this
+naive userspace split is not the production 100 Gb/s answer yet. The next
+sharding step needs RSS/RX-queue affinity, fewer duplicated window flushes,
+and live ingress paths instead of preloaded pcap events.
 
 ## Real-world comparison
 
@@ -80,8 +111,8 @@ Packet size controls how hard 100 Gb/s is:
 
 | Packet shape | Approximate packet rate for 100 Gb/s | Current pcap/runtime core projection |
 | ------------ | ------------------------------------ | ------------------------------------ |
-| 1250-byte L3 packets | 10.00M packets/s | about 5.1% of target per core |
-| 631.8-byte generated trace average | 19.78M packets/s | about 2.6% of target per core |
+| 1250-byte L3 packets | 10.00M packets/s | depends on the trace/query path |
+| 632.4-byte generated trace average | 19.76M packets/s | about 7.3% of target per core |
 | minimum Ethernet frames on wire | about 148.8M packets/s | below 1% of target per core |
 
 The current hot loop is good. The current end-to-end ingest/runtime path is

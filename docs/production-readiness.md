@@ -48,11 +48,11 @@ a CPU budget:
 flowsketch bench --trace /data/caida-or-mawi.pcap \
   --query examples/queries/top-talkers.yaml \
   --profile 10g \
-  --core-budget 5
+  --core-budget 2
 ```
 
 Passing this gate means the measured trace path projects to 10 Gb/s within
-five cores on that machine and packet-size distribution. It is not a live NIC
+two cores on that machine and packet-size distribution. It is not a live NIC
 claim until validated with packet-drop counters on Linux.
 
 ## Kubernetes

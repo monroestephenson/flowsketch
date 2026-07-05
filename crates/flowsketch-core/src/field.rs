@@ -2,6 +2,7 @@
 //! names (`src.ip`, `dst.port`, `protocol`, ...).
 
 use std::fmt;
+use std::io::Write as _;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -137,13 +138,45 @@ pub const GROUP_KEY_SEP: u8 = 0x1F; // ASCII unit separator
 /// Encode the group-by key of `fields` for `event` into stable bytes.
 pub fn group_key(fields: &[Field], event: &FlowEvent) -> Vec<u8> {
     let mut out = Vec::with_capacity(fields.len() * 16);
+    group_key_into(fields, event, &mut out);
+    out
+}
+
+/// Encode the group-by key of `fields` into a caller-owned buffer.
+pub fn group_key_into(fields: &[Field], event: &FlowEvent, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(fields.len() * 16);
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             out.push(GROUP_KEY_SEP);
         }
-        out.extend_from_slice(f.extract(event).as_bytes());
+        field_value_into(*f, event, out);
     }
-    out
+}
+
+/// Encode one field's canonical display value into a caller-owned buffer.
+pub fn field_value_into(field: Field, event: &FlowEvent, out: &mut Vec<u8>) {
+    match field {
+        Field::SrcIp => write!(out, "{}", event.src_ip).expect("write to Vec cannot fail"),
+        Field::DstIp => write!(out, "{}", event.dst_ip).expect("write to Vec cannot fail"),
+        Field::SrcPort => write!(out, "{}", event.src_port).expect("write to Vec cannot fail"),
+        Field::DstPort => write!(out, "{}", event.dst_port).expect("write to Vec cannot fail"),
+        Field::Protocol => match event.protocol {
+            protocol::ICMP => out.extend_from_slice(b"icmp"),
+            protocol::TCP => out.extend_from_slice(b"tcp"),
+            protocol::UDP => out.extend_from_slice(b"udp"),
+            protocol::ICMPV6 => out.extend_from_slice(b"icmpv6"),
+            other => write!(out, "{other}").expect("write to Vec cannot fail"),
+        },
+        Field::TcpFlags => write!(out, "{}", event.tcp_flags).expect("write to Vec cannot fail"),
+        Field::Direction => out.extend_from_slice(event.direction.name().as_bytes()),
+        Field::Bytes => write!(out, "{}", event.bytes).expect("write to Vec cannot fail"),
+        Field::Packets => write!(out, "{}", event.packets).expect("write to Vec cannot fail"),
+        Field::InterfaceIndex => {
+            write!(out, "{}", event.interface_index).expect("write to Vec cannot fail")
+        }
+        Field::NodeId => write!(out, "{}", event.node_id).expect("write to Vec cannot fail"),
+    }
 }
 
 /// Decode a group key produced by `group_key` back into per-field values.

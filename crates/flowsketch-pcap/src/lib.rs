@@ -15,6 +15,8 @@ pub mod writer;
 pub use parse::parse_packet;
 pub use writer::PcapWriter;
 
+pub type BorrowedPacket<'a> = (u64, u32, &'a [u8]);
+
 #[derive(Debug, Error)]
 pub enum PcapError {
     #[error("io error: {0}")]
@@ -96,6 +98,22 @@ impl<R: Read> PcapReader<R> {
     /// Next raw packet as `(ts_nanos, original_len, captured_bytes)`, or
     /// `None` at end of file.
     pub fn next_packet(&mut self) -> Result<Option<(u64, u32, Vec<u8>)>, PcapError> {
+        let mut data = Vec::new();
+        let Some((ts_nanos, origlen, _)) = self.next_packet_into(&mut data)? else {
+            return Ok(None);
+        };
+        Ok(Some((ts_nanos, origlen, data)))
+    }
+
+    /// Next raw packet using a caller-owned scratch buffer.
+    ///
+    /// This avoids allocating a fresh packet buffer for every pcap record in
+    /// hot replay/benchmark loops while keeping `next_packet` available for
+    /// callers that want owned packet bytes.
+    pub fn next_packet_into<'a>(
+        &mut self,
+        data: &'a mut Vec<u8>,
+    ) -> Result<Option<BorrowedPacket<'a>>, PcapError> {
         let mut rec = [0u8; 16];
         match self.reader.read_exact(&mut rec) {
             Ok(()) => {}
@@ -110,23 +128,29 @@ impl<R: Read> PcapReader<R> {
         if caplen > 256 * 1024 {
             return Err(PcapError::Truncated);
         }
-        let mut data = vec![0u8; caplen];
+        data.resize(caplen, 0);
         self.reader
-            .read_exact(&mut data)
+            .read_exact(data)
             .map_err(|_| PcapError::Truncated)?;
         self.packets_read += 1;
         let ts_nanos = ts_sec * 1_000_000_000 + ts_subsec * self.subsec_to_nanos;
-        Ok(Some((ts_nanos, origlen, data)))
+        Ok(Some((ts_nanos, origlen, data.as_slice())))
     }
 
     /// Next parseable flow event, skipping packets that are not
     /// IPv4/IPv6 over a supported link type.
     pub fn next_event(&mut self) -> Result<Option<FlowEvent>, PcapError> {
+        let mut data = Vec::new();
+        self.next_event_into(&mut data)
+    }
+
+    /// Next parseable flow event using a caller-owned scratch buffer.
+    pub fn next_event_into(&mut self, data: &mut Vec<u8>) -> Result<Option<FlowEvent>, PcapError> {
         loop {
-            match self.next_packet()? {
+            match self.next_packet_into(data)? {
                 None => return Ok(None),
                 Some((ts_nanos, origlen, data)) => {
-                    if let Some(mut ev) = parse_packet(self.linktype, &data) {
+                    if let Some(mut ev) = parse_packet(self.linktype, data) {
                         ev.ts_nanos = ts_nanos;
                         // Bytes on the wire, not bytes captured.
                         if ev.bytes == 0 {

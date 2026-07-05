@@ -117,6 +117,9 @@ enum Command {
         /// Fail if selected line-rate profile projection needs more cores than this budget
         #[arg(long)]
         core_budget: Option<f64>,
+        /// Preload trace events and process runtime updates across N shards
+        #[arg(long, default_value_t = 1)]
+        runtime_shards: usize,
     },
     /// Generate a synthetic pcap trace (background traffic + heavy talkers + scanners)
     Synth {
@@ -253,6 +256,7 @@ fn main() -> Result<()> {
             queries,
             seed,
             core_budget,
+            runtime_shards,
         } => bench::run(bench::BenchConfig {
             algo,
             events,
@@ -264,6 +268,7 @@ fn main() -> Result<()> {
             queries,
             seed,
             core_budget,
+            runtime_shards,
         }),
         Command::Synth {
             out,

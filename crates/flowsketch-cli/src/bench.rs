@@ -13,6 +13,7 @@ use flowsketch_algos::{
     CountMinSketch, CountSketch, ExactCounter, HyperLogLog, MisraGries, SpaceSaving,
 };
 use flowsketch_core::hash::{HashSpec, SplitMixRng};
+use flowsketch_core::FlowEvent;
 use flowsketch_core::Sketch;
 use flowsketch_ir::parse_query_yaml;
 use flowsketch_pcap::PcapReader;
@@ -107,6 +108,8 @@ pub struct BenchConfig {
     pub seed: u64,
     /// Optional CPU-core budget for selected line-rate profile projections.
     pub core_budget: Option<f64>,
+    /// Process preloaded trace events across this many runtime shards.
+    pub runtime_shards: usize,
 }
 
 /// Zipf(s=1) sampler over `n` keys via inverse-CDF on a precomputed table.
@@ -256,6 +259,9 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
 }
 
 fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
+    if cfg.runtime_shards > 1 {
+        return run_trace_sharded_runtime(cfg, trace);
+    }
     let hash = HashSpec::new(cfg.seed);
     let plans = load_plans(&cfg.queries, cfg.seed)?;
     let mut engine = if plans.is_empty() {
@@ -274,7 +280,8 @@ fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
     let mut total_l3_bytes = 0u64;
     let mut first_ts = None;
     let mut last_ts = None;
-    while let Some(event) = reader.next_event()? {
+    let mut packet_buf = Vec::with_capacity(2048);
+    while let Some(event) = reader.next_event_into(&mut packet_buf)? {
         first_ts.get_or_insert(event.ts_nanos);
         last_ts = Some(event.ts_nanos);
         total_l3_bytes += event.bytes as u64;
@@ -330,6 +337,177 @@ fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
             engine.late_events()
         );
     }
+    Ok(())
+}
+
+struct LoadedTrace {
+    events: Vec<FlowEvent>,
+    packets_read: u64,
+    total_l3_bytes: u64,
+    avg_packet_bytes: f64,
+    trace_duration: f64,
+    trace_gbps: f64,
+    elapsed_secs: f64,
+}
+
+fn load_trace(trace: &PathBuf, fallback_avg_packet_bytes: u64) -> Result<LoadedTrace> {
+    let file =
+        File::open(trace).with_context(|| format!("cannot open trace {}", trace.display()))?;
+    let mut reader = PcapReader::new(BufReader::with_capacity(1024 * 1024, file))
+        .context("cannot read pcap header")?;
+
+    let started = Instant::now();
+    let mut events = Vec::new();
+    let mut total_l3_bytes = 0u64;
+    let mut first_ts = None;
+    let mut last_ts = None;
+    let mut packet_buf = Vec::with_capacity(2048);
+    while let Some(event) = reader.next_event_into(&mut packet_buf)? {
+        first_ts.get_or_insert(event.ts_nanos);
+        last_ts = Some(event.ts_nanos);
+        total_l3_bytes += event.bytes as u64;
+        events.push(event);
+    }
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    let avg_packet_bytes = if events.is_empty() {
+        fallback_avg_packet_bytes as f64
+    } else {
+        total_l3_bytes as f64 / events.len() as f64
+    };
+    let trace_duration = match (first_ts, last_ts) {
+        (Some(first), Some(last)) if last > first => (last - first) as f64 / 1e9,
+        _ => 0.0,
+    };
+    let trace_gbps = if trace_duration > 0.0 {
+        total_l3_bytes as f64 * 8.0 / trace_duration / 1e9
+    } else {
+        0.0
+    };
+
+    Ok(LoadedTrace {
+        events,
+        packets_read: reader.packets_read(),
+        total_l3_bytes,
+        avg_packet_bytes,
+        trace_duration,
+        trace_gbps,
+        elapsed_secs,
+    })
+}
+
+#[derive(Default)]
+struct ShardStats {
+    events: u64,
+    estimates: usize,
+    sketch_memory_bytes: u64,
+    late_events: u64,
+}
+
+fn run_trace_sharded_runtime(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
+    let shard_count = cfg.runtime_shards;
+    if shard_count == 0 {
+        bail!("--runtime-shards must be at least 1");
+    }
+
+    let hash = HashSpec::new(cfg.seed);
+    let plans = load_plans(&cfg.queries, cfg.seed)?;
+    let loaded = load_trace(trace, cfg.avg_packet_bytes)?;
+    let events = loaded.events.len();
+    let effective_shards = shard_count.min(events.max(1));
+    let chunk_size = events.div_ceil(effective_shards).max(1);
+
+    println!(
+        "trace benchmark: file={} parsed_events={} packets_read={} queries={}",
+        trace.display(),
+        events,
+        loaded.packets_read,
+        cfg.queries.len()
+    );
+    println!(
+        "trace shape: avg_l3_packet_bytes={:.1} duration={:.3}s observed_l3_rate={:.3}Gbps",
+        loaded.avg_packet_bytes, loaded.trace_duration, loaded.trace_gbps
+    );
+    println!(
+        "preload: {} events in {:.3}s -> {:.2}M parse events/s/core",
+        events,
+        loaded.elapsed_secs,
+        events as f64 / loaded.elapsed_secs.max(1e-9) / 1e6
+    );
+
+    let started = Instant::now();
+    let shard_results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in loaded.events.chunks(chunk_size) {
+            let plans = plans.clone();
+            handles.push(scope.spawn(move || -> Result<ShardStats> {
+                if plans.is_empty() {
+                    return Ok(ShardStats {
+                        events: chunk.len() as u64,
+                        ..ShardStats::default()
+                    });
+                }
+                let mut engine =
+                    QueryEngine::new(plans, hash).context("engine construction failed")?;
+                for event in chunk {
+                    engine.process(event).context("sketch update failed")?;
+                }
+                engine.finish().context("final window flush failed")?;
+                let estimates = engine.take_estimates();
+                Ok(ShardStats {
+                    events: chunk.len() as u64,
+                    estimates: estimates.len(),
+                    sketch_memory_bytes: engine.sketch_memory_bytes() as u64,
+                    late_events: engine.late_events(),
+                })
+            }));
+        }
+
+        let mut stats = Vec::new();
+        for handle in handles {
+            stats.push(
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("runtime shard panicked"))??,
+            );
+        }
+        Ok::<_, anyhow::Error>(stats)
+    })?;
+    let elapsed = started.elapsed();
+
+    let mut stats = ShardStats::default();
+    for shard in shard_results {
+        stats.events += shard.events;
+        stats.estimates += shard.estimates;
+        stats.sketch_memory_bytes += shard.sketch_memory_bytes;
+        stats.late_events += shard.late_events;
+    }
+
+    let aggregate_eps = stats.events as f64 / elapsed.as_secs_f64().max(1e-9);
+    let per_core_eps = aggregate_eps / effective_shards as f64;
+    println!(
+        "sharded_runtime: shards={} events={} in {:.3}s -> aggregate {:.2}M events/s, per_core {:.2}M events/s/core",
+        effective_shards,
+        stats.events,
+        elapsed.as_secs_f64(),
+        aggregate_eps / 1e6,
+        per_core_eps / 1e6
+    );
+    print_l3_capacity(per_core_eps, loaded.avg_packet_bytes);
+    println!(
+        "capacity: aggregate_l3_capacity={:.2} Gb/s across {} shard(s)",
+        measured_l3_gbps(aggregate_eps, loaded.avg_packet_bytes),
+        effective_shards
+    );
+    let projections = print_profile_projection(cfg.profile, loaded.avg_packet_bytes, per_core_eps);
+    enforce_core_budget(&projections, cfg.core_budget)?;
+    println!(
+        "runtime: shards={} estimates={} sketch_memory={} late_events={} total_l3_bytes={}",
+        effective_shards,
+        stats.estimates,
+        flowsketch_planner::format_bytes(stats.sketch_memory_bytes),
+        stats.late_events,
+        loaded.total_l3_bytes
+    );
     Ok(())
 }
 

@@ -40,8 +40,9 @@ fn pcap_loop(
         .map_err(|e| AgentError::Source(format!("cannot open {}: {e}", path.display())))?;
     let mut reader = PcapReader::new(std::io::BufReader::new(file))
         .map_err(|e| AgentError::Source(e.to_string()))?;
+    let mut packet_buf = Vec::with_capacity(2048);
     while let Some(event) = reader
-        .next_event()
+        .next_event_into(&mut packet_buf)
         .map_err(|e| AgentError::Source(e.to_string()))?
     {
         state.packets_seen.fetch_add(1, Ordering::Relaxed);

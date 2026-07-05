@@ -10,7 +10,8 @@
 //! summary's minimum count as additional potential error; the union is then
 //! trimmed back to capacity.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use flowsketch_core::hash::{hash64, HashSpec};
 use flowsketch_core::snapshot::{
@@ -40,8 +41,15 @@ pub struct SpaceSaving {
     capacity: usize,
     hash: HashSpec, // kept for merge-compatibility metadata; keys are exact
     entries: HashMap<Vec<u8>, Entry>,
+    min_heap: BinaryHeap<Reverse<HeapEntry>>,
     total_weight: u64,
     updates: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HeapEntry {
+    count: u64,
+    key: Vec<u8>,
 }
 
 impl SpaceSaving {
@@ -55,6 +63,7 @@ impl SpaceSaving {
             capacity,
             hash,
             entries: HashMap::with_capacity(capacity + 1),
+            min_heap: BinaryHeap::with_capacity(capacity + 1),
             total_weight: 0,
             updates: 0,
         })
@@ -79,11 +88,45 @@ impl SpaceSaving {
         1.0 / self.capacity as f64
     }
 
-    fn min_entry_key(&self) -> Option<Vec<u8>> {
-        self.entries
-            .iter()
-            .min_by_key(|(_, e)| e.count)
-            .map(|(k, _)| k.clone())
+    fn push_heap_entry(&mut self, key: &[u8], count: u64) {
+        self.min_heap.push(Reverse(HeapEntry {
+            count,
+            key: key.to_vec(),
+        }));
+        let compact_at = (self.entries.len().max(1) * 8).max(self.capacity * 2);
+        if self.min_heap.len() > compact_at {
+            self.rebuild_heap();
+        }
+    }
+
+    fn rebuild_heap(&mut self) {
+        self.min_heap.clear();
+        self.min_heap.reserve(self.entries.len());
+        for (key, entry) in &self.entries {
+            self.min_heap.push(Reverse(HeapEntry {
+                count: entry.count,
+                key: key.clone(),
+            }));
+        }
+    }
+
+    fn min_entry_key(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let Some(Reverse(candidate)) = self.min_heap.pop() else {
+                if self.entries.is_empty() {
+                    return None;
+                }
+                self.rebuild_heap();
+                continue;
+            };
+            if self
+                .entries
+                .get(&candidate.key)
+                .is_some_and(|entry| entry.count == candidate.count)
+            {
+                return Some(candidate.key);
+            }
+        }
     }
 
     pub fn add(&mut self, key: &[u8], weight: u64) {
@@ -91,6 +134,8 @@ impl SpaceSaving {
         self.updates += 1;
         if let Some(e) = self.entries.get_mut(key) {
             e.count += weight;
+            let count = e.count;
+            self.push_heap_entry(key, count);
             return;
         }
         if self.entries.len() < self.capacity {
@@ -101,6 +146,7 @@ impl SpaceSaving {
                     error: 0,
                 },
             );
+            self.push_heap_entry(key, weight);
             return;
         }
         // Evict the current minimum and inherit its count as error.
@@ -113,6 +159,7 @@ impl SpaceSaving {
                 error: min.count,
             },
         );
+        self.push_heap_entry(key, min.count + weight);
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&Entry> {
@@ -186,9 +233,16 @@ impl SpaceSaving {
             capacity,
             hash: header.hash,
             entries,
+            min_heap: BinaryHeap::new(),
             total_weight,
             updates,
-        })
+        }
+        .with_rebuilt_heap())
+    }
+
+    fn with_rebuilt_heap(mut self) -> Self {
+        self.rebuild_heap();
+        self
     }
 }
 
@@ -248,6 +302,7 @@ impl Sketch for SpaceSaving {
             merged = all.into_iter().collect();
         }
         self.entries = merged;
+        self.rebuild_heap();
         self.total_weight += other.total_weight;
         self.updates += other.updates;
         Ok(())
@@ -259,11 +314,17 @@ impl Sketch for SpaceSaving {
             .keys()
             .map(|k| k.len() + std::mem::size_of::<Entry>() + 32)
             .sum();
-        entry_bytes + std::mem::size_of::<Self>()
+        let heap_bytes: usize = self
+            .min_heap
+            .iter()
+            .map(|entry| entry.0.key.len() + std::mem::size_of::<HeapEntry>() + 32)
+            .sum();
+        entry_bytes + heap_bytes + std::mem::size_of::<Self>()
     }
 
     fn reset(&mut self) {
         self.entries.clear();
+        self.min_heap.clear();
         self.total_weight = 0;
         self.updates = 0;
     }
