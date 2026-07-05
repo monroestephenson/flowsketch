@@ -227,7 +227,10 @@ fn bench_trace_profile_runs_on_generated_pcap() {
             .arg("--query")
             .arg(example("top-talkers.yaml"))
             .args(["--profile", "10g"])
-            .args(["--core-budget", "100"]),
+            // This debug-binary smoke test verifies the readiness output path,
+            // not runner-dependent performance. The release benchmark gate is
+            // documented separately with a real CPU budget.
+            .args(["--core-budget", "1000"]),
     );
     let text = stdout(&out);
     assert!(text.contains("trace benchmark:"), "{text}");

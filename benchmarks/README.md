@@ -60,11 +60,13 @@ live Linux capture validation with explicit packet-drop accounting.
 The normal test suite generates small synthetic pcaps and runs:
 
 ```bash
-flowsketch bench --trace synthetic.pcap --query examples/queries/top-talkers.yaml --profile 10g --core-budget 100
+flowsketch bench --trace synthetic.pcap --query examples/queries/top-talkers.yaml --profile 10g --core-budget 1000
 ```
 
 This verifies the real-trace harness and line-rate math without checking in
-large or legally restricted traces.
+large or legally restricted traces. The high budget is intentional because
+normal test runs use debug binaries on shared CI runners; release benchmark
+gates are documented separately.
 
 ## Optional real-trace test hook
 
