@@ -58,18 +58,31 @@ live Linux capture validation with explicit packet-drop accounting.
 ## Sharded runtime benchmark
 
 Use `--runtime-shards` to preload parsed trace events and process the runtime
-updates across multiple independent query engines:
+updates across mergeable query-engine shards:
 
 ```bash
 target/release/flowsketch bench \
   --trace /data/caida-or-mawi.pcap \
   --query examples/queries/top-talkers.yaml \
   --profile 100g \
-  --runtime-shards 8
+  --runtime-shards 8 \
+  --runtime-shard-strategy round-robin \
+  --normalize-line-rate-gbps 100
 ```
 
-This measures runtime sharding after parsing. It is useful for estimating how
-the query engine scales, but it is not an end-to-end live capture result.
+The runtime synchronizes active shards on one event-time watermark and merges
+completed sketch states before emitting estimates. `flow` (the default)
+models directional RSS affinity. `round-robin` evenly distributes packets and
+is appropriate for mergeable queries when elephant flows create queue skew.
+The benchmark prints min/max events per shard so that skew is visible.
+
+`--normalize-line-rate-gbps` rescales timestamps without changing packet
+contents or sizes. This prevents a slowly recorded trace replayed at high
+speed from charging many minutes of window-close work to a fraction of a
+second. It remains a runtime-only capacity projection: preload parsing and
+partition timing are reported separately, and live capture is not included.
+Sharded mode runs three isolated runtime samples by default and reports their
+median; use `--runtime-iterations` to change the sample count.
 
 ## CI-safe benchmark tests
 

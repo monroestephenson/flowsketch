@@ -6,6 +6,8 @@
 //!   listen: 127.0.0.1:9464
 //!   seed: 0
 //!   flushIntervalMs: 1000
+//!   runtimeShards: 4
+//!   runtimeBatchSize: 4096
 //!   source:
 //!     kind: pcap            # pcap | af_packet
 //!     path: demo.pcap       # pcap: file to replay
@@ -25,6 +27,13 @@ use flowsketch_planner::{plan, Plan};
 
 use crate::AgentError;
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeShardStrategy {
+    Flow,
+    RoundRobin,
+}
+
 /// Where packets come from.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -42,6 +51,11 @@ pub struct AgentConfig {
     pub listen: String,
     pub seed: u64,
     pub flush_interval_ms: u64,
+    /// Independent mergeable query engines used for parallel batch updates.
+    pub runtime_shards: usize,
+    /// Maximum events dispatched to the runtime worker pool at once.
+    pub runtime_batch_size: usize,
+    pub runtime_shard_strategy: RuntimeShardStrategy,
     pub source: SourceConfig,
     pub query_files: Vec<PathBuf>,
     /// OTLP export, if configured.
@@ -57,6 +71,18 @@ impl AgentConfig {
         if raw.queries.is_empty() {
             return Err(AgentError::Config(
                 "agent config must list at least one query file".into(),
+            ));
+        }
+        let runtime_shards = raw.agent.runtime_shards.unwrap_or(1);
+        if !(1..=256).contains(&runtime_shards) {
+            return Err(AgentError::Config(
+                "agent.runtimeShards must be between 1 and 256".into(),
+            ));
+        }
+        let runtime_batch_size = raw.agent.runtime_batch_size.unwrap_or(4_096);
+        if !(1..=65_536).contains(&runtime_batch_size) {
+            return Err(AgentError::Config(
+                "agent.runtimeBatchSize must be between 1 and 65536".into(),
             ));
         }
         let export = raw.export.unwrap_or_default();
@@ -112,6 +138,12 @@ impl AgentConfig {
             listen: raw.agent.listen.unwrap_or_else(|| "127.0.0.1:9464".into()),
             seed: raw.agent.seed.unwrap_or(0),
             flush_interval_ms: raw.agent.flush_interval_ms.unwrap_or(1_000).max(10),
+            runtime_shards,
+            runtime_batch_size,
+            runtime_shard_strategy: raw
+                .agent
+                .runtime_shard_strategy
+                .unwrap_or(RuntimeShardStrategy::Flow),
             source: raw.agent.source,
             query_files: raw.queries.into_iter().map(|q| q.file).collect(),
             otlp,
@@ -205,6 +237,16 @@ struct RawAgent {
     seed: Option<u64>,
     #[serde(default, rename = "flushIntervalMs", alias = "flush_interval_ms")]
     flush_interval_ms: Option<u64>,
+    #[serde(default, rename = "runtimeShards", alias = "runtime_shards")]
+    runtime_shards: Option<usize>,
+    #[serde(default, rename = "runtimeBatchSize", alias = "runtime_batch_size")]
+    runtime_batch_size: Option<usize>,
+    #[serde(
+        default,
+        rename = "runtimeShardStrategy",
+        alias = "runtime_shard_strategy"
+    )]
+    runtime_shard_strategy: Option<RuntimeShardStrategy>,
     source: SourceConfig,
 }
 
@@ -227,6 +269,9 @@ agent:
   listen: 127.0.0.1:0
   seed: 7
   flushIntervalMs: 250
+  runtimeShards: 4
+  runtimeBatchSize: 8192
+  runtimeShardStrategy: round_robin
   source:
     kind: pcap
     path: demo.pcap
@@ -239,6 +284,9 @@ queries:
         assert_eq!(cfg.node_name, "node-a");
         assert_eq!(cfg.seed, 7);
         assert_eq!(cfg.flush_interval_ms, 250);
+        assert_eq!(cfg.runtime_shards, 4);
+        assert_eq!(cfg.runtime_batch_size, 8192);
+        assert_eq!(cfg.runtime_shard_strategy, RuntimeShardStrategy::RoundRobin);
         assert!(matches!(cfg.source, SourceConfig::Pcap { .. }));
         assert_eq!(cfg.query_files.len(), 2);
     }
@@ -255,6 +303,9 @@ queries:
         }
         // Defaults applied.
         assert_eq!(cfg.listen, "127.0.0.1:9464");
+        assert_eq!(cfg.runtime_shards, 1);
+        assert_eq!(cfg.runtime_batch_size, 4096);
+        assert_eq!(cfg.runtime_shard_strategy, RuntimeShardStrategy::Flow);
     }
 
     #[test]
@@ -332,6 +383,14 @@ queries:
         .is_err());
         assert!(AgentConfig::from_yaml(
             "agent:\n  source: {kind: pcap, path: x.pcap}\n  bogus: 1\nqueries:\n  - file: q.yaml\n"
+        )
+        .is_err());
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  runtimeShards: 0\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
+        )
+        .is_err());
+        assert!(AgentConfig::from_yaml(
+            "agent:\n  runtimeBatchSize: 65537\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
         )
         .is_err());
     }

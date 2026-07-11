@@ -120,6 +120,15 @@ enum Command {
         /// Preload trace events and process runtime updates across N shards
         #[arg(long, default_value_t = 1)]
         runtime_shards: usize,
+        /// Rescale trace event time to this L3 line rate before runtime measurement
+        #[arg(long, value_name = "GBPS")]
+        normalize_line_rate_gbps: Option<f64>,
+        /// Runtime dispatch policy for preloaded events
+        #[arg(long, value_enum, default_value_t = bench::RuntimeShardStrategy::Flow)]
+        runtime_shard_strategy: bench::RuntimeShardStrategy,
+        /// Independent sharded-runtime samples; the median is reported
+        #[arg(long, default_value_t = 3)]
+        runtime_iterations: usize,
     },
     /// Generate a synthetic pcap trace (background traffic + heavy talkers + scanners)
     Synth {
@@ -257,6 +266,9 @@ fn main() -> Result<()> {
             seed,
             core_budget,
             runtime_shards,
+            normalize_line_rate_gbps,
+            runtime_shard_strategy,
+            runtime_iterations,
         } => bench::run(bench::BenchConfig {
             algo,
             events,
@@ -269,6 +281,9 @@ fn main() -> Result<()> {
             seed,
             core_budget,
             runtime_shards,
+            normalize_line_rate_gbps,
+            runtime_shard_strategy,
+            runtime_iterations,
         }),
         Command::Synth {
             out,

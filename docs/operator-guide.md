@@ -70,8 +70,23 @@ development, demos, and offline analysis; `af_packet` returns a clear
 "Linux only" error. The agent is a capture thread feeding a bounded channel
 into the engine thread; when the engine falls behind, capture drops events
 and counts them in `flowsketch_agent_dropped_events_total` rather than
-blocking the NIC path. A capture failure flips `/healthz` to 503 while
+blocking the NIC path. Linux AF_PACKET socket overflow is reported separately
+as `flowsketch_agent_kernel_dropped_packets_total`. A capture failure flips `/healthz` to 503 while
 `/metrics` keeps serving the last good state.
+
+Parallel runtime execution is configured under `agent`:
+
+```yaml
+runtimeShards: 8
+runtimeBatchSize: 8192
+runtimeShardStrategy: flow       # flow or round_robin
+```
+
+`flow` preserves 5-tuple affinity and models normal RSS. `round_robin`
+balances elephant-heavy traffic across mergeable sketch shards. Each shard
+owns its window state; completed states are merged before metrics or gateway
+snapshots are emitted. Memory grows approximately with the shard count, so
+size it from measurements and keep the default of one for small nodes.
 
 In pcap-source mode, the capture source is finite: once the file is fully
 processed, the agent marks `flowsketch_agent_source_done` and keeps serving

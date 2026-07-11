@@ -66,6 +66,7 @@ fn af_packet_loop(
 ) -> Result<(), AgentError> {
     let sock = AfPacketSocket::open(interface)?;
     let mut buf = vec![0u8; 65_536];
+    let mut received_since_stats = 0u32;
     loop {
         let len = match sock.recv(&mut buf) {
             Ok(0) => continue,
@@ -74,6 +75,16 @@ fn af_packet_loop(
             Err(e) => return Err(AgentError::Source(format!("recv on {interface}: {e}"))),
         };
         state.packets_seen.fetch_add(1, Ordering::Relaxed);
+        received_since_stats += 1;
+        if received_since_stats >= 4_096 {
+            let stats = sock.statistics().map_err(|e| {
+                AgentError::Source(format!("PACKET_STATISTICS on {interface}: {e}"))
+            })?;
+            state
+                .kernel_dropped_packets
+                .fetch_add(stats.tp_drops as u64, Ordering::Relaxed);
+            received_since_stats = 0;
+        }
         if let Some(mut event) = parse_packet(linktype::ETHERNET, &buf[..len]) {
             event.ts_nanos = now_nanos();
             if event.bytes == 0 {
@@ -176,6 +187,38 @@ impl AfPacketSocket {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(n as usize)
+        }
+    }
+
+    /// Read and reset the kernel's per-socket AF_PACKET counters. Linux
+    /// accumulates `tp_drops` when the socket receive queue overflows before
+    /// userspace can call `recv`.
+    fn statistics(&self) -> std::io::Result<libc::tpacket_stats> {
+        let mut stats = libc::tpacket_stats {
+            tp_packets: 0,
+            tp_drops: 0,
+        };
+        let mut len = std::mem::size_of::<libc::tpacket_stats>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `len` bytes to the correctly typed
+        // stats buffer and updates the valid socklen_t pointer.
+        let rc = unsafe {
+            libc::getsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&self.fd),
+                libc::SOL_PACKET,
+                libc::PACKET_STATISTICS,
+                &mut stats as *mut libc::tpacket_stats as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            Err(std::io::Error::last_os_error())
+        } else if len < std::mem::size_of::<libc::tpacket_stats>() as libc::socklen_t {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "short PACKET_STATISTICS response",
+            ))
+        } else {
+            Ok(stats)
         }
     }
 }

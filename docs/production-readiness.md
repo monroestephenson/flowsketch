@@ -22,6 +22,7 @@ the items below as the gate to broad production rollout.
 - Track:
   - `flowsketch_agent_packets_seen_total`
   - `flowsketch_agent_events_processed_total`
+  - `flowsketch_agent_kernel_dropped_packets_total`
   - `flowsketch_agent_dropped_events_total`
   - `flowsketch_agent_late_events_total`
   - gateway rejected snapshots and merged-node counts
@@ -54,6 +55,21 @@ flowsketch bench --trace /data/caida-or-mawi.pcap \
 Passing this gate means the measured trace path projects to 10 Gb/s within
 two cores on that machine and packet-size distribution. It is not a live NIC
 claim until validated with packet-drop counters on Linux.
+
+For a runtime-only 100G event-time projection, separate parser, dispatch, and
+merge-correct shard costs:
+
+```bash
+flowsketch bench --trace /data/caida-or-mawi.pcap \
+  --query examples/queries/top-talkers.yaml \
+  --profile 100g --runtime-shards 8 \
+  --runtime-shard-strategy flow \
+  --normalize-line-rate-gbps 100
+```
+
+Repeat with `round-robin` to quantify elephant-flow shard skew. Neither mode
+is a live-NIC result. Production rollout still requires dedicated hardware
+replay, direct RX-queue ingestion, CPU affinity, and zero unexplained drops.
 
 ## Kubernetes
 

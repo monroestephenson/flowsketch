@@ -10,7 +10,7 @@ use flowsketch_core::SketchEstimate;
 use flowsketch_ir::logical::Measure;
 use flowsketch_planner::Plan;
 use flowsketch_prometheus::QueryExportInfo;
-use flowsketch_runtime::{QueryEngine, SnapshotExport};
+use flowsketch_runtime::{ShardedQueryEngine, SnapshotExport};
 
 /// Plan metadata the HTTP layer serves on /v1/queries and uses for
 /// /metrics labels.
@@ -52,6 +52,7 @@ pub struct PublishedState {
 
     pub events_processed: AtomicU64,
     pub packets_seen: AtomicU64,
+    pub kernel_dropped_packets: AtomicU64,
     pub dropped_events: AtomicU64,
     pub sketch_memory_bytes: AtomicU64,
     pub late_events: AtomicU64,
@@ -59,6 +60,8 @@ pub struct PublishedState {
     pub otlp_failures: AtomicU64,
     pub gateway_pushes: AtomicU64,
     pub gateway_push_failures: AtomicU64,
+    pub runtime_batches: AtomicU64,
+    pub runtime_shards: usize,
 
     /// Latest exported window snapshots for the gateway pusher, refreshed
     /// by the engine thread at most once per `interval` (serializing
@@ -74,7 +77,7 @@ struct SnapshotGate {
 }
 
 impl PublishedState {
-    pub fn new(plans: &[Plan]) -> Self {
+    pub fn new(plans: &[Plan], runtime_shards: usize) -> Self {
         let queries = plans
             .iter()
             .map(|p| QueryInfo {
@@ -98,6 +101,7 @@ impl PublishedState {
             source_error: Mutex::new(None),
             events_processed: AtomicU64::new(0),
             packets_seen: AtomicU64::new(0),
+            kernel_dropped_packets: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
             sketch_memory_bytes: AtomicU64::new(0),
             late_events: AtomicU64::new(0),
@@ -105,6 +109,8 @@ impl PublishedState {
             otlp_failures: AtomicU64::new(0),
             gateway_pushes: AtomicU64::new(0),
             gateway_push_failures: AtomicU64::new(0),
+            runtime_batches: AtomicU64::new(0),
+            runtime_shards,
             snapshot_gate: Mutex::new(None),
             snapshots: Mutex::new(Vec::new()),
         }
@@ -128,7 +134,7 @@ impl PublishedState {
     /// Export snapshots now, ignoring the rate gate — used for the final
     /// publish when a finite source completes, so the trailing window is
     /// available to push regardless of timing.
-    pub fn export_snapshots_now(&self, engine: &QueryEngine) {
+    pub fn export_snapshots_now(&self, engine: &ShardedQueryEngine) {
         if self.snapshot_gate.lock().unwrap().is_none() {
             return;
         }
@@ -137,7 +143,7 @@ impl PublishedState {
         }
     }
 
-    fn maybe_export_snapshots(&self, engine: &QueryEngine) {
+    fn maybe_export_snapshots(&self, engine: &ShardedQueryEngine) {
         let mut gate = self.snapshot_gate.lock().unwrap();
         let Some(gate) = gate.as_mut() else { return };
         if gate
@@ -154,15 +160,18 @@ impl PublishedState {
 
     /// Drain newly emitted estimates from the engine and retain, per query,
     /// only the most recent window.
-    pub fn publish(&self, engine: &mut QueryEngine) {
-        let drained = engine.take_estimates();
+    pub fn publish(
+        &self,
+        engine: &mut ShardedQueryEngine,
+    ) -> Result<(), flowsketch_core::SketchError> {
+        let drained = engine.take_estimates()?;
         self.sketch_memory_bytes
             .store(engine.sketch_memory_bytes() as u64, Ordering::Relaxed);
         self.late_events
             .store(engine.late_events(), Ordering::Relaxed);
         self.maybe_export_snapshots(engine);
         if drained.is_empty() {
-            return;
+            return Ok(());
         }
         let mut map = self.estimates.lock().unwrap();
         for e in drained {
@@ -179,6 +188,7 @@ impl PublishedState {
                 None => per_query.push(e),
             }
         }
+        Ok(())
     }
 
     /// Estimates of the latest window across all queries.
@@ -210,7 +220,7 @@ impl PublishedState {
     /// Agent health block appended to /metrics.
     pub fn render_health_metrics(&self) -> String {
         let mut out = String::new();
-        let counters: [(&str, &str, u64); 9] = [
+        let counters: [(&str, &str, u64); 11] = [
             (
                 "flowsketch_agent_events_processed_total",
                 "Flow events processed by the sketch engine.",
@@ -222,8 +232,13 @@ impl PublishedState {
                 self.packets_seen.load(Ordering::Relaxed),
             ),
             (
+                "flowsketch_agent_kernel_dropped_packets_total",
+                "Packets dropped by the Linux AF_PACKET socket before userspace received them.",
+                self.kernel_dropped_packets.load(Ordering::Relaxed),
+            ),
+            (
                 "flowsketch_agent_dropped_events_total",
-                "Events dropped because the engine channel was full.",
+                "Parsed events dropped in userspace because the engine channel was full.",
                 self.dropped_events.load(Ordering::Relaxed),
             ),
             (
@@ -256,6 +271,11 @@ impl PublishedState {
                 "Snapshot pushes that failed after retries.",
                 self.gateway_push_failures.load(Ordering::Relaxed),
             ),
+            (
+                "flowsketch_agent_runtime_batches_total",
+                "Event batches dispatched to runtime shards.",
+                self.runtime_batches.load(Ordering::Relaxed),
+            ),
         ];
         for (name, help, value) in counters {
             let kind = if name.ends_with("_total") {
@@ -267,6 +287,12 @@ impl PublishedState {
                 "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
             ));
         }
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_runtime_shards Configured parallel runtime shards.\n\
+             # TYPE flowsketch_agent_runtime_shards gauge\n\
+             flowsketch_agent_runtime_shards {}\n",
+            self.runtime_shards
+        ));
         out.push_str(&format!(
             "# HELP flowsketch_agent_queries_active Queries this agent is executing.\n\
              # TYPE flowsketch_agent_queries_active gauge\n\

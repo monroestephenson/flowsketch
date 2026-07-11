@@ -13,6 +13,7 @@ use flowsketch_core::{Field, FlowEvent, Sketch, SketchError, SketchEstimate};
 use flowsketch_ir::logical::Measure;
 use flowsketch_ir::physical::PhysicalSketch;
 use flowsketch_planner::{ErrorKind, Plan};
+use rayon::prelude::*;
 
 /// Component names tagging each FSK1 blob of a (possibly multi-sketch)
 /// query state. Shared by snapshot export and reconstruction so the two
@@ -265,6 +266,15 @@ pub struct WindowState {
     window_end_nanos: u64,
 }
 
+/// One completed query window, retained as mergeable sketch state until an
+/// engine consumer drains it. Sharded runtimes merge these states before
+/// converting them into estimates.
+#[derive(Debug, Clone)]
+struct WindowOutput {
+    query_name: String,
+    state: WindowState,
+}
+
 impl WindowState {
     /// Parse component snapshots for one query and validate them against
     /// the local `plan` and `hash`: all components must cover the same
@@ -424,8 +434,8 @@ struct RunningQuery {
     value_field: Option<Field>,
     hash: HashSpec,
     buckets: VecDeque<Bucket>,
-    /// Estimates emitted at each window close.
-    emitted: Vec<SketchEstimate>,
+    /// Mergeable states emitted at each window close.
+    emitted: Vec<WindowState>,
     /// Events dropped because they arrived before the earliest open bucket.
     late_events: u64,
     /// Reused hot-path buffers for encoded keys.
@@ -575,8 +585,11 @@ impl RunningQuery {
             merged.merge_from(&b.state)?;
         }
         let window_start = self.buckets.front().unwrap().start_nanos;
-        let estimates = self.emit(&merged, window_start, window_end);
-        self.emitted.extend(estimates);
+        self.emitted.push(WindowState {
+            state: merged,
+            window_start_nanos: window_start,
+            window_end_nanos: window_end,
+        });
         Ok(())
     }
 
@@ -587,10 +600,6 @@ impl RunningQuery {
             self.flush_window(window_end)?;
         }
         Ok(())
-    }
-
-    fn emit(&self, state: &QueryState, window_start: u64, window_end: u64) -> Vec<SketchEstimate> {
-        emit_estimates(&self.plan, state, window_start, window_end)
     }
 }
 
@@ -603,6 +612,9 @@ fn emit_estimates(
     window_start: u64,
     window_end: u64,
 ) -> Vec<SketchEstimate> {
+    if state.update_count() == 0 {
+        return Vec::new();
+    }
     let q = &plan.query;
     let p = &plan.physical;
     let algorithm = p.sketch.algorithm_name();
@@ -745,6 +757,16 @@ impl QueryEngine {
         Ok(())
     }
 
+    /// Advance every query to a shared event-time watermark. This is a no-op
+    /// for queries already at or beyond the watermark and is used to keep
+    /// independently fed shards on identical window boundaries.
+    pub fn advance_to(&mut self, ts_nanos: u64) -> Result<(), SketchError> {
+        for q in &mut self.queries {
+            q.advance_to_bucket(q.bucket_start_for(ts_nanos))?;
+        }
+        Ok(())
+    }
+
     /// Close trailing windows (offline replay end-of-stream).
     pub fn finish(&mut self) -> Result<(), SketchError> {
         for q in &mut self.queries {
@@ -757,9 +779,44 @@ impl QueryEngine {
     pub fn take_estimates(&mut self) -> Vec<SketchEstimate> {
         let mut out = Vec::new();
         for q in &mut self.queries {
-            out.append(&mut q.emitted);
+            for state in q.emitted.drain(..) {
+                out.extend(state.estimates(&q.plan));
+            }
         }
         out
+    }
+
+    fn take_window_outputs(&mut self) -> Vec<WindowOutput> {
+        let mut out = Vec::new();
+        for q in &mut self.queries {
+            out.extend(q.emitted.drain(..).map(|state| WindowOutput {
+                query_name: q.plan.query.name.clone(),
+                state,
+            }));
+        }
+        out
+    }
+
+    fn current_window_outputs(&self) -> Result<Vec<WindowOutput>, SketchError> {
+        let mut out = Vec::new();
+        for q in &self.queries {
+            if q.buckets.is_empty() {
+                continue;
+            }
+            let mut state = q.buckets[0].state.clone();
+            for bucket in q.buckets.iter().skip(1) {
+                state.merge_from(&bucket.state)?;
+            }
+            out.push(WindowOutput {
+                query_name: q.plan.query.name.clone(),
+                state: WindowState {
+                    state,
+                    window_start_nanos: q.buckets.front().unwrap().start_nanos,
+                    window_end_nanos: q.buckets.back().unwrap().start_nanos + q.slide_nanos(),
+                },
+            });
+        }
+        Ok(out)
     }
 
     pub fn events_processed(&self) -> u64 {
@@ -798,25 +855,265 @@ impl QueryEngine {
     /// all currently open buckets.
     pub fn export_snapshots(&self) -> Result<Vec<SnapshotExport>, SketchError> {
         let mut out = Vec::new();
-        for q in &self.queries {
-            if q.buckets.is_empty() {
-                continue;
-            }
-            let mut merged = q.buckets[0].state.clone();
-            for b in q.buckets.iter().skip(1) {
-                merged.merge_from(&b.state)?;
-            }
-            let ws = q.buckets.front().unwrap().start_nanos;
-            let we = q.buckets.back().unwrap().start_nanos + q.slide_nanos();
-            for (component, bytes) in merged.to_snapshots(ws, we) {
+        for window in self.current_window_outputs()? {
+            for (component, bytes) in window.state.state.to_snapshots(
+                window.state.window_start_nanos,
+                window.state.window_end_nanos,
+            ) {
                 out.push(SnapshotExport {
-                    query_name: q.plan.query.name.clone(),
+                    query_name: window.query_name.clone(),
                     component,
                     bytes,
                 });
             }
         }
         Ok(out)
+    }
+}
+
+/// A merge-correct set of query engines for receive-queue or flow sharding.
+///
+/// Callers with NIC RSS metadata should use `process_shard_batches` so queue
+/// affinity is preserved without a userspace dispatch pass. Other callers can
+/// use `process_batch`, which hashes the directional 5-tuple deterministically.
+pub struct ShardedQueryEngine {
+    shards: Vec<QueryEngine>,
+    plans: Vec<Plan>,
+    hash: HashSpec,
+    pool: rayon::ThreadPool,
+    next_balanced_shard: usize,
+}
+
+/// Userspace dispatch policy for sources that do not already provide one
+/// batch per NIC receive queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardStrategy {
+    /// Keep a directional 5-tuple on one shard for cache locality.
+    Flow,
+    /// Spread packets evenly; mergeable sketch states preserve query results.
+    RoundRobin,
+}
+
+impl ShardedQueryEngine {
+    pub fn new(plans: Vec<Plan>, hash: HashSpec, shard_count: usize) -> Result<Self, SketchError> {
+        if shard_count == 0 {
+            return Err(SketchError::InvalidParam(
+                "runtime shard count must be at least 1".into(),
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for plan in &plans {
+            if !names.insert(plan.query.name.as_str()) {
+                return Err(SketchError::InvalidParam(format!(
+                    "duplicate query name {:?} in sharded runtime",
+                    plan.query.name
+                )));
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(shard_count)
+            .thread_name(|index| format!("fs-runtime-{index}"))
+            .build()
+            .map_err(|e| SketchError::InvalidParam(format!("cannot build runtime pool: {e}")))?;
+        let shards = (0..shard_count)
+            .map(|_| QueryEngine::new(plans.clone(), hash))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            shards,
+            plans,
+            hash,
+            pool,
+            next_balanced_shard: 0,
+        })
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Stable directional 5-tuple shard selection for sources without an RSS
+    /// queue id. A flow stays on one shard, improving cache locality.
+    pub fn shard_for(&self, event: &FlowEvent) -> usize {
+        let mut key = [0u8; 38];
+        let (src, dst) = match (event.src_ip, event.dst_ip) {
+            (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
+                key[0] = 4;
+                (src.to_ipv6_mapped().octets(), dst.to_ipv6_mapped().octets())
+            }
+            (src, dst) => {
+                key[0] = 6;
+                let src = match src {
+                    std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+                    std::net::IpAddr::V6(ip) => ip.octets(),
+                };
+                let dst = match dst {
+                    std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+                    std::net::IpAddr::V6(ip) => ip.octets(),
+                };
+                (src, dst)
+            }
+        };
+        key[1..17].copy_from_slice(&src);
+        key[17..33].copy_from_slice(&dst);
+        key[33..35].copy_from_slice(&event.src_port.to_be_bytes());
+        key[35..37].copy_from_slice(&event.dst_port.to_be_bytes());
+        key[37] = event.protocol;
+        (self.hash.hash64(&key) % self.shards.len() as u64) as usize
+    }
+
+    /// Hash-dispatch and process one batch in parallel. Event order is
+    /// preserved within each shard.
+    pub fn process_batch(&mut self, events: &[FlowEvent]) -> Result<(), SketchError> {
+        self.process_batch_with_strategy(events, ShardStrategy::Flow)
+    }
+
+    pub fn process_batch_with_strategy(
+        &mut self,
+        events: &[FlowEvent],
+        strategy: ShardStrategy,
+    ) -> Result<(), SketchError> {
+        let mut batches = vec![Vec::new(); self.shards.len()];
+        for event in events {
+            let shard = match strategy {
+                ShardStrategy::Flow => self.shard_for(event),
+                ShardStrategy::RoundRobin => {
+                    let shard = self.next_balanced_shard;
+                    self.next_balanced_shard = (shard + 1) % self.shards.len();
+                    shard
+                }
+            };
+            batches[shard].push(event);
+        }
+        self.process_shard_refs(&batches)
+    }
+
+    /// Process already partitioned receive-queue batches. `batches[i]` maps
+    /// to shard `i`; this models the production RSS fast path.
+    pub fn process_shard_batches(&mut self, batches: &[Vec<FlowEvent>]) -> Result<(), SketchError> {
+        if batches.len() != self.shards.len() {
+            return Err(SketchError::InvalidParam(format!(
+                "received {} shard batches for {} runtime shards",
+                batches.len(),
+                self.shards.len()
+            )));
+        }
+        let refs: Vec<Vec<&FlowEvent>> =
+            batches.iter().map(|batch| batch.iter().collect()).collect();
+        self.process_shard_refs(&refs)
+    }
+
+    fn process_shard_refs(&mut self, batches: &[Vec<&FlowEvent>]) -> Result<(), SketchError> {
+        let watermark = batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .map(|event| event.ts_nanos)
+            .max();
+        self.pool.install(|| {
+            self.shards
+                .par_iter_mut()
+                .zip(batches.par_iter())
+                .try_for_each(|(engine, batch)| {
+                    for event in batch {
+                        engine.process(event)?;
+                    }
+                    if let Some(watermark) = watermark {
+                        engine.advance_to(watermark)?;
+                    }
+                    Ok::<_, SketchError>(())
+                })
+        })
+    }
+
+    pub fn finish(&mut self) -> Result<(), SketchError> {
+        self.pool
+            .install(|| self.shards.par_iter_mut().try_for_each(QueryEngine::finish))
+    }
+
+    pub fn take_estimates(&mut self) -> Result<Vec<SketchEstimate>, SketchError> {
+        let mut merged: BTreeMap<(String, u64, u64), WindowState> = BTreeMap::new();
+        for output in self
+            .shards
+            .iter_mut()
+            .flat_map(QueryEngine::take_window_outputs)
+        {
+            let key = (
+                output.query_name,
+                output.state.window_start_nanos,
+                output.state.window_end_nanos,
+            );
+            match merged.get_mut(&key) {
+                Some(state) => state.merge_from(&output.state)?,
+                None => {
+                    merged.insert(key, output.state);
+                }
+            }
+        }
+        let plans: BTreeMap<_, _> = self
+            .plans
+            .iter()
+            .map(|plan| (plan.query.name.as_str(), plan))
+            .collect();
+        let mut estimates = Vec::new();
+        for ((query_name, _, _), state) in merged {
+            let plan = plans.get(query_name.as_str()).ok_or_else(|| {
+                SketchError::InvalidParam(format!("missing plan for query {query_name:?}"))
+            })?;
+            estimates.extend(state.estimates(plan));
+        }
+        Ok(estimates)
+    }
+
+    pub fn events_processed(&self) -> u64 {
+        self.shards.iter().map(QueryEngine::events_processed).sum()
+    }
+
+    pub fn late_events(&self) -> u64 {
+        self.shards.iter().map(QueryEngine::late_events).sum()
+    }
+
+    pub fn sketch_memory_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(QueryEngine::sketch_memory_bytes)
+            .sum()
+    }
+
+    pub fn export_snapshots(&self) -> Result<Vec<SnapshotExport>, SketchError> {
+        let mut merged: BTreeMap<(String, u64, u64), WindowState> = BTreeMap::new();
+        for output in self
+            .shards
+            .iter()
+            .map(QueryEngine::current_window_outputs)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+        {
+            let key = (
+                output.query_name,
+                output.state.window_start_nanos,
+                output.state.window_end_nanos,
+            );
+            match merged.get_mut(&key) {
+                Some(state) => state.merge_from(&output.state)?,
+                None => {
+                    merged.insert(key, output.state);
+                }
+            }
+        }
+        let mut exports = Vec::new();
+        for ((query_name, _, _), state) in merged {
+            for (component, bytes) in state
+                .state
+                .to_snapshots(state.window_start_nanos, state.window_end_nanos)
+            {
+                exports.push(SnapshotExport {
+                    query_name: query_name.clone(),
+                    component,
+                    bytes,
+                });
+            }
+        }
+        Ok(exports)
     }
 }
 
@@ -946,6 +1243,137 @@ mod tests {
             vec![("protocol".to_string(), "tcp".to_string())]
         );
         assert_eq!(est[0].estimate, 1_000_000.0);
+    }
+
+    #[test]
+    fn sharded_engine_merges_before_emitting_estimates() {
+        let yaml =
+            "name: pb\nwindow: {size: 60s}\ngroupBy: [protocol]\nmeasure: {type: sum, value: bytes}\n";
+        let query = parse_query_yaml(yaml).unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, 4).unwrap();
+        let events: Vec<_> = (0..1_000)
+            .map(|i| {
+                event(
+                    5,
+                    &format!("10.0.{}.{}", i / 250, i % 250 + 1),
+                    "10.9.9.9",
+                    443,
+                    1_000,
+                )
+            })
+            .collect();
+
+        engine.process_batch(&events).unwrap();
+        engine.finish().unwrap();
+        let estimates = engine.take_estimates().unwrap();
+
+        assert_eq!(engine.events_processed(), 1_000);
+        assert_eq!(estimates.len(), 1, "shards leaked duplicate estimates");
+        assert_eq!(estimates[0].estimate, 1_000_000.0);
+        assert_eq!(estimates[0].update_count, 1_000);
+    }
+
+    #[test]
+    fn sharded_engine_advances_active_shards_on_one_watermark() {
+        let yaml =
+            "name: c\nwindow: {size: 10s, slide: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";
+        let query = parse_query_yaml(yaml).unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, 2).unwrap();
+        let first = vec![
+            vec![event(5, "10.0.0.1", "10.0.0.2", 80, 100)],
+            vec![event(5, "10.0.0.3", "10.0.0.4", 80, 100)],
+        ];
+        engine.process_shard_batches(&first).unwrap();
+        let second = vec![vec![event(15, "10.0.0.1", "10.0.0.2", 80, 100)], vec![]];
+        engine.process_shard_batches(&second).unwrap();
+
+        let estimates = engine.take_estimates().unwrap();
+        let first_window = estimates
+            .iter()
+            .find(|estimate| estimate.window_end_nanos == 10_000_000_000)
+            .unwrap();
+        assert_eq!(first_window.estimate, 2.0);
+        assert_eq!(first_window.update_count, 2);
+    }
+
+    #[test]
+    fn sharded_sliding_windows_align_when_a_shard_starts_late() {
+        let yaml =
+            "name: c\nwindow: {size: 20s, slide: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";
+        let query = parse_query_yaml(yaml).unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, 2).unwrap();
+
+        engine
+            .process_shard_batches(&[vec![event(5, "10.0.0.1", "10.0.0.2", 80, 100)], vec![]])
+            .unwrap();
+        engine
+            .process_shard_batches(&[vec![], vec![event(15, "10.0.0.3", "10.0.0.4", 80, 100)]])
+            .unwrap();
+        engine
+            .process_shard_batches(&[vec![event(25, "10.0.0.5", "10.0.0.6", 80, 100)], vec![]])
+            .unwrap();
+
+        let estimates = engine.take_estimates().unwrap();
+        let window = estimates
+            .iter()
+            .filter(|estimate| estimate.window_end_nanos == 20_000_000_000)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            window.len(),
+            1,
+            "unaligned shards emitted duplicate windows"
+        );
+        assert_eq!(window[0].window_start_nanos, 0);
+        assert_eq!(window[0].estimate, 2.0);
+        assert_eq!(window[0].update_count, 2);
+    }
+
+    #[test]
+    fn sharded_engine_rejects_zero_shards() {
+        let query = parse_query_yaml(
+            "name: c\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n",
+        )
+        .unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        assert!(ShardedQueryEngine::new(vec![planned], hash, 0).is_err());
+    }
+
+    #[test]
+    fn round_robin_sharding_balances_across_batches() {
+        let query = parse_query_yaml(
+            "name: c\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n",
+        )
+        .unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, 4).unwrap();
+        let batch: Vec<_> = (0..3)
+            .map(|i| event(5, "10.0.0.1", "10.0.0.2", 80 + i, 100))
+            .collect();
+        engine
+            .process_batch_with_strategy(&batch, ShardStrategy::RoundRobin)
+            .unwrap();
+        engine
+            .process_batch_with_strategy(&batch, ShardStrategy::RoundRobin)
+            .unwrap();
+
+        let counts: Vec<_> = engine
+            .shards
+            .iter()
+            .map(QueryEngine::events_processed)
+            .collect();
+        assert_eq!(counts, vec![2, 2, 1, 1]);
+        engine.finish().unwrap();
+        let estimates = engine.take_estimates().unwrap();
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].estimate, 6.0);
     }
 
     #[test]

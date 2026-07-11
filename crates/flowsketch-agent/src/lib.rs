@@ -30,7 +30,7 @@ use thiserror::Error;
 
 use flowsketch_core::hash::HashSpec;
 use flowsketch_core::FlowEvent;
-use flowsketch_runtime::QueryEngine;
+use flowsketch_runtime::ShardedQueryEngine;
 
 pub use config::AgentConfig;
 pub use state::PublishedState;
@@ -62,9 +62,9 @@ pub fn run(
 ) -> Result<(), AgentError> {
     let plans = config.load_plans()?;
     let hash = HashSpec::new(config.seed);
-    let engine = QueryEngine::new(plans.clone(), hash)?;
+    let engine = ShardedQueryEngine::new(plans.clone(), hash, config.runtime_shards)?;
 
-    let published = Arc::new(PublishedState::new(&plans));
+    let published = Arc::new(PublishedState::new(&plans, config.runtime_shards));
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| AgentError::Http(format!("cannot bind {}: {e}", config.listen)))?;
     let addr = listener.local_addr()?;
@@ -87,7 +87,14 @@ pub fn run(
         .spawn(move || source::capture_loop(source_cfg, tx, capture_state))
         .map_err(AgentError::Io)?;
 
-    engine_loop(engine, rx, Arc::clone(&published), config.flush_interval())?;
+    engine_loop(
+        engine,
+        rx,
+        Arc::clone(&published),
+        config.flush_interval(),
+        config.runtime_batch_size,
+        config.runtime_shard_strategy,
+    )?;
 
     match capture.join() {
         Ok(Ok(())) => {
@@ -236,35 +243,53 @@ pub(crate) fn offer_event(
 }
 
 fn engine_loop(
-    mut engine: QueryEngine,
+    mut engine: ShardedQueryEngine,
     rx: Receiver<FlowEvent>,
     published: Arc<PublishedState>,
     flush_interval: Duration,
+    batch_size: usize,
+    shard_strategy: config::RuntimeShardStrategy,
 ) -> Result<(), AgentError> {
     published.ready.store(true, Ordering::Release);
+    let mut batch = Vec::with_capacity(batch_size);
     loop {
         match rx.recv_timeout(flush_interval) {
             Ok(event) => {
-                engine.process(&event)?;
-                published.events_processed.fetch_add(1, Ordering::Relaxed);
+                batch.push(event);
+                while batch.len() < batch_size {
+                    match rx.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let strategy = match shard_strategy {
+                    config::RuntimeShardStrategy::Flow => flowsketch_runtime::ShardStrategy::Flow,
+                    config::RuntimeShardStrategy::RoundRobin => {
+                        flowsketch_runtime::ShardStrategy::RoundRobin
+                    }
+                };
+                engine.process_batch_with_strategy(&batch, strategy)?;
+                published
+                    .events_processed
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                published.runtime_batches.fetch_add(1, Ordering::Relaxed);
+                batch.clear();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Idle: publish whatever windows have closed so far.
-                published.publish(&mut engine);
+                published.publish(&mut engine)?;
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Cheap periodic publish: every 4096 events.
-        if published.events_processed.load(Ordering::Relaxed) % 4096 == 0 {
-            published.publish(&mut engine);
-        }
+        published.publish(&mut engine)?;
     }
     // Source finished: flush trailing windows and publish the final state.
     // The trailing window's snapshots export unconditionally so the
     // gateway pusher ships the final state regardless of gate timing.
     engine.finish()?;
-    published.publish(&mut engine);
+    published.publish(&mut engine)?;
     published.export_snapshots_now(&engine);
     published.source_done.store(true, Ordering::Release);
     Ok(())

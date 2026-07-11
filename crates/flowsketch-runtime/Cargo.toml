@@ -13,3 +13,4 @@ flowsketch-algos = { workspace = true }
 flowsketch-ir = { workspace = true }
 flowsketch-planner = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }

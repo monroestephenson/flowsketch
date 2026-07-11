@@ -18,7 +18,7 @@ use flowsketch_core::Sketch;
 use flowsketch_ir::parse_query_yaml;
 use flowsketch_pcap::PcapReader;
 use flowsketch_planner::{plan, Plan};
-use flowsketch_runtime::QueryEngine;
+use flowsketch_runtime::{QueryEngine, ShardedQueryEngine};
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Algo {
@@ -33,6 +33,14 @@ pub enum Algo {
 pub enum Dist {
     Uniform,
     Zipf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum RuntimeShardStrategy {
+    /// Directional 5-tuple affinity, matching normal RSS behavior.
+    Flow,
+    /// Even packet distribution for mergeable, elephant-heavy workloads.
+    RoundRobin,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -110,6 +118,11 @@ pub struct BenchConfig {
     pub core_budget: Option<f64>,
     /// Process preloaded trace events across this many runtime shards.
     pub runtime_shards: usize,
+    /// Rescale event timestamps to this L3 rate for accelerated replay.
+    pub normalize_line_rate_gbps: Option<f64>,
+    pub runtime_shard_strategy: RuntimeShardStrategy,
+    /// Independent sharded runtime samples used for the reported median.
+    pub runtime_iterations: usize,
 }
 
 /// Zipf(s=1) sampler over `n` keys via inverse-CDF on a precomputed table.
@@ -259,7 +272,7 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
 }
 
 fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
-    if cfg.runtime_shards > 1 {
+    if cfg.runtime_shards > 1 || cfg.normalize_line_rate_gbps.is_some() {
         return run_trace_sharded_runtime(cfg, trace);
     }
     let hash = HashSpec::new(cfg.seed);
@@ -395,26 +408,37 @@ fn load_trace(trace: &PathBuf, fallback_avg_packet_bytes: u64) -> Result<LoadedT
     })
 }
 
-#[derive(Default)]
-struct ShardStats {
-    events: u64,
-    estimates: usize,
-    sketch_memory_bytes: u64,
-    late_events: u64,
-}
-
 fn run_trace_sharded_runtime(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
     let shard_count = cfg.runtime_shards;
     if shard_count == 0 {
         bail!("--runtime-shards must be at least 1");
     }
+    if !(1..=100).contains(&cfg.runtime_iterations) {
+        bail!("--runtime-iterations must be between 1 and 100");
+    }
 
     let hash = HashSpec::new(cfg.seed);
     let plans = load_plans(&cfg.queries, cfg.seed)?;
-    let loaded = load_trace(trace, cfg.avg_packet_bytes)?;
+    let mut loaded = load_trace(trace, cfg.avg_packet_bytes)?;
     let events = loaded.events.len();
     let effective_shards = shard_count.min(events.max(1));
-    let chunk_size = events.div_ceil(effective_shards).max(1);
+    if let Some(gbps) = cfg.normalize_line_rate_gbps {
+        if !gbps.is_finite() || gbps <= 0.0 {
+            bail!("--normalize-line-rate-gbps must be a finite value greater than zero");
+        }
+        let start = loaded.events.first().map_or(0, |event| event.ts_nanos);
+        let mut bytes = 0u64;
+        for event in &mut loaded.events {
+            event.ts_nanos = start.saturating_add((bytes as f64 * 8.0 / gbps) as u64);
+            bytes = bytes.saturating_add(event.bytes as u64);
+        }
+        println!(
+            "event_time: normalized_l3_rate={gbps:.2}Gbps normalized_duration={:.6}s",
+            loaded.total_l3_bytes as f64 * 8.0 / gbps / 1e9
+        );
+    }
+    let mut engine = ShardedQueryEngine::new(plans.clone(), hash, effective_shards)
+        .context("sharded engine construction failed")?;
 
     println!(
         "trace benchmark: file={} parsed_events={} packets_read={} queries={}",
@@ -434,61 +458,72 @@ fn run_trace_sharded_runtime(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
         events as f64 / loaded.elapsed_secs.max(1e-9) / 1e6
     );
 
-    let started = Instant::now();
-    let shard_results = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in loaded.events.chunks(chunk_size) {
-            let plans = plans.clone();
-            handles.push(scope.spawn(move || -> Result<ShardStats> {
-                if plans.is_empty() {
-                    return Ok(ShardStats {
-                        events: chunk.len() as u64,
-                        ..ShardStats::default()
-                    });
-                }
-                let mut engine =
-                    QueryEngine::new(plans, hash).context("engine construction failed")?;
-                for event in chunk {
-                    engine.process(event).context("sketch update failed")?;
-                }
-                engine.finish().context("final window flush failed")?;
-                let estimates = engine.take_estimates();
-                Ok(ShardStats {
-                    events: chunk.len() as u64,
-                    estimates: estimates.len(),
-                    sketch_memory_bytes: engine.sketch_memory_bytes() as u64,
-                    late_events: engine.late_events(),
-                })
-            }));
-        }
-
-        let mut stats = Vec::new();
-        for handle in handles {
-            stats.push(
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("runtime shard panicked"))??,
-            );
-        }
-        Ok::<_, anyhow::Error>(stats)
-    })?;
-    let elapsed = started.elapsed();
-
-    let mut stats = ShardStats::default();
-    for shard in shard_results {
-        stats.events += shard.events;
-        stats.estimates += shard.estimates;
-        stats.sketch_memory_bytes += shard.sketch_memory_bytes;
-        stats.late_events += shard.late_events;
+    // Partition outside the timed runtime section. This models NIC RSS/RX
+    // queues delivering flow-affine batches directly to their CPU shards.
+    let partition_started = Instant::now();
+    let mut shard_batches: Vec<Vec<FlowEvent>> = (0..effective_shards)
+        .map(|_| Vec::with_capacity(events.div_ceil(effective_shards)))
+        .collect();
+    for (index, event) in std::mem::take(&mut loaded.events).into_iter().enumerate() {
+        let shard = match cfg.runtime_shard_strategy {
+            RuntimeShardStrategy::Flow => engine.shard_for(&event),
+            RuntimeShardStrategy::RoundRobin => index % effective_shards,
+        };
+        shard_batches[shard].push(event);
     }
+    let partition_elapsed = partition_started.elapsed();
+    let min_shard_events = shard_batches.iter().map(Vec::len).min().unwrap_or(0);
+    let max_shard_events = shard_batches.iter().map(Vec::len).max().unwrap_or(0);
+    println!(
+        "partition: {events} events in {:.3}s -> {:.2}M flow dispatches/s/core",
+        partition_elapsed.as_secs_f64(),
+        events as f64 / partition_elapsed.as_secs_f64().max(1e-9) / 1e6
+    );
+    println!(
+        "shard_balance: strategy={:?} min_events={min_shard_events} max_events={max_shard_events} max_to_mean={:.2}",
+        cfg.runtime_shard_strategy,
+        max_shard_events as f64 / (events as f64 / effective_shards as f64).max(1.0)
+    );
 
-    let aggregate_eps = stats.events as f64 / elapsed.as_secs_f64().max(1e-9);
+    let mut elapsed_samples = Vec::with_capacity(cfg.runtime_iterations);
+    let mut estimates_len = 0usize;
+    let mut sketch_memory_bytes = 0usize;
+    let mut late_events = 0u64;
+    for iteration in 0..cfg.runtime_iterations {
+        if iteration > 0 {
+            engine = ShardedQueryEngine::new(plans.clone(), hash, effective_shards)
+                .context("sharded engine construction failed")?;
+        }
+        let started = Instant::now();
+        engine
+            .process_shard_batches(&shard_batches)
+            .context("sharded sketch update failed")?;
+        engine.finish().context("final window flush failed")?;
+        estimates_len = engine
+            .take_estimates()
+            .context("sharded window merge failed")?
+            .len();
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "sharded_runtime_sample: iteration={} elapsed={elapsed:.6}s rate={:.2}M events/s",
+            iteration + 1,
+            events as f64 / elapsed.max(1e-9) / 1e6
+        );
+        elapsed_samples.push(elapsed);
+        sketch_memory_bytes = engine.sketch_memory_bytes();
+        late_events = engine.late_events();
+    }
+    elapsed_samples.sort_by(f64::total_cmp);
+    let elapsed_secs = elapsed_samples[elapsed_samples.len() / 2];
+
+    let processed = events as u64;
+    let aggregate_eps = processed as f64 / elapsed_secs.max(1e-9);
     let per_core_eps = aggregate_eps / effective_shards as f64;
     println!(
         "sharded_runtime: shards={} events={} in {:.3}s -> aggregate {:.2}M events/s, per_core {:.2}M events/s/core",
         effective_shards,
-        stats.events,
-        elapsed.as_secs_f64(),
+        processed,
+        elapsed_secs,
         aggregate_eps / 1e6,
         per_core_eps / 1e6
     );
@@ -503,9 +538,9 @@ fn run_trace_sharded_runtime(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
     println!(
         "runtime: shards={} estimates={} sketch_memory={} late_events={} total_l3_bytes={}",
         effective_shards,
-        stats.estimates,
-        flowsketch_planner::format_bytes(stats.sketch_memory_bytes),
-        stats.late_events,
+        estimates_len,
+        flowsketch_planner::format_bytes(sketch_memory_bytes as u64),
+        late_events,
         loaded.total_l3_bytes
     );
     Ok(())

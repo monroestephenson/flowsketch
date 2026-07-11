@@ -14,6 +14,10 @@ agent:
   listen: 127.0.0.1:9464
   seed: 0
   flushIntervalMs: 1000
+  # Scale after measuring per-shard memory and CPU on the target node.
+  runtimeShards: 1
+  runtimeBatchSize: 4096
+  runtimeShardStrategy: flow
   source:
     kind: pcap
     path: ../demo.pcap

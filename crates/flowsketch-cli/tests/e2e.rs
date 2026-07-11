@@ -250,10 +250,17 @@ fn bench_trace_profile_runs_on_generated_pcap() {
             .arg(example("top-talkers.yaml"))
             .args(["--profile", "10g"])
             .args(["--runtime-shards", "2"])
+            .args(["--runtime-shard-strategy", "round-robin"])
+            .args(["--normalize-line-rate-gbps", "10"])
             .args(["--core-budget", "1000"]),
     );
     let text = stdout(&out);
     assert!(text.contains("preload:"), "{text}");
+    assert!(
+        text.contains("event_time: normalized_l3_rate=10.00Gbps"),
+        "{text}"
+    );
+    assert!(text.contains("strategy=RoundRobin"), "{text}");
     assert!(text.contains("sharded_runtime: shards=2"), "{text}");
     assert!(text.contains("aggregate_l3_capacity="), "{text}");
 }
