@@ -46,7 +46,8 @@ jobs:
             --seed 77
           $BIN bench --trace /tmp/flowsketch-linux-projection.pcap \
             --query examples/queries/top-talkers.yaml \
-            --profile 10g | tee /tmp/flowsketch-linux-projection.txt
+            --profile 10g \
+            --core-budget 2 | tee /tmp/flowsketch-linux-projection.txt
           {
             echo "## Linux 10 Gb/s projection"
             echo

@@ -49,10 +49,24 @@ The optional NetworkPolicy template allows labeled agent pods in the
 `flowsketch` namespace to push to the gateway. Host-networked agents and
 Prometheus scrapes may need additional CNI-specific allow rules.
 
+## Prometheus Operator
+
+Clusters with Prometheus Operator can install the optional monitoring pack:
+
+```bash
+kubectl apply -k deploy/kubernetes/monitoring
+```
+
+It installs a PodMonitor for host-networked agents, a ServiceMonitor for the
+gateway, and PrometheusRule alerts for kernel/userspace packet drops, late
+events, readiness, gateway push failures, and rejected snapshots. Install the
+`monitoring.coreos.com` CRDs before applying this pack. Operator deployments
+that select monitors or rules by labels may require an environment-specific
+label transformer or Kustomize overlay.
+
 ## Production TODOs
 
 - Convert these manifests to a Helm chart with image/tag/resources values.
-- Add ServiceMonitor/PodMonitor templates for your Prometheus operator.
 - Validate AF_PACKET capture on the target CNI and node OS.
 - Pin CPU requests/limits after running `flowsketch bench --trace` on real
   cluster traffic.

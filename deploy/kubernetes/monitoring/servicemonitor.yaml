@@ -1,0 +1,17 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: flowsketch-gateway
+  labels:
+    app.kubernetes.io/name: flowsketch
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flowsketch
+      app.kubernetes.io/component: gateway
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

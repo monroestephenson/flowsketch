@@ -1,0 +1,51 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flowsketch
+  labels:
+    app.kubernetes.io/name: flowsketch
+spec:
+  groups:
+    - name: flowsketch-agent
+      rules:
+        - alert: FlowSketchPacketDrops
+          expr: >-
+            sum(rate(flowsketch_agent_kernel_dropped_packets_total[5m]))
+            + sum(rate(flowsketch_agent_dropped_events_total[5m])) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch is dropping observed traffic
+            description: Kernel or userspace drops have remained nonzero for two minutes.
+        - alert: FlowSketchAgentNotReady
+          expr: flowsketch_agent_ready == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch agent is not ready
+            description: A FlowSketch agent has not been ready for five minutes.
+        - alert: FlowSketchLateEvents
+          expr: increase(flowsketch_agent_late_events_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch rejected late events
+            description: Events arrived before the earliest open runtime window.
+    - name: flowsketch-gateway
+      rules:
+        - alert: FlowSketchGatewayPushFailures
+          expr: increase(flowsketch_agent_gateway_push_failures_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch gateway snapshot pushes are failing
+            description: At least one agent failed to push snapshots during the last ten minutes.
+        - alert: FlowSketchGatewayRejectedSnapshots
+          expr: increase(flowsketch_gateway_snapshots_rejected_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch gateway rejected snapshots
+            description: The gateway received incompatible or malformed sketch snapshots.

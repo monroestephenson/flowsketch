@@ -5,8 +5,10 @@ parse packets, apply cheap filters, and emit normalized header metadata.
 
 ## Contract
 
-The new `flowsketch-ebpf` crate defines `EbpfFlowEvent`, the userspace
-event contract a tc/XDP collector must produce:
+The `flowsketch-ebpf` crate defines the versioned, native-endian 56-byte
+`EbpfFlowEvent` ring-buffer contract a tc/XDP collector must produce. Its
+`#[repr(C)]` layout is padding-free, has explicit direction values, safely
+decodes unaligned byte slices, and rejects incompatible record sizes:
 
 - timestamp
 - IPv4/IPv6 source and destination
@@ -18,6 +20,9 @@ event contract a tc/XDP collector must produce:
 
 `EbpfFlowEvent` converts into `flowsketch_core::FlowEvent`, so the existing
 planner/runtime/exporter stack stays unchanged.
+
+The ABI is ready for a Linux producer/loader conformance fixture. No kernel
+program is loaded by this crate yet.
 
 ## Preferred phases
 

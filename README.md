@@ -27,8 +27,8 @@ Implemented today:
 | Sources | Synthetic pcap generation, pcap replay, Linux AF_PACKET live capture with socket-drop accounting |
 | Exports | Prometheus text output, HTTP `/metrics`, OTLP/HTTP+JSON metrics export |
 | Distributed merge | Agents can push FSK1 snapshots to a gateway, which validates and merges compatible windows |
-| Deployment prep | Dockerfile, systemd units, baseline Kubernetes manifests, CI on Ubuntu and macOS |
-| eBPF prep | `flowsketch-ebpf` contract crate and roadmap |
+| Deployment prep | Dockerfile, systemd, Kubernetes manifests, Prometheus Operator monitors/alerts, cross-platform CI |
+| eBPF prep | Versioned 56-byte ring-buffer ABI with safe decoding plus collector roadmap |
 
 Not implemented yet:
 
@@ -51,7 +51,7 @@ cargo test --workspace
 kubectl kustomize deploy/kubernetes
 ```
 
-The workspace test suite currently has 147 passing tests.
+The workspace test suite currently has 149 passing tests.
 
 ## Live Capture Today
 
@@ -98,6 +98,7 @@ Measured on a local Mac release build:
 | Projected cores for 100 Gb/s on that trace shape | 10.95 cores |
 | Merge-correct 8-shard runtime, 100G-normalized event time | 10.87M events/s median |
 | Projected aggregate capacity for that sharded runtime | 54.99 Gb/s |
+| GitHub Linux single-core projection | 12.10 Gb/s at 631.8-byte average packets |
 
 Interpretation:
 
@@ -1114,7 +1115,7 @@ claims.
 | M2: distributed v0 | node-local agents plus cluster merge | baseline done | snapshot push, compatibility validation, gateway `/metrics`, node inventory |
 | M3: 10 Gb/s projected path | 10 Gb/s mixed-packet projection within a CPU budget | local baseline done | `flowsketch bench --trace ... --profile 10g --core-budget 2` passes on representative traces |
 | M4: 10 Gb/s live Linux | real 10 Gb/s capture without silent loss | partial | AF_PACKET socket and userspace drop counters exist; dedicated-NIC replay, CPU profile, and exact replay comparison remain |
-| M5: Kubernetes v1 | normal platform-team deployment | partial | Helm, ServiceMonitor/PodMonitor, PrometheusRule, metadata enrichment, resource defaults |
+| M5: Kubernetes v1 | normal platform-team deployment | partial | raw deployment, ServiceMonitor/PodMonitor, PrometheusRule, and resource defaults exist; Helm and metadata enrichment remain |
 | M6: eBPF collector | production Linux ingest path | prepared | tc ingress program, ring-buffer drop counters, verifier-safe parser, userspace fallback |
 | M7: 25/40 Gb/s | serious infrastructure traffic | runtime partial | merge-correct sharded runtime and balanced dispatch exist; direct RSS queue mapping, CPU pinning, live replay, and p99 latency remain |
 | M8: 100 Gb/s mixed traffic | realistic 100G packet-size distribution | not done | XDP/eBPF or AF_XDP path, sharded userspace, live NIC validation, public benchmark report |
@@ -1407,7 +1408,7 @@ If the next work is about making FlowSketch more real, prioritize this order:
 2. Feed runtime shards directly from RSS/RX queues and add CPU affinity, avoiding the serial parser/dispatcher.
 3. Benchmark AF_PACKET, eBPF tc, and XDP on Linux with real CAIDA/MAWI-style traces and hardware replay where available.
 4. Add Kubernetes metadata enrichment for node, namespace, pod, service, and workload dimensions.
-5. Turn the manifests into a Helm chart and add ServiceMonitor, PodMonitor, and PrometheusRule templates.
+5. Turn the manifests and existing Prometheus Operator monitoring pack into a Helm chart.
 6. Add gateway HA strategy: sharding, leader election, replicated state, or explicit single-gateway semantics.
 7. Add auth/TLS guidance through mesh, reverse proxy, or collector-side deployment patterns.
 8. Publish Grafana dashboards and Datadog/OpenMetrics examples.

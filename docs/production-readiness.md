@@ -77,7 +77,9 @@ replay, direct RX-queue ingestion, CPU affinity, and zero unexplained drops.
 - Convert to Helm before multi-environment rollout.
 - Start from the optional gateway NetworkPolicy template and add explicit
   allow rules for node CIDRs and monitoring namespace/pod labels.
-- Add ServiceMonitor/PodMonitor if using Prometheus Operator.
+- Apply `deploy/kubernetes/monitoring` when using Prometheus Operator and
+  verify that its monitor/rule selectors include the `app.kubernetes.io/name`
+  label.
 - Tune resource requests/limits from benchmark data.
 - Consider node selectors/tolerations for high-throughput nodes.
 

@@ -80,6 +80,23 @@ Interpretation: current pcap parsing plus runtime query execution needs
 parallel capture, eBPF or XDP ingestion, and hardware validation before a
 credible 100 Gb/s live claim. The M3 two-core 10 Gb/s projection gate passes.
 
+## GitHub-hosted Linux projection
+
+The `linux-live.yml` workflow measured the generated 200,000-packet trace on
+a GitHub-hosted Linux runner:
+
+- average L3 packet size: 631.8 bytes
+- throughput: 2.39M events/s/core
+- projected capacity: 12.10 Gb/s/core
+- 10 Gb/s target: 1.98M events/s
+- projected cores for 10 Gb/s: 0.83
+- runtime estimates: 1300
+- late events: 0
+
+This passes the enforced M3 `--core-budget 2` projection gate. It is pcap
+replay on shared CI compute, not live 10 Gb/s capture or a stable hardware
+performance baseline.
+
 ## Sharded runtime projection
 
 The sharded runtime preloads parsed events, normalizes event time to the
