@@ -13,6 +13,8 @@ the items below as the gate to broad production rollout.
 - Run `cargo clippy --workspace --all-targets -- -D warnings`.
 - Run `cargo test --workspace`.
 - Run `cargo build --release -p flowsketch-cli`.
+- Run `scripts/validate-deploy.sh` to lint, package, and render all Helm and
+  Kustomize deployment profiles.
 
 ## Linux capture validation
 
@@ -74,7 +76,8 @@ replay, direct RX-queue ingestion, CPU affinity, and zero unexplained drops.
 ## Kubernetes
 
 - Start from `deploy/kubernetes/`.
-- Convert to Helm before multi-environment rollout.
+- Use `deploy/helm/flowsketch` for multi-environment rollout and keep image
+  tags immutable.
 - Start from the optional gateway NetworkPolicy template and add explicit
   allow rules for node CIDRs and monitoring namespace/pod labels.
 - Apply `deploy/kubernetes/monitoring` when using Prometheus Operator and

@@ -1,0 +1,27 @@
+{{- if and .Values.networkPolicy.enabled .Values.gateway.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "flowsketch.fullname" . }}-gateway-ingress
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "flowsketch.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "flowsketch.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: agent
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gateway.listenPort }}
+    {{- with .Values.networkPolicy.additionalGatewayIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

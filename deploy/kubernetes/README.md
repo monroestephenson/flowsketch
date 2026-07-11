@@ -1,6 +1,7 @@
 # Kubernetes deployment
 
-These manifests are a production-prep baseline, not a Helm chart. They run:
+These manifests are a fixed production-prep baseline. For configurable
+multi-environment installs, use `deploy/helm/flowsketch`. The baseline runs:
 
 - one `flowsketch-gateway` Deployment
 - one `flowsketch-agent` DaemonSet using Linux AF_PACKET capture
@@ -11,8 +12,8 @@ These manifests are a production-prep baseline, not a Helm chart. They run:
 ## Build and publish the image
 
 ```bash
-docker build -t ghcr.io/monroestephenson/flowsketch:latest .
-docker push ghcr.io/monroestephenson/flowsketch:latest
+docker build -t ghcr.io/monroestephenson/flowsketch:0.1.0 .
+docker push ghcr.io/monroestephenson/flowsketch:0.1.0
 ```
 
 Use a pinned immutable tag in production.
@@ -66,7 +67,6 @@ label transformer or Kustomize overlay.
 
 ## Production TODOs
 
-- Convert these manifests to a Helm chart with image/tag/resources values.
 - Validate AF_PACKET capture on the target CNI and node OS.
 - Pin CPU requests/limits after running `flowsketch bench --trace` on real
   cluster traffic.

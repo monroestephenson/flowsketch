@@ -27,7 +27,7 @@ Implemented today:
 | Sources | Synthetic pcap generation, pcap replay, Linux AF_PACKET live capture with socket-drop accounting |
 | Exports | Prometheus text output, HTTP `/metrics`, OTLP/HTTP+JSON metrics export |
 | Distributed merge | Agents can push FSK1 snapshots to a gateway, which validates and merges compatible windows |
-| Deployment prep | Dockerfile, systemd, Kubernetes manifests, Prometheus Operator monitors/alerts, cross-platform CI |
+| Deployment prep | Dockerfile, systemd, strict Helm chart/schema, Kustomize baseline, monitors/alerts, deployment CI |
 | eBPF prep | Versioned 56-byte ring-buffer ABI with safe decoding plus collector roadmap |
 
 Not implemented yet:
@@ -37,21 +37,22 @@ Not implemented yet:
 | eBPF tc/XDP collector | Needed for credible Linux production packet collection |
 | Parallel RX-queue ingest | Runtime shards exist; capture still needs direct RSS/RX-queue fan-out for 25/40/100 Gb/s |
 | eBPF ring/drop accounting | AF_PACKET kernel and userspace drops are counted; the future eBPF path needs equivalent counters |
-| Kubernetes CRD/operator/Helm chart | Needed for normal platform-team adoption |
+| Kubernetes CRD/operator | Needed for declarative query lifecycle and admission control |
 | Kubernetes metadata enrichment | Needed for namespace, pod, service, and workload queries |
 | Gateway HA/sharding | The gateway is currently an in-memory merge point |
 | Real 100 Gb/s validation | Current benchmarks are local projections, not live NIC proof |
 
-Most recent full code validation before this README-only rewrite:
+Current full validation commands:
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 kubectl kustomize deploy/kubernetes
+scripts/validate-deploy.sh
 ```
 
-The workspace test suite currently has 149 passing tests.
+The workspace test suite currently has 154 passing tests.
 
 ## Live Capture Today
 
@@ -288,6 +289,7 @@ flowsketch/
     queries/*.yaml
   deploy/
     kubernetes/
+    helm/flowsketch/
     systemd/
   docs/
     query-language.md
@@ -743,6 +745,7 @@ Current deployment assets:
 - `deploy/kubernetes/pdb.yaml`
 - `deploy/kubernetes/networkpolicy.yaml` as an optional template
 - `deploy/kubernetes/kustomization.yaml`
+- `deploy/helm/flowsketch` with strict values schema and optional monitoring
 
 Deploy the baseline manifests:
 
@@ -750,21 +753,41 @@ Deploy the baseline manifests:
 kubectl apply -k deploy/kubernetes
 ```
 
+Install the configurable production package:
+
+```bash
+helm upgrade --install flowsketch deploy/helm/flowsketch \
+  --namespace flowsketch --create-namespace \
+  --set image.tag=0.1.0 \
+  --set agent.interface=eth0
+```
+
+The chart rejects mutable `latest` tags, multiple replicas of the current
+in-memory gateway, mismatched agent/gateway hash seeds, missing external
+ServiceAccounts, and enabled OTLP without an endpoint. See
+[`deploy/helm/flowsketch/README.md`](deploy/helm/flowsketch/README.md).
+
 The optional NetworkPolicy must be reviewed before use. The agent uses
 `hostNetwork: true`, and some CNIs classify that traffic by node IP rather
 than pod labels.
 
-Future Kubernetes surface:
+Implemented Kubernetes surface:
 
 ```text
 flowsketch-agent DaemonSet
 flowsketch-gateway Deployment
-flowsketch-operator Deployment
-SketchQuery CRD
 Helm chart
-Grafana dashboards
 PrometheusRule templates
 ServiceMonitor / PodMonitor templates
+```
+
+Future Kubernetes control-plane surface:
+
+```text
+flowsketch-operator Deployment
+SketchQuery CRD
+Kubernetes metadata enrichment
+Grafana dashboards
 ```
 
 Future CRD shape:
@@ -959,7 +982,7 @@ Grafana would want:
 - Prometheus recording rules
 - Mimir-compatible metrics
 - Loki anomaly-event export later
-- Helm chart and Kubernetes dashboards
+- Helm-integrated Kubernetes dashboards
 
 Dashboards to ship:
 
@@ -1115,7 +1138,7 @@ claims.
 | M2: distributed v0 | node-local agents plus cluster merge | baseline done | snapshot push, compatibility validation, gateway `/metrics`, node inventory |
 | M3: 10 Gb/s projected path | 10 Gb/s mixed-packet projection within a CPU budget | local baseline done | `flowsketch bench --trace ... --profile 10g --core-budget 2` passes on representative traces |
 | M4: 10 Gb/s live Linux | real 10 Gb/s capture without silent loss | partial | AF_PACKET socket and userspace drop counters exist; dedicated-NIC replay, CPU profile, and exact replay comparison remain |
-| M5: Kubernetes v1 | normal platform-team deployment | partial | raw deployment, ServiceMonitor/PodMonitor, PrometheusRule, and resource defaults exist; Helm and metadata enrichment remain |
+| M5: Kubernetes v1 | normal platform-team deployment | packaging done, control plane partial | strict Helm schema, hardened workloads, monitors/alerts, render CI, and resource defaults exist; metadata enrichment and operator/CRD remain |
 | M6: eBPF collector | production Linux ingest path | prepared | tc ingress program, ring-buffer drop counters, verifier-safe parser, userspace fallback |
 | M7: 25/40 Gb/s | serious infrastructure traffic | runtime partial | merge-correct sharded runtime and balanced dispatch exist; direct RSS queue mapping, CPU pinning, live replay, and p99 latency remain |
 | M8: 100 Gb/s mixed traffic | realistic 100G packet-size distribution | not done | XDP/eBPF or AF_XDP path, sharded userspace, live NIC validation, public benchmark report |
@@ -1239,7 +1262,8 @@ TLS/auth story through sidecar, mesh, or collector
 
 ### Phase 5: Kubernetes-Native MVP
 
-Partially implemented through raw manifests.
+Deployment packaging is implemented; the query control plane remains future
+work.
 
 Implemented:
 
@@ -1251,18 +1275,20 @@ agent DaemonSet
 gateway Deployment and Service
 PodDisruptionBudget
 optional NetworkPolicy template
+strict Helm chart and values schema
+immutable default image tag
+ServiceMonitor / PodMonitor
+PrometheusRule alerts
+deployment render/lint CI
 ```
 
 Still needed:
 
 ```text
-Helm chart
-ServiceMonitor / PodMonitor
 SketchQuery CRD
 operator
 Kubernetes metadata enrichment
 Grafana dashboards
-PrometheusRule templates
 ```
 
 ### Phase 6: eBPF Collector
@@ -1383,7 +1409,7 @@ What is solid:
 - bounded HTTP handling in agent/gateway paths
 - snapshot format and merge compatibility checks
 - cross-platform developer CI
-- Docker/systemd/Kubernetes starting points
+- Docker/systemd packaging and validated Helm/Kustomize deployment surfaces
 
 What is missing before a production v1:
 
@@ -1393,10 +1419,10 @@ What is missing before a production v1:
 - direct parallel RX-queue ingestion and CPU affinity (runtime execution is sharded)
 - gateway HA/sharding or clear single-writer semantics
 - TLS/auth/deployment guidance for non-local HTTP endpoints
-- Kubernetes metadata, Helm, CRD, and operator
+- Kubernetes metadata, CRD, and operator
 - real trace benchmark suite using legally available traces
 - live 10/25/40/100 Gb/s validation on actual NICs
-- dashboards, alerts, and runbooks
+- dashboards and operational runbooks
 
 See [`docs/production-readiness.md`](docs/production-readiness.md).
 
@@ -1408,7 +1434,7 @@ If the next work is about making FlowSketch more real, prioritize this order:
 2. Feed runtime shards directly from RSS/RX queues and add CPU affinity, avoiding the serial parser/dispatcher.
 3. Benchmark AF_PACKET, eBPF tc, and XDP on Linux with real CAIDA/MAWI-style traces and hardware replay where available.
 4. Add Kubernetes metadata enrichment for node, namespace, pod, service, and workload dimensions.
-5. Turn the manifests and existing Prometheus Operator monitoring pack into a Helm chart.
+5. Publish signed chart/release artifacts and a versioned upgrade test matrix.
 6. Add gateway HA strategy: sharding, leader election, replicated state, or explicit single-gateway semantics.
 7. Add auth/TLS guidance through mesh, reverse proxy, or collector-side deployment patterns.
 8. Publish Grafana dashboards and Datadog/OpenMetrics examples.
@@ -1501,7 +1527,7 @@ The practical order remains:
 6. flowsketch-agent
 7. flowsketch-otel
 8. flowsketch-gateway
-9. Kubernetes metadata and Helm
+9. Kubernetes metadata and operator/CRD
 10. eBPF tc/XDP collector
 11. planner v1 expansion
 12. Hubble, Datadog, Grafana, ClickHouse, Kafka

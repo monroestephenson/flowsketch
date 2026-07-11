@@ -295,4 +295,26 @@ mod tests {
             let _ = parse_packet(linktype::ETHERNET, &frame[..cut]);
         }
     }
+
+    #[test]
+    fn deterministic_arbitrary_frames_do_not_panic() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for len in 0..512usize {
+            let mut frame = vec![0; len];
+            for byte in &mut frame {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            for link in [
+                linktype::ETHERNET,
+                linktype::RAW_IP,
+                linktype::LINUX_SLL,
+                u32::MAX,
+            ] {
+                let _ = parse_packet(link, &frame);
+            }
+        }
+    }
 }

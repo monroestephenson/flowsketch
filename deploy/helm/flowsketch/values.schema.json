@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["image", "agent", "gateway", "serviceAccounts", "monitoring", "networkPolicy", "queries"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1, "not": {"const": "latest"}},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "interface", "listenPort", "hostPort", "seed", "flushIntervalMs", "runtimeShards", "runtimeBatchSize", "runtimeShardStrategy", "gatewayPush", "otlp", "updateStrategy", "podAnnotations", "podLabels", "priorityClassName", "nodeSelector", "tolerations", "affinity", "resources"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "interface": {"type": "string", "minLength": 1},
+        "listenPort": {"type": "integer", "minimum": 1024, "maximum": 65535},
+        "hostPort": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "seed": {"type": "integer", "minimum": 0},
+        "flushIntervalMs": {"type": "integer", "minimum": 10},
+        "runtimeShards": {"type": "integer", "minimum": 1, "maximum": 256},
+        "runtimeBatchSize": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "runtimeShardStrategy": {"enum": ["flow", "round_robin"]},
+        "gatewayPush": {"$ref": "#/definitions/gatewayPush"},
+        "otlp": {"$ref": "#/definitions/otlp"},
+        "updateStrategy": {"type": "object"},
+        "podAnnotations": {"type": "object"},
+        "podLabels": {"type": "object"},
+        "priorityClassName": {"type": "string"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"},
+        "resources": {"type": "object"}
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "replicas", "listenPort", "seed", "staleAfterMs", "podAnnotations", "podLabels", "priorityClassName", "nodeSelector", "tolerations", "affinity", "service", "podDisruptionBudget", "resources"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicas": {"type": "integer", "const": 1},
+        "listenPort": {"type": "integer", "minimum": 1024, "maximum": 65535},
+        "seed": {"type": "integer", "minimum": 0},
+        "staleAfterMs": {"type": "integer", "minimum": 1000},
+        "podAnnotations": {"type": "object"},
+        "podLabels": {"type": "object"},
+        "priorityClassName": {"type": "string"},
+        "nodeSelector": {"type": "object"},
+        "tolerations": {"type": "array"},
+        "affinity": {"type": "object"},
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "annotations"],
+          "properties": {
+            "type": {"enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+            "annotations": {"type": "object"}
+          }
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "minAvailable"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "minAvailable": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "string"}]}
+          }
+        },
+        "resources": {"type": "object"}
+      }
+    },
+    "serviceAccounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "gateway"],
+      "properties": {
+        "agent": {"$ref": "#/definitions/serviceAccount"},
+        "gateway": {"$ref": "#/definitions/serviceAccount"}
+      }
+    },
+    "monitoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "interval", "scrapeTimeout", "labels", "rules"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "interval": {"type": "string", "pattern": "^[1-9][0-9]*[smh]$"},
+        "scrapeTimeout": {"type": "string", "pattern": "^[1-9][0-9]*[smh]$"},
+        "labels": {"type": "object"},
+        "rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "severity"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "severity": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "additionalGatewayIngress"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "additionalGatewayIngress": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "queries": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "string", "minLength": 1},
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9.-]*\\.ya?ml$"}
+    }
+  },
+  "definitions": {
+    "gatewayPush": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "intervalMs"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "intervalMs": {"type": "integer", "minimum": 100}
+      }
+    },
+    "otlp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "endpoint", "intervalMs"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "endpoint": {"type": "string"},
+        "intervalMs": {"type": "integer", "minimum": 100}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object"}
+      }
+    }
+  }
+}

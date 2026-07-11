@@ -1377,6 +1377,118 @@ mod tests {
     }
 
     #[test]
+    fn shard_strategies_match_single_engine_across_sliding_windows() {
+        let yaml = "name: counts\nwindow: {size: 30s, slide: 10s}\n\
+                    groupBy: [protocol]\nmeasure: {type: count}\n";
+        let hash = HashSpec::new(91);
+        let planned = plan(parse_query_yaml(yaml).unwrap(), &hash).unwrap();
+        let mut events = Vec::new();
+        for i in 0..3_000u64 {
+            let mut item = event(
+                i / 30,
+                &format!("10.{}.{}.{}", (i / 65_536) % 256, (i / 256) % 256, i % 256),
+                "192.0.2.1",
+                1_000 + (i % 100) as u16,
+                64 + (i % 1_400) as u32,
+            );
+            item.protocol = [6, 17, 1][i as usize % 3];
+            // Deterministic, bounded disorder spanning some batch boundaries.
+            if i > 0 && i % 97 == 0 {
+                item.ts_nanos = item.ts_nanos.saturating_sub(1_000_000_000);
+            }
+            events.push(item);
+        }
+
+        let signature = |estimates: Vec<SketchEstimate>| {
+            estimates
+                .into_iter()
+                .map(|estimate| {
+                    (
+                        (
+                            estimate.window_start_nanos,
+                            estimate.window_end_nanos,
+                            estimate.group,
+                        ),
+                        (estimate.estimate as u64, estimate.update_count),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        let mut single = QueryEngine::new(vec![planned.clone()], hash).unwrap();
+        for item in &events {
+            single.process(item).unwrap();
+        }
+        single.finish().unwrap();
+        let expected = signature(single.take_estimates());
+
+        for strategy in [ShardStrategy::Flow, ShardStrategy::RoundRobin] {
+            let mut sharded = ShardedQueryEngine::new(vec![planned.clone()], hash, 7).unwrap();
+            for batch in events.chunks(73) {
+                sharded
+                    .process_batch_with_strategy(batch, strategy)
+                    .unwrap();
+            }
+            sharded.finish().unwrap();
+            assert_eq!(
+                signature(sharded.take_estimates().unwrap()),
+                expected,
+                "{strategy:?} sharding changed query results"
+            );
+            assert_eq!(sharded.late_events(), single.late_events());
+        }
+    }
+
+    #[test]
+    fn long_running_shards_stay_inside_planned_memory_budget() {
+        let yaml = "name: bounded\nwindow: {size: 60s, slide: 10s}\n\
+                    groupBy: [src.ip]\n\
+                    measure: {type: heavy_hitters, value: bytes, limit: 20}\n\
+                    resources: {maxMemory: 16MiB}\n";
+        let hash = HashSpec::new(17);
+        let planned = plan(parse_query_yaml(yaml).unwrap(), &hash).unwrap();
+        let shard_count = 4usize;
+        let memory_limit = planned.physical.estimated_memory_bytes * shard_count as u64;
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, shard_count).unwrap();
+        let events: Vec<_> = (0..20_000u64)
+            .map(|i| {
+                event(
+                    i / 10,
+                    &format!("10.0.{}.{}", (i / 250) % 200, i % 250 + 1),
+                    "192.0.2.1",
+                    443,
+                    100 + (i % 1_400) as u32,
+                )
+            })
+            .collect();
+
+        for batch in events.chunks(128) {
+            engine
+                .process_batch_with_strategy(batch, ShardStrategy::RoundRobin)
+                .unwrap();
+            let _ = engine.take_estimates().unwrap();
+            assert!(
+                engine.sketch_memory_bytes() as u64 <= memory_limit,
+                "runtime used {} bytes above planned shard budget {memory_limit}",
+                engine.sketch_memory_bytes()
+            );
+        }
+        engine.finish().unwrap();
+        let _ = engine.take_estimates().unwrap();
+        assert_eq!(engine.events_processed(), events.len() as u64);
+        assert_eq!(engine.late_events(), 0);
+    }
+
+    #[test]
+    fn sharded_engine_rejects_duplicate_query_names() {
+        let yaml =
+            "name: duplicate\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";
+        let hash = HashSpec::new(7);
+        let planned = plan(parse_query_yaml(yaml).unwrap(), &hash).unwrap();
+        assert!(ShardedQueryEngine::new(vec![planned.clone(), planned], hash, 2).is_err());
+    }
+
+    #[test]
     fn filter_excludes_non_matching_traffic() {
         let mut eng = engine_for(
             "name: f\nwindow: {size: 60s}\nmatch: {protocol: udp}\ngroupBy: [protocol]\n\

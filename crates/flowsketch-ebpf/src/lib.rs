@@ -223,10 +223,15 @@ mod tests {
 
     #[test]
     fn wire_decoder_rejects_wrong_size_and_direction() {
-        assert!(matches!(
-            EbpfFlowEvent::decode_ne(&[0; EBPF_FLOW_EVENT_SIZE - 1]),
-            Err(EbpfError::InvalidRecordSize { .. })
-        ));
+        for len in 0..=EBPF_FLOW_EVENT_SIZE * 2 {
+            if len == EBPF_FLOW_EVENT_SIZE {
+                continue;
+            }
+            assert!(matches!(
+                EbpfFlowEvent::decode_ne(&vec![0; len]),
+                Err(EbpfError::InvalidRecordSize { .. })
+            ));
+        }
         let mut encoded = EbpfFlowEvent {
             ts_nanos: 0,
             src_ip: [0; 16],

@@ -7,7 +7,8 @@ offline `merge-snapshots` primitive and the live cluster gateway
 
 For deployment hardening and rollout gates, see
 `docs/production-readiness.md`. For Kubernetes manifests, see
-`deploy/kubernetes/`. For the eBPF collector contract and roadmap, see
+`deploy/kubernetes/`; use `deploy/helm/flowsketch` for configurable production
+installs. For the eBPF collector contract and roadmap, see
 `docs/ebpf-roadmap.md`.
 
 ## Build

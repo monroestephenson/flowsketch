@@ -1,0 +1,19 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "flowsketch.fullname" . }}-gateway
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+data:
+  gateway.yaml: |
+    gateway:
+      listen: 0.0.0.0:{{ .Values.gateway.listenPort }}
+      seed: {{ .Values.gateway.seed }}
+      staleAfterMs: {{ .Values.gateway.staleAfterMs }}
+    queries:
+      {{- range $name, $_ := .Values.queries }}
+      - file: /etc/flowsketch/queries/{{ $name }}
+      {{- end }}
+{{- end }}

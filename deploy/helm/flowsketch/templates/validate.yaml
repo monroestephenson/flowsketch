@@ -1,0 +1,12 @@
+{{- if and (not .Values.agent.enabled) (not .Values.gateway.enabled) -}}
+{{- fail "at least one of agent.enabled or gateway.enabled must be true" -}}
+{{- end -}}
+{{- if and .Values.agent.enabled .Values.gateway.enabled .Values.agent.gatewayPush.enabled (ne (toString .Values.agent.seed) (toString .Values.gateway.seed)) -}}
+{{- fail "agent.seed and gateway.seed must match when gateway push is enabled" -}}
+{{- end -}}
+{{- if and .Values.agent.enabled (not .Values.serviceAccounts.agent.create) (empty .Values.serviceAccounts.agent.name) -}}
+{{- fail "serviceAccounts.agent.name is required when create=false" -}}
+{{- end -}}
+{{- if and .Values.gateway.enabled (not .Values.serviceAccounts.gateway.create) (empty .Values.serviceAccounts.gateway.name) -}}
+{{- fail "serviceAccounts.gateway.name is required when create=false" -}}
+{{- end -}}

@@ -27,7 +27,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          image: ghcr.io/monroestephenson/flowsketch:latest
+          image: ghcr.io/monroestephenson/flowsketch:0.1.0
           imagePullPolicy: IfNotPresent
           args: ["gateway", "--config", "/etc/flowsketch/config/gateway.yaml"]
           ports:

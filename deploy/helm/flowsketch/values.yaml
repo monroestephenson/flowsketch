@@ -1,0 +1,122 @@
+image:
+  repository: ghcr.io/monroestephenson/flowsketch
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+agent:
+  enabled: true
+  interface: eth0
+  listenPort: 9464
+  hostPort: 9464
+  seed: 0
+  flushIntervalMs: 1000
+  runtimeShards: 1
+  runtimeBatchSize: 4096
+  runtimeShardStrategy: flow
+  gatewayPush:
+    enabled: true
+    intervalMs: 5000
+  otlp:
+    enabled: false
+    endpoint: ""
+    intervalMs: 5000
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "4"
+      memory: 2Gi
+
+gateway:
+  enabled: true
+  replicas: 1
+  listenPort: 9465
+  seed: 0
+  staleAfterMs: 300000
+  podAnnotations: {}
+  podLabels: {}
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  service:
+    type: ClusterIP
+    annotations: {}
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+
+serviceAccounts:
+  agent:
+    create: true
+    name: ""
+    annotations: {}
+  gateway:
+    create: true
+    name: ""
+    annotations: {}
+
+monitoring:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  rules:
+    enabled: true
+    severity: warning
+
+networkPolicy:
+  enabled: false
+  additionalGatewayIngress: []
+
+queries:
+  top-talkers.yaml: |
+    name: top_talkers
+    window:
+      size: 60s
+      slide: 10s
+    groupBy: [src.ip, dst.ip]
+    measure:
+      type: heavy_hitters
+      value: bytes
+      limit: 100
+      error: {epsilon: 0.001}
+    export: {prometheus: true, maxSeries: 100}
+    resources: {maxMemory: 64MiB}
+  suspected-scanners.yaml: |
+    name: suspected_scanners
+    window:
+      size: 60s
+      slide: 10s
+    match:
+      protocol: tcp
+      dst.port: [22, 80, 443, 5432, 6379]
+    groupBy: [src.ip]
+    measure:
+      type: distinct_count
+      field: dst.ip
+      error: {epsilon: 0.02}
+    alertIf: {gt: 500}
+    export: {prometheus: true, maxSeries: 500}
+    resources: {maxMemory: 64MiB}

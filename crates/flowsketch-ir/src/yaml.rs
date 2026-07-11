@@ -603,4 +603,28 @@ resources:
         assert_eq!(parse_memory("1GiB").unwrap(), 1 << 30);
         assert!(parse_memory("64MB").is_err());
     }
+
+    #[test]
+    fn helm_default_queries_are_valid_and_uniquely_named() {
+        let values = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/helm/flowsketch/values.yaml");
+        let yaml = std::fs::read_to_string(&values).unwrap();
+        let document: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let queries = document["queries"]
+            .as_mapping()
+            .expect("chart values must contain a queries map");
+        assert!(!queries.is_empty());
+        let mut names = std::collections::BTreeSet::new();
+        for (filename, source) in queries {
+            let filename = filename.as_str().expect("query filename must be text");
+            let source = source.as_str().expect("query source must be text");
+            let query = parse_query_yaml(source)
+                .unwrap_or_else(|error| panic!("invalid Helm query {filename}: {error}"));
+            assert!(
+                names.insert(query.name.clone()),
+                "duplicate Helm query name {:?}",
+                query.name
+            );
+        }
+    }
 }

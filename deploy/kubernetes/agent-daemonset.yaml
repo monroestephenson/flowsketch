@@ -25,11 +25,15 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: agent
-          image: ghcr.io/monroestephenson/flowsketch:latest
+          image: ghcr.io/monroestephenson/flowsketch:0.1.0
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "/etc/flowsketch/config/start-agent.sh"]
           env:
@@ -46,8 +50,6 @@ spec:
             capabilities:
               add: ["NET_RAW"]
               drop: ["ALL"]
-            runAsUser: 0
-            runAsGroup: 0
             readOnlyRootFilesystem: true
           readinessProbe:
             httpGet:

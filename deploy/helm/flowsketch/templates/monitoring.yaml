@@ -1,0 +1,105 @@
+{{- if .Values.monitoring.enabled }}
+{{- if .Values.agent.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "flowsketch.fullname" . }}-agent
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "flowsketch.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: agent
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.monitoring.interval }}
+      scrapeTimeout: {{ .Values.monitoring.scrapeTimeout }}
+      relabelings:
+        - targetLabel: flowsketch_release
+          replacement: {{ .Release.Name | quote }}
+{{- end }}
+{{- if and .Values.agent.enabled .Values.gateway.enabled }}
+---
+{{- end }}
+{{- if .Values.gateway.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "flowsketch.fullname" . }}-gateway
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "flowsketch.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.monitoring.interval }}
+      scrapeTimeout: {{ .Values.monitoring.scrapeTimeout }}
+      relabelings:
+        - targetLabel: flowsketch_release
+          replacement: {{ .Release.Name | quote }}
+{{- end }}
+{{- if .Values.monitoring.rules.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "flowsketch.fullname" . }}
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: flowsketch-agent
+      rules:
+        - alert: FlowSketchPacketDrops
+          expr: sum(rate(flowsketch_agent_kernel_dropped_packets_total{flowsketch_release="{{ .Release.Name }}"}[5m])) + sum(rate(flowsketch_agent_dropped_events_total{flowsketch_release="{{ .Release.Name }}"}[5m])) > 0
+          for: 2m
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch is dropping observed traffic
+            description: Kernel or userspace drops have remained nonzero for two minutes.
+        - alert: FlowSketchAgentNotReady
+          expr: flowsketch_agent_ready{flowsketch_release="{{ .Release.Name }}"} == 0
+          for: 5m
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch agent is not ready
+            description: A FlowSketch agent has not been ready for five minutes.
+        - alert: FlowSketchLateEvents
+          expr: increase(flowsketch_agent_late_events_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch rejected late events
+            description: Events arrived before the earliest open runtime window.
+    - name: flowsketch-gateway
+      rules:
+        - alert: FlowSketchGatewayPushFailures
+          expr: increase(flowsketch_agent_gateway_push_failures_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch gateway snapshot pushes are failing
+            description: At least one agent failed to push snapshots during the last ten minutes.
+        - alert: FlowSketchGatewayRejectedSnapshots
+          expr: increase(flowsketch_gateway_snapshots_rejected_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch gateway rejected snapshots
+            description: The gateway received incompatible or malformed sketch snapshots.
+{{- end }}
+{{- end }}

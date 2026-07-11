@@ -1,0 +1,45 @@
+{{- if .Values.agent.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "flowsketch.fullname" . }}-agent
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+data:
+  agent.yaml.template: |
+    agent:
+      nodeName: ${NODE_NAME}
+      listen: 0.0.0.0:{{ .Values.agent.listenPort }}
+      seed: {{ .Values.agent.seed }}
+      flushIntervalMs: {{ .Values.agent.flushIntervalMs }}
+      runtimeShards: {{ .Values.agent.runtimeShards }}
+      runtimeBatchSize: {{ .Values.agent.runtimeBatchSize }}
+      runtimeShardStrategy: {{ .Values.agent.runtimeShardStrategy }}
+      source:
+        kind: af_packet
+        interface: {{ .Values.agent.interface }}
+    queries:
+      {{- range $name, $_ := .Values.queries }}
+      - file: /etc/flowsketch/queries/{{ $name }}
+      {{- end }}
+    {{- if or (and .Values.gateway.enabled .Values.agent.gatewayPush.enabled) .Values.agent.otlp.enabled }}
+    export:
+      {{- if and .Values.gateway.enabled .Values.agent.gatewayPush.enabled }}
+      gateway:
+        endpoint: http://{{ include "flowsketch.fullname" . }}-gateway:{{ .Values.gateway.listenPort }}
+        intervalMs: {{ .Values.agent.gatewayPush.intervalMs }}
+      {{- end }}
+      {{- if .Values.agent.otlp.enabled }}
+      otlp:
+        endpoint: {{ required "agent.otlp.endpoint is required when OTLP is enabled" .Values.agent.otlp.endpoint }}
+        intervalMs: {{ .Values.agent.otlp.intervalMs }}
+      {{- end }}
+    {{- end }}
+  start-agent.sh: |
+    #!/bin/sh
+    set -eu
+    sed "s|\${NODE_NAME}|${NODE_NAME}|g" \
+      /etc/flowsketch/config/agent.yaml.template > /tmp/flowsketch-agent.yaml
+    exec /usr/local/bin/flowsketch agent --config /tmp/flowsketch-agent.yaml
+{{- end }}

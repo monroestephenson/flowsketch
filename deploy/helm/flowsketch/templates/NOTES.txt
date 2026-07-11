@@ -1,0 +1,13 @@
+FlowSketch {{ .Chart.AppVersion }} is configured in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.agent.enabled }}
+Agents run as a host-networked DaemonSet and capture {{ .Values.agent.interface }} with AF_PACKET.
+Check agent readiness:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=agent
+{{- end }}
+{{- if .Values.gateway.enabled }}
+Forward the gateway metrics endpoint:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "flowsketch.fullname" . }}-gateway {{ .Values.gateway.listenPort }}:{{ .Values.gateway.listenPort }}
+{{- end }}
+
+Review kernel and userspace drop counters before relying on estimates.
