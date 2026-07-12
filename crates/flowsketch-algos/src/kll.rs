@@ -24,6 +24,7 @@ pub const ALGORITHM: &str = "kll";
 const CAPACITY_DECAY_NUM: usize = 2;
 const CAPACITY_DECAY_DEN: usize = 3;
 const MIN_LEVEL_CAPACITY: usize = 8;
+const MAX_LEVELS: usize = u64::BITS as usize;
 
 #[derive(Debug, Clone)]
 pub struct KllSketch {
@@ -196,15 +197,35 @@ impl KllSketch {
             return Err(SketchError::Snapshot("not a kll snapshot".into()));
         }
         let mut p = Reader::new(&params);
-        let k = p.u64()? as usize;
+        let encoded_k = p.u64()?;
+        let k = usize::try_from(encoded_k).map_err(|_| {
+            SketchError::Snapshot(format!(
+                "kll snapshot k {encoded_k} does not fit this platform"
+            ))
+        })?;
+        if k < MIN_LEVEL_CAPACITY {
+            return Err(SketchError::Snapshot(format!(
+                "kll snapshot k must be >= {MIN_LEVEL_CAPACITY}, got {k}"
+            )));
+        }
         let mut r = Reader::new(&payload);
         let n = r.u64()?;
         let rng_state = r.u64()?;
         let updates = r.u64()?;
         let num_levels = r.u32()? as usize;
+        if num_levels > MAX_LEVELS {
+            return Err(SketchError::Snapshot(format!(
+                "kll snapshot has {num_levels} levels, maximum is {MAX_LEVELS}"
+            )));
+        }
+        // Each level needs at least its u32 length prefix; each item is a
+        // u64. Bounding declared counts by the remaining payload keeps a
+        // hostile snapshot from forcing huge preallocations.
+        r.check_count(num_levels, 4)?;
         let mut levels = Vec::with_capacity(num_levels);
         for _ in 0..num_levels {
             let len = r.u32()? as usize;
+            r.check_count(len, 8)?;
             let mut level = Vec::with_capacity(len);
             for _ in 0..len {
                 level.push(r.u64()?);
@@ -364,6 +385,38 @@ mod tests {
             assert_eq!(s.quantile(q), s2.quantile(q));
         }
         assert_eq!(s.n(), s2.n());
+    }
+
+    #[test]
+    fn hostile_snapshot_counts_are_rejected() {
+        let craft = |k: u64, num_levels: u32, level_len: u32| {
+            let mut params = Writer::new();
+            params.u64(k);
+            let mut payload = Writer::new();
+            payload.u64(0); // n
+            payload.u64(0); // rng_state
+            payload.u64(0); // updates
+            payload.u32(num_levels);
+            payload.u32(level_len);
+            write_snapshot(
+                &SnapshotHeader {
+                    version: SNAPSHOT_VERSION,
+                    algorithm_id: algorithm_id::KLL,
+                    hash: HashSpec::new(1),
+                    window_start_nanos: 0,
+                    window_end_nanos: 0,
+                },
+                &params.buf,
+                &payload.buf,
+            )
+        };
+        // k below the constructor's floor, a level count and an item count
+        // the payload cannot back: all rejected before allocation.
+        assert!(KllSketch::from_snapshot(&craft(1, 1, 0)).is_err());
+        let err = KllSketch::from_snapshot(&craft(64, (MAX_LEVELS + 1) as u32, 0)).unwrap_err();
+        assert!(err.to_string().contains("levels"), "{err}");
+        assert!(KllSketch::from_snapshot(&craft(64, u32::MAX, 0)).is_err());
+        assert!(KllSketch::from_snapshot(&craft(64, 1, u32::MAX)).is_err());
     }
 
     #[test]

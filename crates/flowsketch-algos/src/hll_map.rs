@@ -182,16 +182,54 @@ impl HllMap {
             return Err(SketchError::Snapshot("not an hllmap snapshot".into()));
         }
         let mut p = Reader::new(&params);
-        let max_keys = p.u64()? as usize;
+        let encoded_max_keys = p.u64()?;
+        let max_keys = usize::try_from(encoded_max_keys).map_err(|_| {
+            SketchError::Snapshot(format!(
+                "hllmap snapshot max_keys {encoded_max_keys} does not fit this platform"
+            ))
+        })?;
         let precision = p.u8()?;
+        if max_keys == 0 {
+            return Err(SketchError::Snapshot(
+                "hllmap snapshot max_keys must be positive".into(),
+            ));
+        }
+        // Re-establish the constructor's precision invariant; the map's own
+        // error math shifts by `precision` too, not just the inner HLLs.
+        if !(crate::hll::MIN_PRECISION..=crate::hll::MAX_PRECISION).contains(&precision) {
+            return Err(SketchError::Snapshot(format!(
+                "hllmap snapshot precision must be in [{}, {}], got {precision}",
+                crate::hll::MIN_PRECISION,
+                crate::hll::MAX_PRECISION
+            )));
+        }
         let mut r = Reader::new(&payload);
         let updates = r.u64()?;
         let evicted_keys = r.u64()?;
         let n = r.u32()? as usize;
+        if n > max_keys {
+            return Err(SketchError::Snapshot(format!(
+                "hllmap snapshot entry count {n} exceeds max_keys {max_keys}"
+            )));
+        }
+        // Each entry encodes at least two u32 length prefixes (key + inner
+        // HLL snapshot).
+        r.check_count(n, 4 + 4)?;
         let mut map = HashMap::with_capacity(n);
         for _ in 0..n {
             let key = r.lp_bytes()?.to_vec();
             let hll = HyperLogLog::from_snapshot(r.lp_bytes()?)?;
+            if hll.precision() != precision {
+                return Err(SketchError::Snapshot(format!(
+                    "hllmap inner hll precision {} does not match outer precision {precision}",
+                    hll.precision()
+                )));
+            }
+            if hll.compatibility().hash != header.hash {
+                return Err(SketchError::Snapshot(
+                    "hllmap inner hll hash does not match outer hash".into(),
+                ));
+            }
             let cached_cardinality = hll.cardinality();
             map.insert(
                 key,
@@ -343,6 +381,72 @@ mod tests {
         let k = a.cardinality(b"k").unwrap();
         assert!((k - 1_000.0).abs() / 1_000.0 < 0.1, "union cardinality {k}");
         assert!(a.cardinality(b"only-b").is_some());
+    }
+
+    #[test]
+    fn hostile_snapshot_params_are_rejected() {
+        let craft = |max_keys: u64, precision: u8, n: u32| {
+            let mut params = Writer::new();
+            params.u64(max_keys);
+            params.u8(precision);
+            let mut payload = Writer::new();
+            payload.u64(0); // updates
+            payload.u64(0); // evicted_keys
+            payload.u32(n);
+            write_snapshot(
+                &SnapshotHeader {
+                    version: SNAPSHOT_VERSION,
+                    algorithm_id: algorithm_id::HLL_MAP,
+                    hash: HashSpec::new(1),
+                    window_start_nanos: 0,
+                    window_end_nanos: 0,
+                },
+                &params.buf,
+                &payload.buf,
+            )
+        };
+        assert!(HllMap::from_snapshot(&craft(0, 12, 0)).is_err());
+        assert!(HllMap::from_snapshot(&craft(10, 200, 0)).is_err());
+        let err = HllMap::from_snapshot(&craft(1, 12, 2)).unwrap_err();
+        assert!(err.to_string().contains("exceeds max_keys"), "{err}");
+        assert!(HllMap::from_snapshot(&craft(10, 12, u32::MAX)).is_err());
+    }
+
+    #[test]
+    fn mismatched_inner_hll_params_are_rejected() {
+        let outer_hash = HashSpec::new(1);
+        let craft = |inner: Vec<u8>| {
+            let mut params = Writer::new();
+            params.u64(1);
+            params.u8(12);
+            let mut payload = Writer::new();
+            payload.u64(0); // updates
+            payload.u64(0); // evicted_keys
+            payload.u32(1);
+            payload.lp_bytes(b"key");
+            payload.lp_bytes(&inner);
+            write_snapshot(
+                &SnapshotHeader {
+                    version: SNAPSHOT_VERSION,
+                    algorithm_id: algorithm_id::HLL_MAP,
+                    hash: outer_hash,
+                    window_start_nanos: 0,
+                    window_end_nanos: 0,
+                },
+                &params.buf,
+                &payload.buf,
+            )
+        };
+
+        let wrong_precision = HyperLogLog::new(10, outer_hash).unwrap().to_snapshot(0, 0);
+        let err = HllMap::from_snapshot(&craft(wrong_precision)).unwrap_err();
+        assert!(err.to_string().contains("precision"), "{err}");
+
+        let wrong_hash = HyperLogLog::new(12, HashSpec::new(2))
+            .unwrap()
+            .to_snapshot(0, 0);
+        let err = HllMap::from_snapshot(&craft(wrong_hash)).unwrap_err();
+        assert!(err.to_string().contains("hash"), "{err}");
     }
 
     #[test]

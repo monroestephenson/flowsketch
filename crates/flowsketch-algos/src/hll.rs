@@ -120,9 +120,25 @@ impl HyperLogLog {
         }
         let mut p = Reader::new(&params);
         let precision = p.u8()?;
+        // Re-establish the constructor's invariant: an out-of-range
+        // precision from a hostile snapshot would otherwise drive the
+        // `1 << precision` register math out of `usize`.
+        if !(MIN_PRECISION..=MAX_PRECISION).contains(&precision) {
+            return Err(SketchError::Snapshot(format!(
+                "hll snapshot precision must be in [{MIN_PRECISION}, {MAX_PRECISION}], \
+                 got {precision}"
+            )));
+        }
         let mut r = Reader::new(&payload);
         let updates = r.u64()?;
         let registers = r.take(1usize << precision)?.to_vec();
+        let max_register = 64 - precision + 1;
+        if let Some(&register) = registers.iter().find(|&&register| register > max_register) {
+            return Err(SketchError::Snapshot(format!(
+                "hll snapshot register must be <= {max_register} for precision {precision}, \
+                 got {register}"
+            )));
+        }
         Ok(HyperLogLog {
             precision,
             hash: header.hash,
@@ -239,6 +255,49 @@ mod tests {
         let h2 = HyperLogLog::from_snapshot(&h.to_snapshot(0, 1)).unwrap();
         assert_eq!(h.cardinality(), h2.cardinality());
         assert_eq!(h.update_count(), h2.update_count());
+    }
+
+    #[test]
+    fn out_of_range_snapshot_precision_is_rejected() {
+        let mut params = Writer::new();
+        params.u8(200);
+        let mut payload = Writer::new();
+        payload.u64(0);
+        let bytes = write_snapshot(
+            &SnapshotHeader {
+                version: SNAPSHOT_VERSION,
+                algorithm_id: algorithm_id::HYPER_LOG_LOG,
+                hash: HashSpec::new(1),
+                window_start_nanos: 0,
+                window_end_nanos: 0,
+            },
+            &params.buf,
+            &payload.buf,
+        );
+        let err = HyperLogLog::from_snapshot(&bytes).unwrap_err();
+        assert!(err.to_string().contains("precision"), "{err}");
+    }
+
+    #[test]
+    fn out_of_range_snapshot_register_is_rejected() {
+        let mut params = Writer::new();
+        params.u8(MIN_PRECISION);
+        let mut payload = Writer::new();
+        payload.u64(0);
+        payload.bytes(&[u8::MAX; 1 << MIN_PRECISION]);
+        let bytes = write_snapshot(
+            &SnapshotHeader {
+                version: SNAPSHOT_VERSION,
+                algorithm_id: algorithm_id::HYPER_LOG_LOG,
+                hash: HashSpec::new(1),
+                window_start_nanos: 0,
+                window_end_nanos: 0,
+            },
+            &params.buf,
+            &payload.buf,
+        );
+        let err = HyperLogLog::from_snapshot(&bytes).unwrap_err();
+        assert!(err.to_string().contains("register"), "{err}");
     }
 
     #[test]

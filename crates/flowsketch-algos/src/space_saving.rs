@@ -260,16 +260,38 @@ impl SpaceSaving {
             return Err(SketchError::Snapshot("not a spacesaving snapshot".into()));
         }
         let mut p = Reader::new(&params);
-        let capacity = p.u64()? as usize;
+        let encoded_capacity = p.u64()?;
+        let capacity = usize::try_from(encoded_capacity).map_err(|_| {
+            SketchError::Snapshot(format!(
+                "spacesaving snapshot capacity {encoded_capacity} does not fit this platform"
+            ))
+        })?;
+        if capacity == 0 {
+            return Err(SketchError::Snapshot(
+                "spacesaving snapshot capacity must be positive".into(),
+            ));
+        }
         let mut r = Reader::new(&payload);
         let total_weight = r.u64()?;
         let updates = r.u64()?;
         let n = r.u32()? as usize;
+        if n > capacity {
+            return Err(SketchError::Snapshot(format!(
+                "spacesaving snapshot entry count {n} exceeds capacity {capacity}"
+            )));
+        }
+        // Each entry encodes at least a u32 key length + count + error.
+        r.check_count(n, 4 + 8 + 8)?;
         let mut entries = HashMap::with_capacity(n);
         for _ in 0..n {
             let key = r.lp_bytes()?.to_vec();
             let count = r.u64()?;
             let error = r.u64()?;
+            if error > count {
+                return Err(SketchError::Snapshot(format!(
+                    "spacesaving snapshot entry error {error} exceeds count {count}"
+                )));
+            }
             entries.insert(key, Entry { count, error });
         }
         Ok(SpaceSaving {
@@ -478,6 +500,61 @@ mod tests {
             );
         }
         assert_eq!(a.total_weight(), exact.values().sum::<u64>());
+    }
+
+    #[test]
+    fn hostile_snapshot_params_are_rejected() {
+        let craft = |capacity: u64, n: u32| {
+            let mut params = Writer::new();
+            params.u64(capacity);
+            let mut payload = Writer::new();
+            payload.u64(0); // total_weight
+            payload.u64(0); // updates
+            payload.u32(n);
+            write_snapshot(
+                &SnapshotHeader {
+                    version: SNAPSHOT_VERSION,
+                    algorithm_id: algorithm_id::SPACE_SAVING,
+                    hash: HashSpec::new(1),
+                    window_start_nanos: 0,
+                    window_end_nanos: 0,
+                },
+                &params.buf,
+                &payload.buf,
+            )
+        };
+        // Zero capacity breaks the eviction invariant; an entry count the
+        // payload cannot back must fail before the map is preallocated.
+        assert!(SpaceSaving::from_snapshot(&craft(0, 0)).is_err());
+        let err = SpaceSaving::from_snapshot(&craft(1, 2)).unwrap_err();
+        assert!(err.to_string().contains("exceeds capacity"), "{err}");
+        assert!(SpaceSaving::from_snapshot(&craft(10, u32::MAX)).is_err());
+    }
+
+    #[test]
+    fn snapshot_entry_error_cannot_exceed_count() {
+        let mut params = Writer::new();
+        params.u64(1);
+        let mut payload = Writer::new();
+        payload.u64(1); // total_weight
+        payload.u64(1); // updates
+        payload.u32(1);
+        payload.lp_bytes(b"key");
+        payload.u64(1); // count
+        payload.u64(2); // error
+        let bytes = write_snapshot(
+            &SnapshotHeader {
+                version: SNAPSHOT_VERSION,
+                algorithm_id: algorithm_id::SPACE_SAVING,
+                hash: HashSpec::new(1),
+                window_start_nanos: 0,
+                window_end_nanos: 0,
+            },
+            &params.buf,
+            &payload.buf,
+        );
+        let err = SpaceSaving::from_snapshot(&bytes).unwrap_err();
+        assert!(err.to_string().contains("exceeds count"), "{err}");
     }
 
     #[test]

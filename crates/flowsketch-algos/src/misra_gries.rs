@@ -147,11 +147,28 @@ impl MisraGries {
             return Err(SketchError::Snapshot("not a misra-gries snapshot".into()));
         }
         let mut p = Reader::new(&params);
-        let capacity = p.u64()? as usize;
+        let encoded_capacity = p.u64()?;
+        let capacity = usize::try_from(encoded_capacity).map_err(|_| {
+            SketchError::Snapshot(format!(
+                "misra-gries snapshot capacity {encoded_capacity} does not fit this platform"
+            ))
+        })?;
+        if capacity == 0 {
+            return Err(SketchError::Snapshot(
+                "misra-gries snapshot capacity must be positive".into(),
+            ));
+        }
         let mut r = Reader::new(&payload);
         let total_weight = r.u64()?;
         let updates = r.u64()?;
         let n = r.u32()? as usize;
+        if n > capacity {
+            return Err(SketchError::Snapshot(format!(
+                "misra-gries snapshot counter count {n} exceeds capacity {capacity}"
+            )));
+        }
+        // Each counter encodes at least a u32 key length + u64 count.
+        r.check_count(n, 4 + 8)?;
         let mut counters = HashMap::with_capacity(n);
         for _ in 0..n {
             let key = r.lp_bytes()?.to_vec();
@@ -268,6 +285,33 @@ mod tests {
             let k = String::from_utf8(key).unwrap();
             assert!(c <= exact[&k], "{k}: merged count exceeds truth");
         }
+    }
+
+    #[test]
+    fn hostile_snapshot_params_are_rejected() {
+        let craft = |capacity: u64, n: u32| {
+            let mut params = Writer::new();
+            params.u64(capacity);
+            let mut payload = Writer::new();
+            payload.u64(0); // total_weight
+            payload.u64(0); // updates
+            payload.u32(n);
+            write_snapshot(
+                &SnapshotHeader {
+                    version: SNAPSHOT_VERSION,
+                    algorithm_id: algorithm_id::MISRA_GRIES,
+                    hash: HashSpec::new(1),
+                    window_start_nanos: 0,
+                    window_end_nanos: 0,
+                },
+                &params.buf,
+                &payload.buf,
+            )
+        };
+        assert!(MisraGries::from_snapshot(&craft(0, 0)).is_err());
+        let err = MisraGries::from_snapshot(&craft(1, 2)).unwrap_err();
+        assert!(err.to_string().contains("exceeds capacity"), "{err}");
+        assert!(MisraGries::from_snapshot(&craft(10, u32::MAX)).is_err());
     }
 
     #[test]

@@ -207,6 +207,19 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         self.take(n)
     }
+    /// Validate a declared element count against the bytes actually left,
+    /// given the smallest possible encoding of one element. Snapshots come
+    /// from untrusted peers, so a count must never be trusted to size an
+    /// allocation the payload cannot back.
+    pub fn check_count(&self, count: usize, min_bytes_each: usize) -> Result<(), SketchError> {
+        if count > self.remaining() / min_bytes_each.max(1) {
+            return Err(SketchError::Snapshot(format!(
+                "declared count {count} cannot fit in the {} bytes remaining",
+                self.remaining()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +242,18 @@ mod tests {
         assert_eq!(h2, header);
         assert_eq!(p2, params);
         assert_eq!(pl2, payload);
+    }
+
+    #[test]
+    fn check_count_bounds_declared_counts() {
+        let buf = [0u8; 40];
+        let r = Reader::new(&buf);
+        assert!(r.check_count(5, 8).is_ok());
+        assert!(r.check_count(6, 8).is_err());
+        assert!(r.check_count(usize::MAX, 8).is_err());
+        // A zero minimum must not divide by zero (treated as 1 byte each).
+        assert!(r.check_count(40, 0).is_ok());
+        assert!(r.check_count(41, 0).is_err());
     }
 
     #[test]

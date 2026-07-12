@@ -147,12 +147,23 @@ impl CountMinSketch {
         let width = p.u32()? as usize;
         let depth = p.u32()? as usize;
         let conservative = p.u8()? != 0;
+        if width == 0 || depth == 0 {
+            return Err(SketchError::Snapshot(
+                "count-min snapshot width and depth must be positive".into(),
+            ));
+        }
+        let cells = width.checked_mul(depth).ok_or_else(|| {
+            SketchError::Snapshot(format!(
+                "count-min snapshot table {width}x{depth} overflows"
+            ))
+        })?;
 
         let mut r = Reader::new(&payload);
         let total_weight = r.u64()?;
         let updates = r.u64()?;
-        let mut table = Vec::with_capacity(width * depth);
-        for _ in 0..width * depth {
+        r.check_count(cells, 8)?;
+        let mut table = Vec::with_capacity(cells);
+        for _ in 0..cells {
             table.push(r.u64()?);
         }
         Ok(CountMinSketch {
@@ -340,6 +351,36 @@ mod tests {
             );
         }
         assert_eq!(s.update_count(), s2.update_count());
+    }
+
+    #[test]
+    fn hostile_snapshot_dimensions_are_rejected() {
+        let craft = |width: u32, depth: u32| {
+            let mut params = Writer::new();
+            params.u32(width);
+            params.u32(depth);
+            params.u8(0);
+            let mut payload = Writer::new();
+            payload.u64(0);
+            payload.u64(0);
+            write_snapshot(
+                &SnapshotHeader {
+                    version: SNAPSHOT_VERSION,
+                    algorithm_id: algorithm_id::COUNT_MIN,
+                    hash: HashSpec::new(1),
+                    window_start_nanos: 0,
+                    window_end_nanos: 0,
+                },
+                &params.buf,
+                &payload.buf,
+            )
+        };
+        // Huge declared dimensions must fail the payload-size check before
+        // any table allocation, and zero dimensions must be rejected too.
+        assert!(CountMinSketch::from_snapshot(&craft(u32::MAX, u32::MAX)).is_err());
+        assert!(CountMinSketch::from_snapshot(&craft(1 << 20, 1 << 20)).is_err());
+        assert!(CountMinSketch::from_snapshot(&craft(0, 4)).is_err());
+        assert!(CountMinSketch::from_snapshot(&craft(1024, 0)).is_err());
     }
 
     #[test]
