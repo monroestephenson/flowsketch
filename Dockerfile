@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p flowsketch-cli
+RUN cargo build --locked --release -p flowsketch-cli
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 65532 --home /nonexistent --shell /usr/sbin/nologin flowsketch \

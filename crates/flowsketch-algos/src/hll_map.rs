@@ -407,6 +407,8 @@ mod tests {
         };
         assert!(HllMap::from_snapshot(&craft(0, 12, 0)).is_err());
         assert!(HllMap::from_snapshot(&craft(10, 200, 0)).is_err());
+        #[cfg(target_pointer_width = "32")]
+        assert!(HllMap::from_snapshot(&craft(u64::MAX, 12, 0)).is_err());
         let err = HllMap::from_snapshot(&craft(1, 12, 2)).unwrap_err();
         assert!(err.to_string().contains("exceeds max_keys"), "{err}");
         assert!(HllMap::from_snapshot(&craft(10, 12, u32::MAX)).is_err());

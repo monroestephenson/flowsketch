@@ -52,7 +52,7 @@ kubectl kustomize deploy/kubernetes
 scripts/validate-deploy.sh
 ```
 
-The workspace test suite currently has 154 passing tests.
+The workspace test suite currently has 165 passing tests.
 
 ## Live Capture Today
 

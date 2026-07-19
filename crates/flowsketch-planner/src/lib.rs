@@ -95,7 +95,7 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
     let (sketch, error_kind, error_contract, series_bound) = match &query.measure {
         Measure::Count | Measure::Sum { .. } => {
             let (width, depth) =
-                count_min_dimensions(query.error.epsilon, query.error.delta).map_err(&reject)?;
+                count_min_dimensions(query.error.epsilon, query.error.delta).map_err(reject)?;
             // Track key identities alongside the counter sketch so results
             // can be enumerated; retention capacity scales with the export
             // cap so the guardrail, not the sketch, bounds series.

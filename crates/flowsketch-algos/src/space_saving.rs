@@ -526,6 +526,8 @@ mod tests {
         // Zero capacity breaks the eviction invariant; an entry count the
         // payload cannot back must fail before the map is preallocated.
         assert!(SpaceSaving::from_snapshot(&craft(0, 0)).is_err());
+        #[cfg(target_pointer_width = "32")]
+        assert!(SpaceSaving::from_snapshot(&craft(u64::MAX, 0)).is_err());
         let err = SpaceSaving::from_snapshot(&craft(1, 2)).unwrap_err();
         assert!(err.to_string().contains("exceeds capacity"), "{err}");
         assert!(SpaceSaving::from_snapshot(&craft(10, u32::MAX)).is_err());

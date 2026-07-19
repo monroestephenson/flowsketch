@@ -39,7 +39,7 @@ grep -q 'ghcr.io/monroestephenson/flowsketch:0.1.0' "$TMP/kustomize.yaml"
 grep -q 'kind: PodMonitor' "$TMP/monitoring.yaml"
 grep -q 'FlowSketchPacketDrops' "$TMP/monitoring.yaml"
 test -f "$TMP/flowsketch-0.1.0.tgz"
-if grep -R ':latest' "$ROOT/deploy/kubernetes" "$CHART" --exclude='validate-deploy.sh'; then
+if grep -R ':latest' "$ROOT/deploy/kubernetes" "$CHART"; then
   echo "deployment manifests contain a mutable latest image tag" >&2
   exit 1
 fi

@@ -413,6 +413,8 @@ mod tests {
         // k below the constructor's floor, a level count and an item count
         // the payload cannot back: all rejected before allocation.
         assert!(KllSketch::from_snapshot(&craft(1, 1, 0)).is_err());
+        #[cfg(target_pointer_width = "32")]
+        assert!(KllSketch::from_snapshot(&craft(u64::MAX, 1, 0)).is_err());
         let err = KllSketch::from_snapshot(&craft(64, (MAX_LEVELS + 1) as u32, 0)).unwrap_err();
         assert!(err.to_string().contains("levels"), "{err}");
         assert!(KllSketch::from_snapshot(&craft(64, u32::MAX, 0)).is_err());

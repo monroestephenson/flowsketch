@@ -309,6 +309,8 @@ mod tests {
             )
         };
         assert!(MisraGries::from_snapshot(&craft(0, 0)).is_err());
+        #[cfg(target_pointer_width = "32")]
+        assert!(MisraGries::from_snapshot(&craft(u64::MAX, 0)).is_err());
         let err = MisraGries::from_snapshot(&craft(1, 2)).unwrap_err();
         assert!(err.to_string().contains("exceeds capacity"), "{err}");
         assert!(MisraGries::from_snapshot(&craft(10, u32::MAX)).is_err());
