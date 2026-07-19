@@ -32,7 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release CLI
-        run: cargo build --release -p flowsketch-cli
+        run: cargo build --locked --release -p flowsketch-cli
       - name: AF_PACKET live smoke on veth
         run: bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
       - name: Linux 10 Gb/s projection summary

@@ -10,9 +10,9 @@ the items below as the gate to broad production rollout.
 - Pin image tags in Kubernetes manifests or Helm values.
 - Run CI on Linux and macOS.
 - Run `cargo fmt --all --check`.
-- Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- Run `cargo test --workspace`.
-- Run `cargo build --release -p flowsketch-cli`.
+- Run `cargo clippy --locked --workspace --all-targets -- -D warnings`.
+- Run `cargo test --locked --workspace`.
+- Run `cargo build --locked --release -p flowsketch-cli`.
 - Run `scripts/validate-deploy.sh` to lint, package, and render all Helm and
   Kustomize deployment profiles.
 
@@ -20,7 +20,8 @@ the items below as the gate to broad production rollout.
 
 - Validate AF_PACKET on the target kernel and CNI.
 - Confirm the capture interface name on each node type.
-- Grant only `CAP_NET_RAW` when possible.
+- Grant only `CAP_NET_RAW`; `scripts/linux-afpacket-live-smoke.sh` exercises
+  this least-privilege mode on a veth pair and network namespace.
 - Track:
   - `flowsketch_agent_packets_seen_total`
   - `flowsketch_agent_events_processed_total`

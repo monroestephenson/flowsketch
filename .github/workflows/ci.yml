@@ -9,6 +9,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  minimum-rust:
+    name: Rust 1.85 minimum
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: minimum-rust
+      - name: Test locked workspace on minimum Rust
+        run: cargo test --locked --workspace
+
   test:
     strategy:
       fail-fast: false
@@ -24,11 +36,11 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Build release CLI
-        run: cargo build --release -p flowsketch-cli
+        run: cargo build --locked --release -p flowsketch-cli
       - name: End-to-end smoke (synth -> validate -> explain -> replay)
         run: |
           BIN=target/release/flowsketch
@@ -59,8 +71,11 @@ jobs:
           EOF
           $BIN agent --config /tmp/agent-ci.yaml &
           AGENT_PID=$!
-          for i in $(seq 1 50); do
-            curl -sf localhost:19464/readyz && break || sleep 0.2
+          for _ in $(seq 1 50); do
+            if curl -sf localhost:19464/readyz; then
+              break
+            fi
+            sleep 0.2
           done
           sleep 2
           curl -sf localhost:19464/healthz
@@ -109,7 +124,7 @@ jobs:
           AGENT_A=$!
           $BIN agent --config /tmp/agent-gw-b.yaml &
           AGENT_B=$!
-          for i in $(seq 1 100); do
+          for _ in $(seq 1 100); do
             curl -sf localhost:19465/metrics | grep -q 'flowsketch_gateway_nodes_merged{query="suspected_scanners"} 2' && break
             sleep 0.2
           done
@@ -117,6 +132,21 @@ jobs:
           curl -sf localhost:19465/metrics | grep -q 'flowsketch_gateway_nodes_merged{query="suspected_scanners"} 2'
           curl -sf localhost:19465/v1/nodes | grep '"node-a"'
           kill $AGENT_A $AGENT_B $GATEWAY_PID
+
+  container:
+    name: Production container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build locked production image
+        run: docker build --tag flowsketch:ci .
+      - name: Verify non-root image and executable
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' flowsketch:ci)" = "65532:65532"
+          docker run --rm --read-only flowsketch:ci --help >/dev/null
+          docker run --rm --read-only \
+            --volume "$PWD/examples/queries:/queries:ro" \
+            flowsketch:ci validate /queries/top-talkers.yaml
 
   deployment:
     name: Kubernetes and Helm

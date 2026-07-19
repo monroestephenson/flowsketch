@@ -4,6 +4,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 use flowsketch_core::FlowEvent;
 use flowsketch_pcap::PcapReader;
@@ -15,6 +17,9 @@ use crate::config::SourceConfig;
 use crate::offer_event;
 use crate::state::PublishedState;
 use crate::AgentError;
+
+#[cfg(target_os = "linux")]
+const AF_PACKET_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn capture_loop(
     source: SourceConfig,
@@ -66,24 +71,32 @@ fn af_packet_loop(
 ) -> Result<(), AgentError> {
     let sock = AfPacketSocket::open(interface)?;
     let mut buf = vec![0u8; 65_536];
-    let mut received_since_stats = 0u32;
+    let mut last_statistics = Instant::now();
     loop {
         let len = match sock.recv(&mut buf) {
             Ok(0) => continue,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // SO_RCVTIMEO wakes an idle capture loop so kernel drops do
+                // not remain invisible until another packet arrives.
+                if last_statistics.elapsed() >= AF_PACKET_STATS_INTERVAL {
+                    record_packet_statistics(&sock, state, interface)?;
+                    last_statistics = Instant::now();
+                }
+                continue;
+            }
             Err(e) => return Err(AgentError::Source(format!("recv on {interface}: {e}"))),
         };
         state.packets_seen.fetch_add(1, Ordering::Relaxed);
-        received_since_stats += 1;
-        if received_since_stats >= 4_096 {
-            let stats = sock.statistics().map_err(|e| {
-                AgentError::Source(format!("PACKET_STATISTICS on {interface}: {e}"))
-            })?;
-            state
-                .kernel_dropped_packets
-                .fetch_add(stats.tp_drops as u64, Ordering::Relaxed);
-            received_since_stats = 0;
+        if last_statistics.elapsed() >= AF_PACKET_STATS_INTERVAL {
+            record_packet_statistics(&sock, state, interface)?;
+            last_statistics = Instant::now();
         }
         if let Some(mut event) = parse_packet(linktype::ETHERNET, &buf[..len]) {
             event.ts_nanos = now_nanos();
@@ -95,6 +108,21 @@ fn af_packet_loop(
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn record_packet_statistics(
+    sock: &AfPacketSocket,
+    state: &PublishedState,
+    interface: &str,
+) -> Result<(), AgentError> {
+    let stats = sock
+        .statistics()
+        .map_err(|e| AgentError::Source(format!("PACKET_STATISTICS on {interface}: {e}")))?;
+    state
+        .kernel_dropped_packets
+        .fetch_add(stats.tp_drops as u64, Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -170,7 +198,43 @@ impl AfPacketSocket {
                 "cannot bind to {interface}: {err}"
             )));
         }
-        Ok(AfPacketSocket { fd })
+        let socket = AfPacketSocket { fd };
+        socket
+            .set_receive_timeout(AF_PACKET_STATS_INTERVAL)
+            .map_err(|e| {
+                AgentError::Source(format!("cannot set receive timeout on {interface}: {e}"))
+            })?;
+        Ok(socket)
+    }
+
+    fn set_receive_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        let seconds: libc::time_t = timeout.as_secs().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "receive timeout is too large",
+            )
+        })?;
+        let microseconds: libc::suseconds_t = timeout.subsec_micros().into();
+        let timeout = libc::timeval {
+            tv_sec: seconds,
+            tv_usec: microseconds,
+        };
+        // SAFETY: setsockopt reads exactly one initialized timeval from the
+        // valid pointer for the duration of the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&self.fd),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const libc::timeval as *const libc::c_void,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 
     fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {

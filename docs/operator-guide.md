@@ -72,8 +72,9 @@ development, demos, and offline analysis; `af_packet` returns a clear
 into the engine thread; when the engine falls behind, capture drops events
 and counts them in `flowsketch_agent_dropped_events_total` rather than
 blocking the NIC path. Linux AF_PACKET socket overflow is reported separately
-as `flowsketch_agent_kernel_dropped_packets_total`. A capture failure flips `/healthz` to 503 while
-`/metrics` keeps serving the last good state.
+as `flowsketch_agent_kernel_dropped_packets_total`; the socket counters are
+sampled about once per second even when capture is idle. A capture failure flips
+`/healthz` to 503 while `/metrics` keeps serving the last good state.
 
 Parallel runtime execution is configured under `agent`:
 

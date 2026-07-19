@@ -19,7 +19,7 @@ cleanup() {
   fi
   sudo ip netns del "$NS" 2>/dev/null || true
   sudo ip link del "$HOST_IF" 2>/dev/null || true
-  rm -f "$CONFIG"
+  rm -f "$CONFIG" "$LOG"
 }
 trap cleanup EXIT
 
@@ -33,6 +33,7 @@ need() {
 need curl
 need ip
 need ping
+need setpriv
 need sudo
 
 sudo ip netns add "$NS"
@@ -56,7 +57,17 @@ queries:
   - file: $ROOT/examples/queries/top-talkers.yaml
 EOF
 
-sudo "$BIN" agent --config "$CONFIG" >"$LOG" 2>&1 &
+# Run the agent as the invoking user with only CAP_NET_RAW. Network namespace
+# setup still needs sudo, but a successful capture must not depend on a
+# long-running root process or unrelated Linux capabilities.
+sudo setpriv \
+  --reuid="$(id -u)" \
+  --regid="$(id -g)" \
+  --clear-groups \
+  --inh-caps=-all,+net_raw \
+  --ambient-caps=-all,+net_raw \
+  --bounding-set=-all,+net_raw \
+  "$BIN" agent --config "$CONFIG" >"$LOG" 2>&1 &
 AGENT_PID=$!
 
 for _ in $(seq 1 100); do
@@ -75,6 +86,7 @@ sudo ip netns exec "$NS" ping -f -c 2000 10.240.0.1 >/dev/null 2>&1 ||
 metrics=""
 processed=0
 packets_seen=0
+observed_traffic=false
 for _ in $(seq 1 100); do
   metrics="$(curl -fsS http://127.0.0.1:19464/metrics)"
   processed="$(awk '$1 == "flowsketch_agent_events_processed_total" { print int($2) }' <<<"$metrics")"
@@ -82,15 +94,33 @@ for _ in $(seq 1 100); do
   processed="${processed:-0}"
   packets_seen="${packets_seen:-0}"
   if (( processed > 0 && packets_seen > 0 )); then
-    echo "AF_PACKET live smoke passed: packets_seen=$packets_seen events_processed=$processed"
-    exit 0
+    observed_traffic=true
+    break
   fi
   sleep 0.1
 done
 
-echo "AF_PACKET live smoke failed: packets_seen=$packets_seen events_processed=$processed" >&2
-echo "--- agent log ---" >&2
-cat "$LOG" >&2 || true
-echo "--- metrics ---" >&2
-printf '%s\n' "$metrics" >&2
-exit 1
+if [[ "$observed_traffic" != true ]]; then
+  echo "AF_PACKET live smoke failed: packets_seen=$packets_seen events_processed=$processed" >&2
+  echo "--- agent log ---" >&2
+  cat "$LOG" >&2 || true
+  echo "--- metrics ---" >&2
+  printf '%s\n' "$metrics" >&2
+  exit 1
+fi
+
+# Let the socket receive timeout fire while traffic is idle. This exercises
+# periodic PACKET_STATISTICS collection rather than only packet reception.
+sleep 2
+curl -fsS http://127.0.0.1:19464/healthz >/dev/null
+metrics="$(curl -fsS http://127.0.0.1:19464/metrics)"
+kernel_dropped="$(awk '$1 == "flowsketch_agent_kernel_dropped_packets_total" { print int($2) }' <<<"$metrics")"
+userspace_dropped="$(awk '$1 == "flowsketch_agent_dropped_events_total" { print int($2) }' <<<"$metrics")"
+
+if [[ ! "$kernel_dropped" =~ ^[0-9]+$ || ! "$userspace_dropped" =~ ^[0-9]+$ ]]; then
+  echo "AF_PACKET live smoke failed: drop counters are missing or invalid" >&2
+  printf '%s\n' "$metrics" >&2
+  exit 1
+fi
+
+echo "AF_PACKET live smoke passed with CAP_NET_RAW only: packets_seen=$packets_seen events_processed=$processed kernel_dropped=$kernel_dropped userspace_dropped=$userspace_dropped"

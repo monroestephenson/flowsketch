@@ -66,20 +66,24 @@ FlowSketch currently has two agent source modes:
 The live Linux path is functional but early. It uses a simple AF_PACKET raw
 socket, parses Ethernet/IP/TCP/UDP headers, and pushes `FlowEvent`s into the
 same merge-correct sharded sketch runtime used by replay. It reports both
-AF_PACKET socket drops and userspace channel drops. It does not yet use
+AF_PACKET socket drops and userspace channel drops. Socket statistics are
+sampled about once per second, including while capture is idle, so low-rate
+interfaces do not leave kernel drops unreported indefinitely. It does not yet use
 PACKET_MMAP/TPACKET, eBPF, XDP, AF_XDP, or direct RSS receive-queue ingestion.
 
 GitHub Actions can run a true live functional test by creating a veth pair,
-running the agent on one side with `source.kind: af_packet`, generating packets
-from a network namespace on the other side, and asserting that the agent's
-Prometheus counters increase. That proves the Linux live capture path works.
-It does not prove 10 Gb/s line rate because GitHub-hosted runners do not expose
-a dedicated 10G NIC or stable packet generator.
+running the agent on one side with only `CAP_NET_RAW` and
+`source.kind: af_packet`, generating packets from a network namespace on the
+other side, and asserting that the agent's Prometheus counters increase and
+remain healthy after an idle statistics poll. That proves the Linux live
+capture and least-privilege path work. It does not prove 10 Gb/s line rate
+because GitHub-hosted runners do not expose a dedicated 10G NIC or stable
+packet generator.
 
 For local Linux VMs, the same smoke test can be run with:
 
 ```bash
-cargo build --release -p flowsketch-cli
+cargo build --locked --release -p flowsketch-cli
 bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
 ```
 
