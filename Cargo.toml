@@ -40,6 +40,7 @@ flowsketch-pcap = { path = "crates/flowsketch-pcap", version = "0.1.0" }
 flowsketch-prometheus = { path = "crates/flowsketch-prometheus", version = "0.1.0" }
 flowsketch-otel = { path = "crates/flowsketch-otel", version = "0.1.0" }
 flowsketch-agent = { path = "crates/flowsketch-agent", version = "0.1.0" }
+flowsketch-ebpf = { path = "crates/flowsketch-ebpf", version = "0.1.0" }
 flowsketch-gateway = { path = "crates/flowsketch-gateway", version = "0.1.0" }
 
 [profile.release]

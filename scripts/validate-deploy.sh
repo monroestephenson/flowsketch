@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 CHART="$ROOT/deploy/helm/flowsketch"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/flowsketch-deploy.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
@@ -24,12 +24,32 @@ helm template monitored "$CHART" --namespace telemetry \
   --set agent.runtimeBatchSize=8192 >"$TMP/helm-monitored.yaml"
 helm template agent-only "$CHART" --namespace flowsketch \
   --set gateway.enabled=false >"$TMP/helm-agent-only.yaml"
+helm template ebpf "$CHART" --namespace flowsketch \
+  --set agent.source=ebpf >"$TMP/helm-ebpf.yaml"
+helm template ebpf-fallback "$CHART" --namespace flowsketch \
+  --set agent.source=ebpf \
+  --set agent.ebpf.fallbackToAfPacket=true >"$TMP/helm-ebpf-fallback.yaml"
+helm template affinity "$CHART" --namespace flowsketch \
+  --set agent.cpuAffinity.enabled=true \
+  --set agent.runtimeShards=2 \
+  --set 'agent.cpuAffinity.runtimeCpus[0]=1' \
+  --set 'agent.cpuAffinity.runtimeCpus[1]=2' >"$TMP/helm-affinity.yaml"
 helm package "$CHART" --destination "$TMP" >/dev/null
 
 grep -q 'kind: DaemonSet' "$TMP/helm-default.yaml"
 grep -q 'kind: Deployment' "$TMP/helm-default.yaml"
 grep -q 'runAsNonRoot: true' "$TMP/helm-default.yaml"
 grep -q 'add: \["NET_RAW"\]' "$TMP/helm-default.yaml"
+grep -q 'kind: ebpf' "$TMP/helm-ebpf.yaml"
+grep -q 'objectPath: /usr/lib/flowsketch/flowsketch_tc.bpf.o' "$TMP/helm-ebpf.yaml"
+grep -q 'add: \["BPF", "NET_ADMIN", "PERFMON"\]' "$TMP/helm-ebpf.yaml"
+if grep -q 'add:.*NET_RAW' "$TMP/helm-ebpf.yaml"; then
+  echo "eBPF-only render unexpectedly grants NET_RAW" >&2
+  exit 1
+fi
+grep -q 'add: \["BPF", "NET_ADMIN", "PERFMON", "NET_RAW"\]' "$TMP/helm-ebpf-fallback.yaml"
+grep -q 'captureCpu: 0' "$TMP/helm-affinity.yaml"
+grep -q -- '- 2' "$TMP/helm-affinity.yaml"
 grep -q 'kind: PodMonitor' "$TMP/helm-monitored.yaml"
 grep -q 'kind: ServiceMonitor' "$TMP/helm-monitored.yaml"
 grep -q 'kind: PrometheusRule' "$TMP/helm-monitored.yaml"
@@ -66,12 +86,40 @@ if helm template invalid "$CHART" \
   exit 1
 fi
 if helm template invalid "$CHART" \
+  --set agent.ebpf.fallbackToAfPacket=true >"$TMP/invalid" 2>&1; then
+  echo "chart accepted eBPF fallback while agent.source is AF_PACKET" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.source=ebpf \
+  --set agent.ebpf.ringBufferBytes=1000000 >"$TMP/invalid" 2>&1; then
+  echo "values schema accepted a non-power-of-two eBPF ring" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
   --set agent.enabled=false --set gateway.enabled=false >"$TMP/invalid" 2>&1; then
   echo "chart accepted a release with no enabled workload" >&2
   exit 1
 fi
 if helm template invalid "$CHART" --set agent.otlp.enabled=true >"$TMP/invalid" 2>&1; then
   echo "chart accepted enabled OTLP without an endpoint" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.ringBlockSizeBytes=196608 >"$TMP/invalid" 2>&1; then
+  echo "values schema accepted a non-power-of-two AF_PACKET ring block" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.ringBlockSizeBytes=16777216 \
+  --set agent.ringBlockCount=65 >"$TMP/invalid" 2>&1; then
+  echo "chart accepted an AF_PACKET receive ring larger than 1 GiB" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.cpuAffinity.enabled=true \
+  --set agent.runtimeShards=2 >"$TMP/invalid" 2>&1; then
+  echo "chart accepted CPU affinity without one runtime CPU per shard" >&2
   exit 1
 fi
 

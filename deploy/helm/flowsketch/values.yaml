@@ -8,7 +8,15 @@ fullnameOverride: ""
 
 agent:
   enabled: true
+  source: af_packet
   interface: eth0
+  ringBlockSizeBytes: 1048576
+  ringBlockCount: 64
+  blockRetireTimeoutMs: 64
+  ebpf:
+    objectPath: /usr/lib/flowsketch/flowsketch_tc.bpf.o
+    ringBufferBytes: 16777216
+    fallbackToAfPacket: false
   listenPort: 9464
   hostPort: 9464
   seed: 0
@@ -16,6 +24,10 @@ agent:
   runtimeShards: 1
   runtimeBatchSize: 4096
   runtimeShardStrategy: flow
+  cpuAffinity:
+    enabled: false
+    captureCpu: 0
+    runtimeCpus: [1]
   gatewayPush:
     enabled: true
     intervalMs: 5000

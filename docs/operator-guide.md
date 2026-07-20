@@ -64,8 +64,9 @@ curl -s localhost:9464/healthz                   # capture-source health
 curl -s localhost:9464/v1/queries | jq           # plans, memory, error contracts
 ```
 
-For live capture on Linux, set `source.kind: af_packet` with an `interface`
-— this opens an AF_PACKET raw socket and needs CAP_NET_RAW (or root). On
+For simple live capture on Linux, set `source.kind: af_packet` with an
+`interface` — this opens a TPACKET_V3 memory-mapped AF_PACKET ring and needs
+CAP_NET_RAW (or root). On
 macOS and other non-Linux platforms, `source.kind: pcap` is supported for
 development, demos, and offline analysis; `af_packet` returns a clear
 "Linux only" error. The agent is a capture thread feeding a bounded channel
@@ -76,12 +77,62 @@ as `flowsketch_agent_kernel_dropped_packets_total`; the socket counters are
 sampled about once per second even when capture is idle. A capture failure flips
 `/healthz` to 503 while `/metrics` keeps serving the last good state.
 
+The default receive ring is 64 blocks of 1 MiB (64 MiB total), with partially
+filled blocks retired after 64 ms:
+
+```yaml
+source:
+  kind: af_packet
+  interface: ens5f0
+  ringBlockSizeBytes: 1048576
+  ringBlockCount: 64
+  blockRetireTimeoutMs: 64
+```
+
+Block size must be a power of two from 64 KiB through 16 MiB, timeout must be
+1–1000 ms, and the full ring may not exceed 1 GiB. Watch the ring gauges,
+kernel packet/drop/freeze counters, parser dispositions, and userspace drops
+when tuning. The dedicated M4 runbook is in `docs/m4-validation.md`.
+
+For the tc ingress collector, build the object and select `ebpf`:
+
+```bash
+scripts/build-ebpf.sh
+```
+
+```yaml
+source:
+  kind: ebpf
+  interface: ens5f0
+  objectPath: target/bpf/flowsketch_tc.bpf.o
+  ringBufferBytes: 16777216
+  fallbackToAfPacket: false
+```
+
+The default is fail-closed: a missing object, verifier rejection, attachment
+failure, ABI error, or ring read failure makes `/healthz` fail. Set
+`fallbackToAfPacket: true` only when a deliberate, counted downgrade is
+preferred; it additionally requires CAP_NET_RAW. The eBPF-only process needs
+CAP_BPF, CAP_NET_ADMIN, and CAP_PERFMON on the validated Linux 6.8 target.
+Watch `flowsketch_agent_ebpf_{packets,events_emitted,ring_dropped_events,
+parse_errors,unsupported_packets}_total`; the kernel identity is packets =
+emitted + ring drops + parse errors + unsupported. See
+`docs/ebpf-roadmap.md` for validation and support boundaries.
+
+For systemd installs, copy
+`deploy/systemd/flowsketch-agent-ebpf.conf` into the unit's drop-in directory
+and run `systemctl daemon-reload`. If explicit AF_PACKET fallback is enabled,
+add CAP_NET_RAW to both capability lines in that drop-in.
+
 Parallel runtime execution is configured under `agent`:
 
 ```yaml
 runtimeShards: 8
 runtimeBatchSize: 8192
 runtimeShardStrategy: flow       # flow or round_robin
+cpuAffinity:                     # optional; Linux logical CPU IDs
+  captureCpu: 0
+  runtimeCpus: [1, 2, 3, 4, 5, 6, 7, 8]
 ```
 
 `flow` preserves 5-tuple affinity and models normal RSS. `round_robin`
@@ -89,6 +140,13 @@ balances elephant-heavy traffic across mergeable sketch shards. Each shard
 owns its window state; completed states are merged before metrics or gateway
 snapshots are emitted. Memory grows approximately with the shard count, so
 size it from measurements and keep the default of one for small nodes.
+When `cpuAffinity` is present, `runtimeCpus` must contain one unique CPU per
+runtime shard. Startup fails if Linux rejects any requested CPU instead of
+silently running unpinned. The capture CPU may overlap a runtime CPU, but a
+dedicated capture CPU is preferable for high packet rates. In Kubernetes,
+use Guaranteed QoS with integer CPU requests/limits and a node configured with
+the static CPU Manager policy; the configured host CPU IDs must belong to the
+container's allowed cpuset. The affinity mapping is exported in `/metrics`.
 
 In pcap-source mode, the capture source is finite: once the file is fully
 processed, the agent marks `flowsketch_agent_source_done` and keeps serving

@@ -894,12 +894,136 @@ pub enum ShardStrategy {
     RoundRobin,
 }
 
+fn build_runtime_pool(
+    shard_count: usize,
+    worker_cpus: Option<&[usize]>,
+) -> Result<rayon::ThreadPool, SketchError> {
+    let builder = rayon::ThreadPoolBuilder::new()
+        .num_threads(shard_count)
+        .thread_name(|index| format!("fs-runtime-{index}"));
+
+    #[cfg(target_os = "linux")]
+    let builder = if let Some(worker_cpus) = worker_cpus {
+        use std::sync::Arc;
+
+        for &cpu in worker_cpus {
+            if cpu >= libc::CPU_SETSIZE as usize {
+                return Err(SketchError::InvalidParam(format!(
+                    "runtime CPU {cpu} is outside Linux CPU_SETSIZE {}",
+                    libc::CPU_SETSIZE
+                )));
+            }
+        }
+        let worker_cpus: Arc<[usize]> = Arc::from(worker_cpus);
+        let builder = builder.spawn_handler(move |thread| {
+            let worker = thread.index();
+            let cpu = worker_cpus[worker];
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let mut os_thread = std::thread::Builder::new();
+            if let Some(name) = thread.name() {
+                os_thread = os_thread.name(name.to_string());
+            }
+            if let Some(stack_size) = thread.stack_size() {
+                os_thread = os_thread.stack_size(stack_size);
+            }
+            os_thread.spawn(move || match pin_current_thread(cpu) {
+                Ok(()) => {
+                    if ready_tx.send(Ok(())).is_ok() {
+                        thread.run();
+                    }
+                }
+                Err(error) => {
+                    let detail =
+                        format!("cannot pin runtime worker {worker} to CPU {cpu}: {error}");
+                    let _ = ready_tx.send(Err(std::io::Error::new(error.kind(), detail)));
+                }
+            })?;
+            ready_rx.recv().map_err(|_| {
+                std::io::Error::other(format!(
+                    "runtime worker {worker} ended before reporting CPU affinity"
+                ))
+            })?
+        });
+        let pool = builder.build().map_err(|error| {
+            SketchError::InvalidParam(format!("cannot build runtime pool: {error}"))
+        })?;
+        return Ok(pool);
+    } else {
+        builder
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    if worker_cpus.is_some() {
+        return Err(SketchError::InvalidParam(
+            "runtime CPU affinity is supported only on Linux".into(),
+        ));
+    }
+
+    builder
+        .build()
+        .map_err(|error| SketchError::InvalidParam(format!("cannot build runtime pool: {error}")))
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread(cpu: usize) -> std::io::Result<()> {
+    // SAFETY: cpu_set_t is an integer bitset. CPU_ZERO/CPU_SET initialize and
+    // update it within CPU_SETSIZE, checked by the caller. sched_setaffinity
+    // reads exactly the supplied initialized structure for the current thread.
+    let result = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 impl ShardedQueryEngine {
     pub fn new(plans: Vec<Plan>, hash: HashSpec, shard_count: usize) -> Result<Self, SketchError> {
+        Self::new_inner(plans, hash, shard_count, None)
+    }
+
+    /// Build a sharded engine whose Rayon workers are each restricted to one
+    /// Linux logical CPU. `worker_cpus[i]` is assigned to worker `i`.
+    /// Affinity setup is fail-closed so a mistyped or disallowed CPU cannot
+    /// silently leave a supposedly isolated high-rate deployment unpinned.
+    pub fn new_with_cpu_affinity(
+        plans: Vec<Plan>,
+        hash: HashSpec,
+        shard_count: usize,
+        worker_cpus: &[usize],
+    ) -> Result<Self, SketchError> {
+        Self::new_inner(plans, hash, shard_count, Some(worker_cpus))
+    }
+
+    fn new_inner(
+        plans: Vec<Plan>,
+        hash: HashSpec,
+        shard_count: usize,
+        worker_cpus: Option<&[usize]>,
+    ) -> Result<Self, SketchError> {
         if shard_count == 0 {
             return Err(SketchError::InvalidParam(
                 "runtime shard count must be at least 1".into(),
             ));
+        }
+        if let Some(cpus) = worker_cpus {
+            if cpus.len() != shard_count {
+                return Err(SketchError::InvalidParam(format!(
+                    "runtime CPU affinity lists {} CPU(s) for {shard_count} shard worker(s)",
+                    cpus.len()
+                )));
+            }
+            let unique: std::collections::BTreeSet<_> = cpus.iter().copied().collect();
+            if unique.len() != cpus.len() {
+                return Err(SketchError::InvalidParam(
+                    "runtime CPU affinity must not assign one CPU to multiple workers".into(),
+                ));
+            }
         }
         let mut names = std::collections::BTreeSet::new();
         for plan in &plans {
@@ -910,11 +1034,7 @@ impl ShardedQueryEngine {
                 )));
             }
         }
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(shard_count)
-            .thread_name(|index| format!("fs-runtime-{index}"))
-            .build()
-            .map_err(|e| SketchError::InvalidParam(format!("cannot build runtime pool: {e}")))?;
+        let pool = build_runtime_pool(shard_count, worker_cpus)?;
         let shards = (0..shard_count)
             .map(|_| QueryEngine::new(plans.clone(), hash))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1273,6 +1393,52 @@ mod tests {
         assert_eq!(estimates.len(), 1, "shards leaked duplicate estimates");
         assert_eq!(estimates[0].estimate, 1_000_000.0);
         assert_eq!(estimates[0].update_count, 1_000);
+    }
+
+    #[test]
+    fn runtime_cpu_affinity_requires_one_unique_cpu_per_worker() {
+        let hash = HashSpec::new(7);
+        assert!(ShardedQueryEngine::new_with_cpu_affinity(vec![], hash, 2, &[0]).is_err());
+        assert!(ShardedQueryEngine::new_with_cpu_affinity(vec![], hash, 2, &[0, 0]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_worker_is_pinned_to_requested_allowed_cpu() {
+        // SAFETY: the zeroed set is initialized by sched_getaffinity, which
+        // writes exactly size_of::<cpu_set_t>() bytes for the current thread.
+        let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut allowed)
+        };
+        assert_eq!(result, 0, "sched_getaffinity failed");
+        let cpu = (0..libc::CPU_SETSIZE as usize)
+            .find(|&candidate| unsafe { libc::CPU_ISSET(candidate, &allowed) })
+            .expect("test process has no allowed CPU");
+
+        let engine =
+            ShardedQueryEngine::new_with_cpu_affinity(vec![], HashSpec::new(7), 1, &[cpu]).unwrap();
+        let observed = engine.pool.broadcast(|_| unsafe { libc::sched_getcpu() });
+        assert_eq!(observed, vec![cpu as libc::c_int]);
+
+        if let Some(disallowed) = (0..libc::CPU_SETSIZE as usize)
+            .find(|&candidate| unsafe { !libc::CPU_ISSET(candidate, &allowed) })
+        {
+            let error = ShardedQueryEngine::new_with_cpu_affinity(
+                vec![],
+                HashSpec::new(7),
+                1,
+                &[disallowed],
+            )
+            .err()
+            .expect("disallowed CPU was accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("cannot pin runtime worker 0 to CPU {disallowed}")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

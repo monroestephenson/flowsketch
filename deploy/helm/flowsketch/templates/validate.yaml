@@ -10,3 +10,12 @@
 {{- if and .Values.gateway.enabled (not .Values.serviceAccounts.gateway.create) (empty .Values.serviceAccounts.gateway.name) -}}
 {{- fail "serviceAccounts.gateway.name is required when create=false" -}}
 {{- end -}}
+{{- if and .Values.agent.enabled (eq .Values.agent.source "af_packet") (gt (mul .Values.agent.ringBlockSizeBytes .Values.agent.ringBlockCount) 1073741824) -}}
+{{- fail "agent AF_PACKET receive ring must not exceed 1 GiB" -}}
+{{- end -}}
+{{- if and (ne .Values.agent.source "ebpf") .Values.agent.ebpf.fallbackToAfPacket -}}
+{{- fail "agent.ebpf.fallbackToAfPacket is only valid when agent.source=ebpf" -}}
+{{- end -}}
+{{- if and .Values.agent.cpuAffinity.enabled (ne (len .Values.agent.cpuAffinity.runtimeCpus) (int .Values.agent.runtimeShards)) -}}
+{{- fail "agent.cpuAffinity.runtimeCpus must contain exactly one CPU for each runtime shard" -}}
+{{- end -}}

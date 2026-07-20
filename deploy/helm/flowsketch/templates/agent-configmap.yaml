@@ -16,9 +16,26 @@ data:
       runtimeShards: {{ .Values.agent.runtimeShards }}
       runtimeBatchSize: {{ .Values.agent.runtimeBatchSize }}
       runtimeShardStrategy: {{ .Values.agent.runtimeShardStrategy }}
+      {{- if .Values.agent.cpuAffinity.enabled }}
+      cpuAffinity:
+        captureCpu: {{ .Values.agent.cpuAffinity.captureCpu }}
+        runtimeCpus:
+          {{- range .Values.agent.cpuAffinity.runtimeCpus }}
+          - {{ . }}
+          {{- end }}
+      {{- end }}
       source:
-        kind: af_packet
+        kind: {{ .Values.agent.source }}
         interface: {{ .Values.agent.interface }}
+        {{- if eq .Values.agent.source "ebpf" }}
+        objectPath: {{ .Values.agent.ebpf.objectPath }}
+        ringBufferBytes: {{ .Values.agent.ebpf.ringBufferBytes }}
+        fallbackToAfPacket: {{ .Values.agent.ebpf.fallbackToAfPacket }}
+        {{- else }}
+        ringBlockSizeBytes: {{ .Values.agent.ringBlockSizeBytes }}
+        ringBlockCount: {{ .Values.agent.ringBlockCount }}
+        blockRetireTimeoutMs: {{ .Values.agent.blockRetireTimeoutMs }}
+        {{- end }}
     queries:
       {{- range $name, $_ := .Values.queries }}
       - file: /etc/flowsketch/queries/{{ $name }}

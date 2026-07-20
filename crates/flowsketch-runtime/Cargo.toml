@@ -14,3 +14,6 @@ flowsketch-ir = { workspace = true }
 flowsketch-planner = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

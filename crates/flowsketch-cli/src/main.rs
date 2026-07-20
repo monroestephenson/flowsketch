@@ -150,6 +150,12 @@ enum Command {
         /// RNG seed for reproducible traces
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Store full zero payloads for physical replay instead of compact traces
+        #[arg(long)]
+        full_payload: bool,
+        /// Percentage of generated packets that use IPv6 (0-100)
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+        ipv6_percent: u8,
     },
 }
 
@@ -292,7 +298,20 @@ fn main() -> Result<()> {
             heavy_talkers,
             duration_secs,
             seed,
-        } => synth::run(&out, packets, scanners, heavy_talkers, duration_secs, seed),
+            full_payload,
+            ipv6_percent,
+        } => synth::run(
+            &out,
+            synth::SynthOptions {
+                packets,
+                scanners,
+                heavy_talkers,
+                duration_secs,
+                seed,
+                full_payload,
+                ipv6_percent,
+            },
+        ),
     }
 }
 

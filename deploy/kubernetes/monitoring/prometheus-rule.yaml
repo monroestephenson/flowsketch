@@ -11,13 +11,29 @@ spec:
         - alert: FlowSketchPacketDrops
           expr: >-
             sum(rate(flowsketch_agent_kernel_dropped_packets_total[5m]))
-            + sum(rate(flowsketch_agent_dropped_events_total[5m])) > 0
+            + sum(rate(flowsketch_agent_ebpf_ring_dropped_events_total[5m]))
+            + sum(rate(flowsketch_agent_dropped_events_total[5m]))
+            + sum(rate(flowsketch_agent_kernel_queue_freezes_total[5m])) > 0
           for: 2m
           labels:
             severity: warning
           annotations:
             summary: FlowSketch is dropping observed traffic
-            description: Kernel or userspace drops have remained nonzero for two minutes.
+            description: AF_PACKET/eBPF ring drops, userspace drops, or receive-ring freezes have remained nonzero for two minutes.
+        - alert: FlowSketchEbpfParseErrors
+          expr: increase(flowsketch_agent_ebpf_parse_errors_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch eBPF parser rejected malformed traffic
+            description: The tc collector observed malformed or truncated packet headers.
+        - alert: FlowSketchEbpfFallback
+          expr: increase(flowsketch_agent_ebpf_fallbacks_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch fell back from eBPF to AF_PACKET
+            description: An explicitly enabled fallback occurred after an eBPF load, verifier, attach, or receive failure.
         - alert: FlowSketchAgentNotReady
           expr: flowsketch_agent_ready == 0
           for: 5m

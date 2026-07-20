@@ -233,6 +233,51 @@ mod tests {
     }
 
     #[test]
+    fn full_payload_writer_emits_wire_sized_frames() {
+        let mut compact = Vec::new();
+        PcapWriter::new(&mut compact)
+            .unwrap()
+            .write_tcp_packet(
+                1,
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+                1234,
+                443,
+                0x18,
+                1_200,
+            )
+            .unwrap();
+        let mut full = Vec::new();
+        PcapWriter::new_full_payload(&mut full)
+            .unwrap()
+            .write_tcp_packet(
+                1,
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+                1234,
+                443,
+                0x18,
+                1_200,
+            )
+            .unwrap();
+
+        let (_, compact_len, compact_frame) = PcapReader::new(Cursor::new(compact))
+            .unwrap()
+            .next_packet()
+            .unwrap()
+            .unwrap();
+        let (_, full_len, full_frame) = PcapReader::new(Cursor::new(full))
+            .unwrap()
+            .next_packet()
+            .unwrap()
+            .unwrap();
+        assert_eq!(compact_len, 118);
+        assert_eq!(compact_frame.len(), 118);
+        assert_eq!(full_len, 1_254);
+        assert_eq!(full_frame.len(), 1_254);
+    }
+
+    #[test]
     fn rejects_non_pcap_input() {
         let junk = vec![0u8; 64];
         assert!(matches!(

@@ -9,10 +9,25 @@ use crate::PcapError;
 pub struct PcapWriter<W: Write> {
     writer: W,
     packets_written: u64,
+    max_written_payload: usize,
 }
 
 impl<W: Write> PcapWriter<W> {
-    pub fn new(mut writer: W) -> Result<Self, PcapError> {
+    const COMPACT_PAYLOAD_LIMIT: usize = 64;
+
+    /// Create a compact synthetic-trace writer. Packet headers retain the
+    /// requested wire length, but at most 64 zero payload bytes are stored.
+    pub fn new(writer: W) -> Result<Self, PcapError> {
+        Self::with_payload_limit(writer, Self::COMPACT_PAYLOAD_LIMIT)
+    }
+
+    /// Create a writer that stores the full zero payload up to the protocol's
+    /// maximum packet length. This is intended for physical packet replay.
+    pub fn new_full_payload(writer: W) -> Result<Self, PcapError> {
+        Self::with_payload_limit(writer, usize::MAX)
+    }
+
+    fn with_payload_limit(mut writer: W, max_written_payload: usize) -> Result<Self, PcapError> {
         // Nanosecond magic, version 2.4, Ethernet.
         writer.write_all(&0xA1B2_3C4Du32.to_le_bytes())?;
         writer.write_all(&2u16.to_le_bytes())?;
@@ -24,6 +39,7 @@ impl<W: Write> PcapWriter<W> {
         Ok(PcapWriter {
             writer,
             packets_written: 0,
+            max_written_payload,
         })
     }
 
@@ -56,7 +72,7 @@ impl<W: Write> PcapWriter<W> {
         payload_len: u32,
     ) -> Result<(), PcapError> {
         let l4 = tcp_header(src_port, dst_port, tcp_flags);
-        let frame = build_frame(src, dst, 6, &l4, payload_len);
+        let frame = build_frame(src, dst, 6, &l4, payload_len, self.max_written_payload);
         self.write_record(ts_nanos, &frame)
     }
 
@@ -71,7 +87,7 @@ impl<W: Write> PcapWriter<W> {
         payload_len: u32,
     ) -> Result<(), PcapError> {
         let l4 = udp_header(src_port, dst_port, payload_len as u16);
-        let frame = build_frame(src, dst, 17, &l4, payload_len);
+        let frame = build_frame(src, dst, 17, &l4, payload_len, self.max_written_payload);
         self.write_record(ts_nanos, &frame)
     }
 }
@@ -97,12 +113,26 @@ fn udp_header(src_port: u16, dst_port: u16, payload_len: u16) -> Vec<u8> {
     h
 }
 
-/// Assemble Ethernet + IP + L4 + zero payload. The written payload is
-/// capped so synthetic traces stay small; the IP total-length field still
-/// reflects the requested size, which is what the parser reports as bytes.
-fn build_frame(src: IpAddr, dst: IpAddr, protocol: u8, l4: &[u8], payload_len: u32) -> Vec<u8> {
-    const MAX_WRITTEN_PAYLOAD: usize = 64;
-    let written_payload = (payload_len as usize).min(MAX_WRITTEN_PAYLOAD);
+/// Assemble Ethernet + IP + L4 + zero payload. Compact writers cap stored
+/// payload while retaining the requested IP length; full-payload writers cap
+/// only at the protocol's maximum representable packet length.
+fn build_frame(
+    src: IpAddr,
+    dst: IpAddr,
+    protocol: u8,
+    l4: &[u8],
+    payload_len: u32,
+    max_written_payload: usize,
+) -> Vec<u8> {
+    let requested_payload = usize::try_from(payload_len).unwrap_or(usize::MAX);
+    let protocol_payload_limit = match (src, dst) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => 65_535usize.saturating_sub(20 + l4.len()),
+        (IpAddr::V6(_), IpAddr::V6(_)) => 65_535usize.saturating_sub(l4.len()),
+        _ => 65_535usize.saturating_sub(20 + l4.len()),
+    };
+    let written_payload = requested_payload
+        .min(max_written_payload)
+        .min(protocol_payload_limit);
 
     let mut frame = Vec::with_capacity(14 + 40 + l4.len() + written_payload);
     frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]); // dst MAC
@@ -141,6 +171,6 @@ fn build_frame(src: IpAddr, dst: IpAddr, protocol: u8, l4: &[u8], payload_len: u
         }
     }
     frame.extend_from_slice(l4);
-    frame.extend_from_slice(&vec![0u8; written_payload]);
+    frame.resize(frame.len() + written_payload, 0);
     frame
 }

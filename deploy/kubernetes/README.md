@@ -37,6 +37,13 @@ required for AF_PACKET. It does not run a fully privileged container.
 The default interface is `eth0` in `flowsketch-agent-config`. Change it to
 the node interface that carries the traffic you want to observe.
 
+The fixed Kustomize baseline intentionally remains AF_PACKET. Use the Helm
+chart with `agent.source=ebpf` for the tc collector; it renders BPF,
+NET_ADMIN, and PERFMON instead of NET_RAW and points at the object embedded in
+the production image. Enabling its explicit AF_PACKET fallback adds NET_RAW.
+Qualify the node kernel and container runtime with
+`scripts/linux-ebpf-live-smoke.sh` before rollout.
+
 ## Metrics
 
 - Agent: `http://<node-ip>:9464/metrics`
@@ -59,14 +66,15 @@ kubectl apply -k deploy/kubernetes/monitoring
 ```
 
 It installs a PodMonitor for host-networked agents, a ServiceMonitor for the
-gateway, and PrometheusRule alerts for kernel/userspace packet drops, late
-events, readiness, gateway push failures, and rejected snapshots. Install the
+gateway, and PrometheusRule alerts for AF_PACKET/eBPF/userspace packet drops,
+eBPF parse errors/fallback, late events, readiness, gateway push failures, and rejected snapshots. Install the
 `monitoring.coreos.com` CRDs before applying this pack. Operator deployments
 that select monitors or rules by labels may require an environment-specific
 label transformer or Kustomize overlay.
 
 ## Production TODOs
 
-- Validate AF_PACKET capture on the target CNI and node OS.
+- Validate the selected AF_PACKET or eBPF capture path on the target CNI,
+  kernel, container runtime, and node OS.
 - Pin CPU requests/limits after running `flowsketch bench --trace` on real
   cluster traffic.

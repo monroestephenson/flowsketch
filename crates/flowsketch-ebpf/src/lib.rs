@@ -1,10 +1,15 @@
-//! Stable eBPF collector event contract.
+//! Stable eBPF collector event contract plus the Linux tc ingress loader.
 //!
-//! This crate intentionally does not claim to load a kernel program yet.
-//! It defines the userspace/kernel contract that a future tc/XDP backend
-//! must satisfy: extract packet metadata into the same normalized event
-//! shape as the pcap and AF_PACKET sources, then feed the existing runtime.
-//! The sketch planner and sketch state stay in userspace.
+//! The kernel program extracts packet metadata into the normalized record
+//! below and never modifies traffic. Sketch planning and state remain in
+//! userspace. Linux loader code is isolated behind `cfg(target_os = "linux")`
+//! so the contract and the rest of the workspace remain portable.
+
+#[cfg(target_os = "linux")]
+mod tc;
+
+#[cfg(target_os = "linux")]
+pub use tc::{TcCollector, TcCollectorCounters, TcCollectorError};
 
 use flowsketch_core::{Direction, FlowEvent};
 use thiserror::Error;
@@ -13,6 +18,23 @@ use thiserror::Error;
 /// whenever field semantics, order, size, or byte order changes.
 pub const EBPF_ABI_VERSION: u16 = 1;
 pub const EBPF_FLOW_EVENT_SIZE: usize = 56;
+
+/// Stable ELF symbol and map names shared by the C producer and Rust loader.
+pub const EBPF_ABI_SYMBOL: &str = "FLOWSKETCH_ABI_VERSION";
+pub const EBPF_EVENTS_MAP: &str = "EVENTS";
+pub const EBPF_COUNTERS_MAP: &str = "COUNTERS";
+pub const EBPF_TC_PROGRAM: &str = "flowsketch_tc";
+
+/// Kernel counter indexes. Keep these synchronized with
+/// `bpf/flowsketch_tc.bpf.c`; the conformance smoke validates their identity.
+pub mod counter {
+    pub const PACKETS: u32 = 0;
+    pub const EMITTED: u32 = 1;
+    pub const RING_DROPS: u32 = 2;
+    pub const PARSE_ERRORS: u32 = 3;
+    pub const UNSUPPORTED: u32 = 4;
+    pub const COUNT: u32 = 5;
+}
 
 /// Wire values used for `EbpfFlowEvent::direction`.
 pub mod direction {

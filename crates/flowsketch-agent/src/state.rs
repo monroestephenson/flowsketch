@@ -12,6 +12,8 @@ use flowsketch_planner::Plan;
 use flowsketch_prometheus::QueryExportInfo;
 use flowsketch_runtime::{ShardedQueryEngine, SnapshotExport};
 
+use crate::config::CpuAffinityConfig;
+
 /// Plan metadata the HTTP layer serves on /v1/queries and uses for
 /// /metrics labels.
 #[derive(Debug, Clone)]
@@ -52,8 +54,22 @@ pub struct PublishedState {
 
     pub events_processed: AtomicU64,
     pub packets_seen: AtomicU64,
+    pub packets_parsed: AtomicU64,
+    pub packets_unparsed: AtomicU64,
+    pub kernel_packets: AtomicU64,
     pub kernel_dropped_packets: AtomicU64,
+    pub kernel_queue_freezes: AtomicU64,
     pub dropped_events: AtomicU64,
+    pub capture_ring_bytes: AtomicU64,
+    pub capture_ring_blocks: AtomicU64,
+    pub capture_block_size_bytes: AtomicU64,
+    pub ebpf_packets: AtomicU64,
+    pub ebpf_events_emitted: AtomicU64,
+    pub ebpf_ring_dropped_events: AtomicU64,
+    pub ebpf_parse_errors: AtomicU64,
+    pub ebpf_unsupported_packets: AtomicU64,
+    pub ebpf_fallbacks: AtomicU64,
+    pub ebpf_ring_bytes: AtomicU64,
     pub sketch_memory_bytes: AtomicU64,
     pub late_events: AtomicU64,
     pub otlp_exports: AtomicU64,
@@ -62,6 +78,8 @@ pub struct PublishedState {
     pub gateway_push_failures: AtomicU64,
     pub runtime_batches: AtomicU64,
     pub runtime_shards: usize,
+    capture_cpu_affinity: Option<usize>,
+    runtime_cpu_affinity: Vec<usize>,
 
     /// Latest exported window snapshots for the gateway pusher, refreshed
     /// by the engine thread at most once per `interval` (serializing
@@ -77,7 +95,11 @@ struct SnapshotGate {
 }
 
 impl PublishedState {
-    pub fn new(plans: &[Plan], runtime_shards: usize) -> Self {
+    pub fn new(
+        plans: &[Plan],
+        runtime_shards: usize,
+        cpu_affinity: Option<&CpuAffinityConfig>,
+    ) -> Self {
         let queries = plans
             .iter()
             .map(|p| QueryInfo {
@@ -101,8 +123,22 @@ impl PublishedState {
             source_error: Mutex::new(None),
             events_processed: AtomicU64::new(0),
             packets_seen: AtomicU64::new(0),
+            packets_parsed: AtomicU64::new(0),
+            packets_unparsed: AtomicU64::new(0),
+            kernel_packets: AtomicU64::new(0),
             kernel_dropped_packets: AtomicU64::new(0),
+            kernel_queue_freezes: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
+            capture_ring_bytes: AtomicU64::new(0),
+            capture_ring_blocks: AtomicU64::new(0),
+            capture_block_size_bytes: AtomicU64::new(0),
+            ebpf_packets: AtomicU64::new(0),
+            ebpf_events_emitted: AtomicU64::new(0),
+            ebpf_ring_dropped_events: AtomicU64::new(0),
+            ebpf_parse_errors: AtomicU64::new(0),
+            ebpf_unsupported_packets: AtomicU64::new(0),
+            ebpf_fallbacks: AtomicU64::new(0),
+            ebpf_ring_bytes: AtomicU64::new(0),
             sketch_memory_bytes: AtomicU64::new(0),
             late_events: AtomicU64::new(0),
             otlp_exports: AtomicU64::new(0),
@@ -111,6 +147,10 @@ impl PublishedState {
             gateway_push_failures: AtomicU64::new(0),
             runtime_batches: AtomicU64::new(0),
             runtime_shards,
+            capture_cpu_affinity: cpu_affinity.map(|affinity| affinity.capture_cpu),
+            runtime_cpu_affinity: cpu_affinity
+                .map(|affinity| affinity.runtime_cpus.clone())
+                .unwrap_or_default(),
             snapshot_gate: Mutex::new(None),
             snapshots: Mutex::new(Vec::new()),
         }
@@ -220,7 +260,7 @@ impl PublishedState {
     /// Agent health block appended to /metrics.
     pub fn render_health_metrics(&self) -> String {
         let mut out = String::new();
-        let counters: [(&str, &str, u64); 11] = [
+        let counters: [(&str, &str, u64); 21] = [
             (
                 "flowsketch_agent_events_processed_total",
                 "Flow events processed by the sketch engine.",
@@ -232,9 +272,59 @@ impl PublishedState {
                 self.packets_seen.load(Ordering::Relaxed),
             ),
             (
+                "flowsketch_agent_packets_parsed_total",
+                "Captured packets successfully converted into flow events.",
+                self.packets_parsed.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_packets_unparsed_total",
+                "Captured packets skipped because they are unsupported or malformed.",
+                self.packets_unparsed.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_kernel_packets_total",
+                "Packets accepted by the Linux AF_PACKET socket, including packets later dropped from the receive ring.",
+                self.kernel_packets.load(Ordering::Relaxed),
+            ),
+            (
                 "flowsketch_agent_kernel_dropped_packets_total",
-                "Packets dropped by the Linux AF_PACKET socket before userspace received them.",
+                "Packets dropped by the Linux AF_PACKET receive ring before userspace consumed them.",
                 self.kernel_dropped_packets.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_kernel_queue_freezes_total",
+                "Times the Linux TPACKET_V3 receive queue froze because no ring block was available.",
+                self.kernel_queue_freezes.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_ebpf_packets_total",
+                "Packets presented to the FlowSketch tc eBPF program.",
+                self.ebpf_packets.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_ebpf_events_emitted_total",
+                "Flow events successfully submitted to the eBPF ring buffer.",
+                self.ebpf_events_emitted.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_ebpf_ring_dropped_events_total",
+                "Flow events dropped because the eBPF ring buffer had no space.",
+                self.ebpf_ring_dropped_events.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_ebpf_parse_errors_total",
+                "Malformed or truncated packets rejected by the tc eBPF parser.",
+                self.ebpf_parse_errors.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_ebpf_unsupported_packets_total",
+                "Packets intentionally skipped by the tc eBPF parser.",
+                self.ebpf_unsupported_packets.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_ebpf_fallbacks_total",
+                "Explicit transitions from failed eBPF capture to AF_PACKET fallback.",
+                self.ebpf_fallbacks.load(Ordering::Relaxed),
             ),
             (
                 "flowsketch_agent_dropped_events_total",
@@ -288,11 +378,59 @@ impl PublishedState {
             ));
         }
         out.push_str(&format!(
+            "# HELP flowsketch_agent_capture_ring_bytes Bytes configured for the Linux TPACKET_V3 receive ring.\n\
+             # TYPE flowsketch_agent_capture_ring_bytes gauge\n\
+             flowsketch_agent_capture_ring_bytes {}\n",
+            self.capture_ring_bytes.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_capture_ring_blocks Blocks configured in the Linux TPACKET_V3 receive ring.\n\
+             # TYPE flowsketch_agent_capture_ring_blocks gauge\n\
+             flowsketch_agent_capture_ring_blocks {}\n",
+            self.capture_ring_blocks.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_capture_block_size_bytes Bytes in each Linux TPACKET_V3 receive-ring block.\n\
+             # TYPE flowsketch_agent_capture_block_size_bytes gauge\n\
+             flowsketch_agent_capture_block_size_bytes {}\n",
+            self.capture_block_size_bytes.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_ebpf_ring_bytes Bytes configured for the tc eBPF event ring buffer.\n\
+             # TYPE flowsketch_agent_ebpf_ring_bytes gauge\n\
+             flowsketch_agent_ebpf_ring_bytes {}\n",
+            self.ebpf_ring_bytes.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
             "# HELP flowsketch_agent_runtime_shards Configured parallel runtime shards.\n\
              # TYPE flowsketch_agent_runtime_shards gauge\n\
              flowsketch_agent_runtime_shards {}\n",
             self.runtime_shards
         ));
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_cpu_affinity_enabled Whether explicit Linux capture/runtime CPU affinity is configured.\n\
+             # TYPE flowsketch_agent_cpu_affinity_enabled gauge\n\
+             flowsketch_agent_cpu_affinity_enabled {}\n",
+            u8::from(self.capture_cpu_affinity.is_some())
+        ));
+        out.push_str(
+            "# HELP flowsketch_agent_capture_cpu_affinity Configured Linux logical CPU for the capture thread.\n\
+             # TYPE flowsketch_agent_capture_cpu_affinity gauge\n",
+        );
+        if let Some(cpu) = self.capture_cpu_affinity {
+            out.push_str(&format!(
+                "flowsketch_agent_capture_cpu_affinity{{cpu=\"{cpu}\"}} 1\n"
+            ));
+        }
+        out.push_str(
+            "# HELP flowsketch_agent_runtime_cpu_affinity Configured Linux logical CPU for each runtime worker.\n\
+             # TYPE flowsketch_agent_runtime_cpu_affinity gauge\n",
+        );
+        for (worker, cpu) in self.runtime_cpu_affinity.iter().enumerate() {
+            out.push_str(&format!(
+                "flowsketch_agent_runtime_cpu_affinity{{worker=\"{worker}\",cpu=\"{cpu}\"}} 1\n"
+            ));
+        }
         out.push_str(&format!(
             "# HELP flowsketch_agent_queries_active Queries this agent is executing.\n\
              # TYPE flowsketch_agent_queries_active gauge\n\
@@ -318,5 +456,65 @@ impl PublishedState {
             self.started.elapsed().as_secs()
         ));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_capture_accounting_and_ring_metrics() {
+        let affinity = CpuAffinityConfig {
+            capture_cpu: 0,
+            runtime_cpus: vec![1, 2, 3, 4],
+        };
+        let state = PublishedState::new(&[], 4, Some(&affinity));
+        state.packets_seen.store(11, Ordering::Relaxed);
+        state.packets_parsed.store(9, Ordering::Relaxed);
+        state.packets_unparsed.store(2, Ordering::Relaxed);
+        state.kernel_packets.store(12, Ordering::Relaxed);
+        state.kernel_dropped_packets.store(1, Ordering::Relaxed);
+        state.kernel_queue_freezes.store(3, Ordering::Relaxed);
+        state
+            .capture_ring_bytes
+            .store(67_108_864, Ordering::Relaxed);
+        state.capture_ring_blocks.store(64, Ordering::Relaxed);
+        state
+            .capture_block_size_bytes
+            .store(1_048_576, Ordering::Relaxed);
+        state.ebpf_packets.store(20, Ordering::Relaxed);
+        state.ebpf_events_emitted.store(17, Ordering::Relaxed);
+        state.ebpf_ring_dropped_events.store(1, Ordering::Relaxed);
+        state.ebpf_parse_errors.store(1, Ordering::Relaxed);
+        state.ebpf_unsupported_packets.store(1, Ordering::Relaxed);
+        state.ebpf_fallbacks.store(2, Ordering::Relaxed);
+        state.ebpf_ring_bytes.store(16_777_216, Ordering::Relaxed);
+
+        let metrics = state.render_health_metrics();
+        for expected in [
+            "flowsketch_agent_packets_seen_total 11\n",
+            "flowsketch_agent_packets_parsed_total 9\n",
+            "flowsketch_agent_packets_unparsed_total 2\n",
+            "flowsketch_agent_kernel_packets_total 12\n",
+            "flowsketch_agent_kernel_dropped_packets_total 1\n",
+            "flowsketch_agent_kernel_queue_freezes_total 3\n",
+            "flowsketch_agent_capture_ring_bytes 67108864\n",
+            "flowsketch_agent_capture_ring_blocks 64\n",
+            "flowsketch_agent_capture_block_size_bytes 1048576\n",
+            "flowsketch_agent_ebpf_packets_total 20\n",
+            "flowsketch_agent_ebpf_events_emitted_total 17\n",
+            "flowsketch_agent_ebpf_ring_dropped_events_total 1\n",
+            "flowsketch_agent_ebpf_parse_errors_total 1\n",
+            "flowsketch_agent_ebpf_unsupported_packets_total 1\n",
+            "flowsketch_agent_ebpf_fallbacks_total 2\n",
+            "flowsketch_agent_ebpf_ring_bytes 16777216\n",
+            "flowsketch_agent_runtime_shards 4\n",
+            "flowsketch_agent_cpu_affinity_enabled 1\n",
+            "flowsketch_agent_capture_cpu_affinity{cpu=\"0\"} 1\n",
+            "flowsketch_agent_runtime_cpu_affinity{worker=\"3\",cpu=\"4\"} 1\n",
+        ] {
+            assert!(metrics.contains(expected), "missing {expected:?}");
+        }
     }
 }

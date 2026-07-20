@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flowsketch_core::hash::HashSpec;
 use flowsketch_core::FlowEvent;
@@ -12,6 +13,8 @@ use flowsketch_gateway::{push_batch, GatewayConfig, PushBatch, PushEntry};
 use flowsketch_ir::parse_query_yaml;
 use flowsketch_planner::plan;
 use flowsketch_runtime::QueryEngine;
+
+static NEXT_GATEWAY_DIR: AtomicU64 = AtomicU64::new(0);
 
 const SCANNER_YAML: &str = "name: scanners\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
      measure: {type: distinct_count, field: dst.ip, error: {epsilon: 0.02}}\n";
@@ -31,7 +34,13 @@ fn event(ts_s: u64, src: &str, dst: &str, bytes: u32) -> FlowEvent {
 
 /// Start a gateway on an ephemeral port, returning its address.
 fn start_gateway(seed: u64) -> SocketAddr {
-    let dir = std::env::temp_dir().join(format!("fsk-gw-e2e-{}-{seed}", std::process::id()));
+    let fixture_id = NEXT_GATEWAY_DIR.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "fsk-gw-e2e-{}-{seed}-{fixture_id}",
+        std::process::id()
+    ));
+    // A reused process ID may leave a directory from an interrupted prior run.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let query_file: PathBuf = dir.join("scanners.yaml");
     std::fs::write(&query_file, SCANNER_YAML).unwrap();
@@ -46,8 +55,12 @@ fn start_gateway(seed: u64) -> SocketAddr {
     std::thread::spawn(move || {
         flowsketch_gateway::run(cfg, move |addr| tx.send(addr).unwrap()).unwrap();
     });
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .expect("gateway did not start")
+    let addr = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("gateway did not start");
+    // `run` loads every query before invoking its ready callback.
+    std::fs::remove_dir_all(dir).unwrap();
+    addr
 }
 
 fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {

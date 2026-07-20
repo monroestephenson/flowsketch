@@ -66,9 +66,16 @@ data:
       runtimeShards: 1
       runtimeBatchSize: 4096
       runtimeShardStrategy: flow
+      # Optional Linux CPU pinning; runtimeCpus must match runtimeShards.
+      # cpuAffinity:
+      #   captureCpu: 0
+      #   runtimeCpus: [1]
       source:
         kind: af_packet
         interface: eth0
+        ringBlockSizeBytes: 1048576
+        ringBlockCount: 64
+        blockRetireTimeoutMs: 64
     queries:
       - file: /etc/flowsketch/queries/top-talkers.yaml
       - file: /etc/flowsketch/queries/suspected-scanners.yaml

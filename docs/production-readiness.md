@@ -22,10 +22,17 @@ the items below as the gate to broad production rollout.
 - Confirm the capture interface name on each node type.
 - Grant only `CAP_NET_RAW`; `scripts/linux-afpacket-live-smoke.sh` exercises
   this least-privilege mode on a veth pair and network namespace.
+- Run `scripts/linux-m4-live-validation.sh` first on an isolated veth pair,
+  then with two isolated cabled 10 GbE ports and the hardware gate enabled;
+  see `docs/m4-validation.md`.
 - Track:
+  - `flowsketch_agent_kernel_packets_total`
   - `flowsketch_agent_packets_seen_total`
+  - `flowsketch_agent_packets_parsed_total`
+  - `flowsketch_agent_packets_unparsed_total`
   - `flowsketch_agent_events_processed_total`
   - `flowsketch_agent_kernel_dropped_packets_total`
+  - `flowsketch_agent_kernel_queue_freezes_total`
   - `flowsketch_agent_dropped_events_total`
   - `flowsketch_agent_late_events_total`
   - gateway rejected snapshots and merged-node counts
@@ -72,7 +79,8 @@ flowsketch bench --trace /data/caida-or-mawi.pcap \
 
 Repeat with `round-robin` to quantify elephant-flow shard skew. Neither mode
 is a live-NIC result. Production rollout still requires dedicated hardware
-replay, direct RX-queue ingestion, CPU affinity, and zero unexplained drops.
+replay, direct RX-queue ingestion, target-host validation of the optional CPU
+affinity configuration, and zero unexplained drops.
 
 ## Kubernetes
 
@@ -97,7 +105,12 @@ replay, direct RX-queue ingestion, CPU affinity, and zero unexplained drops.
 
 ## eBPF
 
-- Treat `flowsketch-ebpf` as the contract crate, not a collector yet.
-- Keep eBPF parsing header-only.
-- Keep sketches, query planning, and exports in userspace.
-- Add ring-buffer drop counters before production use.
+- The tc ingress collector is implemented and remains header-only; sketches,
+  planning, windows, and exports stay in userspace.
+- Current validation support is x86_64 Linux 6.8; qualify every production
+  kernel/runtime combination and preserve verifier logs on failure.
+- Alert on ring drops, parse errors, userspace drops, and explicit fallback.
+- Keep fallback disabled unless the deployment intentionally grants NET_RAW
+  and accepts an AF_PACKET downgrade.
+- XDP, direct RSS queue mapping, and physical high-rate comparison remain
+  future work.

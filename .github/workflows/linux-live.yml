@@ -6,6 +6,10 @@ on:
     paths:
       - ".github/workflows/linux-live.yml"
       - "scripts/linux-afpacket-live-smoke.sh"
+      - "scripts/linux-m4-live-validation.sh"
+      - "scripts/linux-ebpf-live-smoke.sh"
+      - "scripts/linux-cpu-affinity-smoke.sh"
+      - "scripts/build-ebpf.sh"
       - "crates/**"
       - "examples/**"
       - "Cargo.toml"
@@ -15,6 +19,10 @@ on:
     paths:
       - ".github/workflows/linux-live.yml"
       - "scripts/linux-afpacket-live-smoke.sh"
+      - "scripts/linux-m4-live-validation.sh"
+      - "scripts/linux-ebpf-live-smoke.sh"
+      - "scripts/linux-cpu-affinity-smoke.sh"
+      - "scripts/build-ebpf.sh"
       - "crates/**"
       - "examples/**"
       - "Cargo.toml"
@@ -25,16 +33,36 @@ env:
 
 jobs:
   afpacket-live:
-    name: AF_PACKET live smoke and Linux projection
+    name: AF_PACKET live accounting and Linux projection
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install live-replay dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang iproute2 libbpf-dev libcap2-bin linux-tools-generic tcpreplay
       - name: Build release CLI
         run: cargo build --locked --release -p flowsketch-cli
       - name: AF_PACKET live smoke on veth
         run: bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
+      - name: Linux capture/runtime CPU-affinity smoke
+        run: bash scripts/linux-cpu-affinity-smoke.sh target/release/flowsketch
+      - name: tc eBPF verifier, accounting, overload, detach, and fallback smoke
+        env:
+          FLOWSKETCH_EBPF_PACKETS: "10000"
+          FLOWSKETCH_EBPF_OVERLOAD_LOOPS: "30"
+        run: bash scripts/linux-ebpf-live-smoke.sh target/release/flowsketch
+      - name: Exact M4 accounting on isolated veth
+        env:
+          FLOWSKETCH_M4_PACKETS: "50000"
+          FLOWSKETCH_M4_LOOPS: "2"
+          FLOWSKETCH_M4_TARGET_MBPS: "1000"
+          FLOWSKETCH_M4_REPORT: /tmp/flowsketch-m4-veth.md
+        run: |
+          bash scripts/linux-m4-live-validation.sh target/release/flowsketch
+          cat /tmp/flowsketch-m4-veth.md >> "$GITHUB_STEP_SUMMARY"
       - name: Linux 10 Gb/s projection summary
         run: |
           BIN=target/release/flowsketch

@@ -9,6 +9,15 @@
 #   source:
 #     kind: af_packet
 #     interface: eth0
+#     ringBlockSizeBytes: 1048576
+#     ringBlockCount: 64
+#     blockRetireTimeoutMs: 64
+#   For tc eBPF instead:
+#     kind: ebpf
+#     interface: eth0
+#     objectPath: ../target/bpf/flowsketch_tc.bpf.o
+#     ringBufferBytes: 16777216
+#     fallbackToAfPacket: false
 agent:
   nodeName: node-a
   listen: 127.0.0.1:9464
@@ -18,6 +27,11 @@ agent:
   runtimeShards: 1
   runtimeBatchSize: 4096
   runtimeShardStrategy: flow
+  # Linux high-rate deployments can pin the capture thread and each runtime
+  # worker. The runtime list length must equal runtimeShards.
+  # cpuAffinity:
+  #   captureCpu: 0
+  #   runtimeCpus: [1]
   source:
     kind: pcap
     path: ../demo.pcap

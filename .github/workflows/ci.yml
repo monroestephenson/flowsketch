@@ -144,6 +144,8 @@ jobs:
         run: |
           test "$(docker image inspect --format '{{.Config.User}}' flowsketch:ci)" = "65532:65532"
           docker run --rm --read-only flowsketch:ci --help >/dev/null
+          docker run --rm --read-only --entrypoint test flowsketch:ci \
+            -r /usr/lib/flowsketch/flowsketch_tc.bpf.o
           docker run --rm --read-only \
             --volume "$PWD/examples/queries:/queries:ro" \
             flowsketch:ci validate /queries/top-talkers.yaml

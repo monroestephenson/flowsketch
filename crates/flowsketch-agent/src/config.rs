@@ -8,10 +8,16 @@
 //!   flushIntervalMs: 1000
 //!   runtimeShards: 4
 //!   runtimeBatchSize: 4096
+//!   cpuAffinity:              # optional, Linux only
+//!     captureCpu: 0
+//!     runtimeCpus: [1, 2, 3, 4]
 //!   source:
-//!     kind: pcap            # pcap | af_packet
+//!     kind: pcap            # pcap | af_packet | ebpf
 //!     path: demo.pcap       # pcap: file to replay
 //!     interface: eth0       # af_packet: interface to sniff
+//!     ringBlockSizeBytes: 1048576
+//!     ringBlockCount: 64
+//!     blockRetireTimeoutMs: 64
 //! queries:
 //!   - file: examples/queries/top-talkers.yaml
 //! ```
@@ -34,6 +40,17 @@ pub enum RuntimeShardStrategy {
     RoundRobin,
 }
 
+/// Optional Linux CPU placement for the capture thread and each long-lived
+/// runtime worker. CPU identifiers are Linux logical CPU numbers.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CpuAffinityConfig {
+    #[serde(rename = "captureCpu", alias = "capture_cpu")]
+    pub capture_cpu: usize,
+    #[serde(rename = "runtimeCpus", alias = "runtime_cpus")]
+    pub runtime_cpus: Vec<usize>,
+}
+
 /// Where packets come from.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -42,7 +59,76 @@ pub enum SourceConfig {
     Pcap { path: PathBuf },
     /// Live capture from a network interface via an AF_PACKET raw socket
     /// (Linux; requires CAP_NET_RAW).
-    AfPacket { interface: String },
+    AfPacket {
+        interface: String,
+        /// Size of each TPACKET_V3 ring block. Power of two and at least
+        /// 64 KiB so it is valid on Linux systems with page sizes up to
+        /// 64 KiB.
+        #[serde(
+            default = "default_ring_block_size_bytes",
+            rename = "ringBlockSizeBytes",
+            alias = "ring_block_size_bytes"
+        )]
+        ring_block_size_bytes: u32,
+        /// Number of blocks in the memory-mapped receive ring.
+        #[serde(
+            default = "default_ring_block_count",
+            rename = "ringBlockCount",
+            alias = "ring_block_count"
+        )]
+        ring_block_count: u32,
+        /// Maximum time the kernel may hold a partially filled block before
+        /// handing it to userspace.
+        #[serde(
+            default = "default_block_retire_timeout_ms",
+            rename = "blockRetireTimeoutMs",
+            alias = "block_retire_timeout_ms"
+        )]
+        block_retire_timeout_ms: u32,
+    },
+    /// Linux tc ingress eBPF collector. Loading requires BPF and network
+    /// administration capabilities. Fallback is explicit so verifier or
+    /// attachment failures are never silently hidden.
+    Ebpf {
+        interface: String,
+        #[serde(rename = "objectPath", alias = "object_path")]
+        object_path: PathBuf,
+        #[serde(
+            default = "default_ebpf_ring_buffer_bytes",
+            rename = "ringBufferBytes",
+            alias = "ring_buffer_bytes"
+        )]
+        ring_buffer_bytes: u32,
+        #[serde(
+            default,
+            rename = "fallbackToAfPacket",
+            alias = "fallback_to_af_packet"
+        )]
+        fallback_to_af_packet: bool,
+    },
+}
+
+const MIN_RING_BLOCK_SIZE_BYTES: u32 = 64 * 1024;
+const MAX_RING_BLOCK_SIZE_BYTES: u32 = 16 * 1024 * 1024;
+const MAX_RING_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_EBPF_RING_BYTES: u32 = 64 * 1024;
+const MAX_EBPF_RING_BYTES: u32 = 1024 * 1024 * 1024;
+const MAX_LINUX_CPU_ID: usize = 1023;
+
+pub(crate) const fn default_ring_block_size_bytes() -> u32 {
+    1024 * 1024
+}
+
+pub(crate) const fn default_ring_block_count() -> u32 {
+    64
+}
+
+pub(crate) const fn default_block_retire_timeout_ms() -> u32 {
+    64
+}
+
+const fn default_ebpf_ring_buffer_bytes() -> u32 {
+    16 * 1024 * 1024
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +142,7 @@ pub struct AgentConfig {
     /// Maximum events dispatched to the runtime worker pool at once.
     pub runtime_batch_size: usize,
     pub runtime_shard_strategy: RuntimeShardStrategy,
+    pub cpu_affinity: Option<CpuAffinityConfig>,
     pub source: SourceConfig,
     pub query_files: Vec<PathBuf>,
     /// OTLP export, if configured.
@@ -85,6 +172,9 @@ impl AgentConfig {
                 "agent.runtimeBatchSize must be between 1 and 65536".into(),
             ));
         }
+        let cpu_affinity = raw.agent.cpu_affinity.clone();
+        validate_cpu_affinity(cpu_affinity.as_ref(), runtime_shards)?;
+        validate_source(&raw.agent.source)?;
         let export = raw.export.unwrap_or_default();
         let otlp = export.otlp.map(|o| {
             let interval_ms = o.interval_ms.unwrap_or(5_000).max(100);
@@ -144,6 +234,7 @@ impl AgentConfig {
                 .agent
                 .runtime_shard_strategy
                 .unwrap_or(RuntimeShardStrategy::Flow),
+            cpu_affinity,
             source: raw.agent.source,
             query_files: raw.queries.into_iter().map(|q| q.file).collect(),
             otlp,
@@ -162,10 +253,18 @@ impl AgentConfig {
                     *q = dir.join(&*q);
                 }
             }
-            if let SourceConfig::Pcap { path: p } = &mut cfg.source {
-                if p.is_relative() {
-                    *p = dir.join(&*p);
+            match &mut cfg.source {
+                SourceConfig::Pcap { path } => {
+                    if path.is_relative() {
+                        *path = dir.join(&*path);
+                    }
                 }
+                SourceConfig::Ebpf { object_path, .. } => {
+                    if object_path.is_relative() {
+                        *object_path = dir.join(&*object_path);
+                    }
+                }
+                SourceConfig::AfPacket { .. } => {}
             }
         }
         Ok(cfg)
@@ -190,6 +289,109 @@ impl AgentConfig {
         }
         Ok(plans)
     }
+}
+
+fn validate_cpu_affinity(
+    affinity: Option<&CpuAffinityConfig>,
+    runtime_shards: usize,
+) -> Result<(), AgentError> {
+    let Some(affinity) = affinity else {
+        return Ok(());
+    };
+    if affinity.capture_cpu > MAX_LINUX_CPU_ID {
+        return Err(AgentError::Config(format!(
+            "agent.cpuAffinity.captureCpu must be between 0 and {MAX_LINUX_CPU_ID}"
+        )));
+    }
+    if affinity.runtime_cpus.len() != runtime_shards {
+        return Err(AgentError::Config(format!(
+            "agent.cpuAffinity.runtimeCpus must contain exactly one CPU for each of the {runtime_shards} runtime shards"
+        )));
+    }
+    if affinity
+        .runtime_cpus
+        .iter()
+        .any(|&cpu| cpu > MAX_LINUX_CPU_ID)
+    {
+        return Err(AgentError::Config(format!(
+            "agent.cpuAffinity.runtimeCpus values must be between 0 and {MAX_LINUX_CPU_ID}"
+        )));
+    }
+    let unique: std::collections::BTreeSet<_> = affinity.runtime_cpus.iter().copied().collect();
+    if unique.len() != affinity.runtime_cpus.len() {
+        return Err(AgentError::Config(
+            "agent.cpuAffinity.runtimeCpus must not contain duplicate CPUs".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source(source: &SourceConfig) -> Result<(), AgentError> {
+    match source {
+        SourceConfig::Pcap { .. } => {}
+        SourceConfig::AfPacket {
+            interface,
+            ring_block_size_bytes,
+            ring_block_count,
+            block_retire_timeout_ms,
+        } => {
+            validate_interface(interface, "af_packet")?;
+            if !(MIN_RING_BLOCK_SIZE_BYTES..=MAX_RING_BLOCK_SIZE_BYTES)
+                .contains(ring_block_size_bytes)
+                || !ring_block_size_bytes.is_power_of_two()
+            {
+                return Err(AgentError::Config(format!(
+                    "af_packet ringBlockSizeBytes must be a power of two between {MIN_RING_BLOCK_SIZE_BYTES} and {MAX_RING_BLOCK_SIZE_BYTES}"
+                )));
+            }
+            if *ring_block_count == 0 {
+                return Err(AgentError::Config(
+                    "af_packet ringBlockCount must be positive".into(),
+                ));
+            }
+            let ring_bytes = u64::from(*ring_block_size_bytes) * u64::from(*ring_block_count);
+            if ring_bytes > MAX_RING_BYTES {
+                return Err(AgentError::Config(format!(
+                    "af_packet receive ring is {ring_bytes} bytes; maximum is {MAX_RING_BYTES}"
+                )));
+            }
+            if !(1..=1_000).contains(block_retire_timeout_ms) {
+                return Err(AgentError::Config(
+                    "af_packet blockRetireTimeoutMs must be between 1 and 1000".into(),
+                ));
+            }
+        }
+        SourceConfig::Ebpf {
+            interface,
+            object_path,
+            ring_buffer_bytes,
+            ..
+        } => {
+            validate_interface(interface, "ebpf")?;
+            if object_path.as_os_str().is_empty() {
+                return Err(AgentError::Config(
+                    "ebpf source objectPath must not be empty".into(),
+                ));
+            }
+            if !(MIN_EBPF_RING_BYTES..=MAX_EBPF_RING_BYTES).contains(ring_buffer_bytes)
+                || !ring_buffer_bytes.is_power_of_two()
+            {
+                return Err(AgentError::Config(format!(
+                    "ebpf ringBufferBytes must be a power of two between {MIN_EBPF_RING_BYTES} and {MAX_EBPF_RING_BYTES}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_interface(interface: &str, source: &str) -> Result<(), AgentError> {
+    if interface.trim().is_empty() {
+        return Err(AgentError::Config(format!(
+            "{source} source interface must not be empty"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +449,8 @@ struct RawAgent {
         alias = "runtime_shard_strategy"
     )]
     runtime_shard_strategy: Option<RuntimeShardStrategy>,
+    #[serde(default, rename = "cpuAffinity", alias = "cpu_affinity")]
+    cpu_affinity: Option<CpuAffinityConfig>,
     source: SourceConfig,
 }
 
@@ -272,6 +476,9 @@ agent:
   runtimeShards: 4
   runtimeBatchSize: 8192
   runtimeShardStrategy: round_robin
+  cpuAffinity:
+    captureCpu: 0
+    runtimeCpus: [1, 2, 3, 4]
   source:
     kind: pcap
     path: demo.pcap
@@ -287,6 +494,13 @@ queries:
         assert_eq!(cfg.runtime_shards, 4);
         assert_eq!(cfg.runtime_batch_size, 8192);
         assert_eq!(cfg.runtime_shard_strategy, RuntimeShardStrategy::RoundRobin);
+        assert_eq!(
+            cfg.cpu_affinity,
+            Some(CpuAffinityConfig {
+                capture_cpu: 0,
+                runtime_cpus: vec![1, 2, 3, 4],
+            })
+        );
         assert!(matches!(cfg.source, SourceConfig::Pcap { .. }));
         assert_eq!(cfg.query_files.len(), 2);
     }
@@ -298,7 +512,17 @@ queries:
         )
         .unwrap();
         match cfg.source {
-            SourceConfig::AfPacket { interface } => assert_eq!(interface, "eth0"),
+            SourceConfig::AfPacket {
+                interface,
+                ring_block_size_bytes,
+                ring_block_count,
+                block_retire_timeout_ms,
+            } => {
+                assert_eq!(interface, "eth0");
+                assert_eq!(ring_block_size_bytes, 1024 * 1024);
+                assert_eq!(ring_block_count, 64);
+                assert_eq!(block_retire_timeout_ms, 64);
+            }
             other => panic!("wrong source {other:?}"),
         }
         // Defaults applied.
@@ -306,6 +530,65 @@ queries:
         assert_eq!(cfg.runtime_shards, 1);
         assert_eq!(cfg.runtime_batch_size, 4096);
         assert_eq!(cfg.runtime_shard_strategy, RuntimeShardStrategy::Flow);
+        assert!(cfg.cpu_affinity.is_none());
+    }
+
+    #[test]
+    fn validates_af_packet_ring_settings() {
+        let valid = AgentConfig::from_yaml(
+            "agent:\n  source:\n    kind: af_packet\n    interface: eth0\n    ringBlockSizeBytes: 2097152\n    ringBlockCount: 32\n    blockRetireTimeoutMs: 25\nqueries:\n  - file: q.yaml\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            valid.source,
+            SourceConfig::AfPacket {
+                ring_block_size_bytes: 2_097_152,
+                ring_block_count: 32,
+                block_retire_timeout_ms: 25,
+                ..
+            }
+        ));
+
+        for invalid_source in [
+            "interface: ''",
+            "interface: eth0\n    ringBlockSizeBytes: 1000000",
+            "interface: eth0\n    ringBlockCount: 0",
+            "interface: eth0\n    ringBlockSizeBytes: 16777216\n    ringBlockCount: 65",
+            "interface: eth0\n    blockRetireTimeoutMs: 0",
+        ] {
+            let yaml = format!(
+                "agent:\n  source:\n    kind: af_packet\n    {invalid_source}\nqueries:\n  - file: q.yaml\n"
+            );
+            assert!(AgentConfig::from_yaml(&yaml).is_err(), "accepted {yaml}");
+        }
+    }
+
+    #[test]
+    fn parses_and_validates_ebpf_source() {
+        let cfg = AgentConfig::from_yaml(
+            "agent:\n  source:\n    kind: ebpf\n    interface: eth0\n    objectPath: /usr/lib/flowsketch/flowsketch_tc.bpf.o\n    ringBufferBytes: 8388608\n    fallbackToAfPacket: true\nqueries:\n  - file: q.yaml\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.source,
+            SourceConfig::Ebpf {
+                ref interface,
+                ring_buffer_bytes: 8_388_608,
+                fallback_to_af_packet: true,
+                ..
+            } if interface == "eth0"
+        ));
+
+        for invalid_source in [
+            "interface: ''\n    objectPath: x.o",
+            "interface: eth0\n    objectPath: ''",
+            "interface: eth0\n    objectPath: x.o\n    ringBufferBytes: 1000000",
+        ] {
+            let yaml = format!(
+                "agent:\n  source:\n    kind: ebpf\n    {invalid_source}\nqueries:\n  - file: q.yaml\n"
+            );
+            assert!(AgentConfig::from_yaml(&yaml).is_err(), "accepted {yaml}");
+        }
     }
 
     #[test]
@@ -373,6 +656,27 @@ queries:
             "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn validates_cpu_affinity_shape_and_bounds() {
+        let valid = AgentConfig::from_yaml(
+            "agent:\n  runtimeShards: 2\n  cpuAffinity:\n    captureCpu: 0\n    runtimeCpus: [1, 2]\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n",
+        )
+        .unwrap();
+        assert_eq!(valid.cpu_affinity.unwrap().runtime_cpus, vec![1, 2]);
+
+        for affinity in [
+            "captureCpu: 0\n    runtimeCpus: [1]",
+            "captureCpu: 0\n    runtimeCpus: [1, 1]",
+            "captureCpu: 1024\n    runtimeCpus: [1, 2]",
+            "captureCpu: 0\n    runtimeCpus: [1, 1024]",
+        ] {
+            let yaml = format!(
+                "agent:\n  runtimeShards: 2\n  cpuAffinity:\n    {affinity}\n  source: {{kind: pcap, path: x.pcap}}\nqueries:\n  - file: q.yaml\n"
+            );
+            assert!(AgentConfig::from_yaml(&yaml).is_err(), "accepted {yaml}");
+        }
     }
 
     #[test]

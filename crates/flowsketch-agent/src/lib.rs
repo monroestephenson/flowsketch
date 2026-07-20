@@ -19,6 +19,9 @@ pub mod http;
 pub mod source;
 pub mod state;
 
+#[cfg(target_os = "linux")]
+mod affinity;
+
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 #[cfg(target_os = "linux")]
@@ -62,9 +65,22 @@ pub fn run(
 ) -> Result<(), AgentError> {
     let plans = config.load_plans()?;
     let hash = HashSpec::new(config.seed);
-    let engine = ShardedQueryEngine::new(plans.clone(), hash, config.runtime_shards)?;
+    let engine = if let Some(affinity) = &config.cpu_affinity {
+        ShardedQueryEngine::new_with_cpu_affinity(
+            plans.clone(),
+            hash,
+            config.runtime_shards,
+            &affinity.runtime_cpus,
+        )?
+    } else {
+        ShardedQueryEngine::new(plans.clone(), hash, config.runtime_shards)?
+    };
 
-    let published = Arc::new(PublishedState::new(&plans, config.runtime_shards));
+    let published = Arc::new(PublishedState::new(
+        &plans,
+        config.runtime_shards,
+        config.cpu_affinity.as_ref(),
+    ));
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| AgentError::Http(format!("cannot bind {}: {e}", config.listen)))?;
     let addr = listener.local_addr()?;
@@ -82,9 +98,27 @@ pub fn run(
     let (tx, rx) = std::sync::mpsc::sync_channel::<FlowEvent>(EVENT_CHANNEL_CAPACITY);
     let capture_state = Arc::clone(&published);
     let source_cfg = config.source.clone();
+    let capture_cpu = config
+        .cpu_affinity
+        .as_ref()
+        .map(|affinity| affinity.capture_cpu);
     let capture = std::thread::Builder::new()
         .name("fs-capture".into())
-        .spawn(move || source::capture_loop(source_cfg, tx, capture_state))
+        .spawn(move || {
+            #[cfg(target_os = "linux")]
+            if let Some(cpu) = capture_cpu {
+                affinity::pin_current_thread(cpu).map_err(|error| {
+                    AgentError::Source(format!("cannot pin capture thread to CPU {cpu}: {error}"))
+                })?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if capture_cpu.is_some() {
+                return Err(AgentError::Config(
+                    "CPU affinity is supported only on Linux".into(),
+                ));
+            }
+            source::capture_loop(source_cfg, tx, capture_state)
+        })
         .map_err(AgentError::Io)?;
 
     engine_loop(

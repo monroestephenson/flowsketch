@@ -20,10 +20,15 @@
     "agent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "interface", "listenPort", "hostPort", "seed", "flushIntervalMs", "runtimeShards", "runtimeBatchSize", "runtimeShardStrategy", "gatewayPush", "otlp", "updateStrategy", "podAnnotations", "podLabels", "priorityClassName", "nodeSelector", "tolerations", "affinity", "resources"],
+      "required": ["enabled", "source", "interface", "ringBlockSizeBytes", "ringBlockCount", "blockRetireTimeoutMs", "ebpf", "listenPort", "hostPort", "seed", "flushIntervalMs", "runtimeShards", "runtimeBatchSize", "runtimeShardStrategy", "cpuAffinity", "gatewayPush", "otlp", "updateStrategy", "podAnnotations", "podLabels", "priorityClassName", "nodeSelector", "tolerations", "affinity", "resources"],
       "properties": {
         "enabled": {"type": "boolean"},
+        "source": {"enum": ["af_packet", "ebpf"]},
         "interface": {"type": "string", "minLength": 1},
+        "ringBlockSizeBytes": {"type": "integer", "enum": [65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216]},
+        "ringBlockCount": {"type": "integer", "minimum": 1, "maximum": 16384},
+        "blockRetireTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "ebpf": {"$ref": "#/definitions/ebpf"},
         "listenPort": {"type": "integer", "minimum": 1024, "maximum": 65535},
         "hostPort": {"type": "integer", "minimum": 0, "maximum": 65535},
         "seed": {"type": "integer", "minimum": 0},
@@ -31,6 +36,7 @@
         "runtimeShards": {"type": "integer", "minimum": 1, "maximum": 256},
         "runtimeBatchSize": {"type": "integer", "minimum": 1, "maximum": 65536},
         "runtimeShardStrategy": {"enum": ["flow", "round_robin"]},
+        "cpuAffinity": {"$ref": "#/definitions/cpuAffinity"},
         "gatewayPush": {"$ref": "#/definitions/gatewayPush"},
         "otlp": {"$ref": "#/definitions/otlp"},
         "updateStrategy": {"type": "object"},
@@ -126,6 +132,32 @@
     }
   },
   "definitions": {
+    "cpuAffinity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "captureCpu", "runtimeCpus"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "captureCpu": {"type": "integer", "minimum": 0, "maximum": 1023},
+        "runtimeCpus": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0, "maximum": 1023}
+        }
+      }
+    },
+    "ebpf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objectPath", "ringBufferBytes", "fallbackToAfPacket"],
+      "properties": {
+        "objectPath": {"type": "string", "minLength": 1},
+        "ringBufferBytes": {"type": "integer", "enum": [65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824]},
+        "fallbackToAfPacket": {"type": "boolean"}
+      }
+    },
     "gatewayPush": {
       "type": "object",
       "additionalProperties": false,

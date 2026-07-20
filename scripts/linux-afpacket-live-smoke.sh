@@ -60,6 +60,9 @@ EOF
 # Run the agent as the invoking user with only CAP_NET_RAW. Network namespace
 # setup still needs sudo, but a successful capture must not depend on a
 # long-running root process or unrelated Linux capabilities.
+# The invoking user intentionally owns the private log file; sudo only starts
+# the setpriv child and does not need to control this redirection.
+# shellcheck disable=SC2024
 sudo setpriv \
   --reuid="$(id -u)" \
   --regid="$(id -g)" \
@@ -113,14 +116,55 @@ fi
 # periodic PACKET_STATISTICS collection rather than only packet reception.
 sleep 2
 curl -fsS http://127.0.0.1:19464/healthz >/dev/null
-metrics="$(curl -fsS http://127.0.0.1:19464/metrics)"
-kernel_dropped="$(awk '$1 == "flowsketch_agent_kernel_dropped_packets_total" { print int($2) }' <<<"$metrics")"
-userspace_dropped="$(awk '$1 == "flowsketch_agent_dropped_events_total" { print int($2) }' <<<"$metrics")"
+accounting_converged=false
+for _ in $(seq 1 50); do
+  metrics="$(curl -fsS http://127.0.0.1:19464/metrics)"
+  processed="$(awk '$1 == "flowsketch_agent_events_processed_total" { print int($2) }' <<<"$metrics")"
+  packets_seen="$(awk '$1 == "flowsketch_agent_packets_seen_total" { print int($2) }' <<<"$metrics")"
+  packets_parsed="$(awk '$1 == "flowsketch_agent_packets_parsed_total" { print int($2) }' <<<"$metrics")"
+  packets_unparsed="$(awk '$1 == "flowsketch_agent_packets_unparsed_total" { print int($2) }' <<<"$metrics")"
+  kernel_packets="$(awk '$1 == "flowsketch_agent_kernel_packets_total" { print int($2) }' <<<"$metrics")"
+  kernel_dropped="$(awk '$1 == "flowsketch_agent_kernel_dropped_packets_total" { print int($2) }' <<<"$metrics")"
+  queue_freezes="$(awk '$1 == "flowsketch_agent_kernel_queue_freezes_total" { print int($2) }' <<<"$metrics")"
+  userspace_dropped="$(awk '$1 == "flowsketch_agent_dropped_events_total" { print int($2) }' <<<"$metrics")"
+  if [[ "$processed" =~ ^[0-9]+$ && "$packets_seen" =~ ^[0-9]+$ &&
+    "$packets_parsed" =~ ^[0-9]+$ && "$packets_unparsed" =~ ^[0-9]+$ &&
+    "$kernel_packets" =~ ^[0-9]+$ && "$kernel_dropped" =~ ^[0-9]+$ &&
+    "$queue_freezes" =~ ^[0-9]+$ && "$userspace_dropped" =~ ^[0-9]+$ ]] &&
+    (( kernel_packets == packets_seen + kernel_dropped &&
+      packets_seen == packets_parsed + packets_unparsed &&
+      packets_parsed == processed + userspace_dropped )); then
+    accounting_converged=true
+    break
+  fi
+  sleep 0.1
+done
 
-if [[ ! "$kernel_dropped" =~ ^[0-9]+$ || ! "$userspace_dropped" =~ ^[0-9]+$ ]]; then
-  echo "AF_PACKET live smoke failed: drop counters are missing or invalid" >&2
+for value in "$processed" "$packets_seen" "$packets_parsed" "$packets_unparsed" \
+  "$kernel_packets" "$kernel_dropped" "$queue_freezes" "$userspace_dropped"; do
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "AF_PACKET live smoke failed: capture counters are missing or invalid" >&2
+    printf '%s\n' "$metrics" >&2
+    exit 1
+  fi
+done
+
+if [[ "$accounting_converged" != true ]]; then
+  echo "AF_PACKET live smoke failed: capture accounting did not converge" >&2
   printf '%s\n' "$metrics" >&2
   exit 1
 fi
 
-echo "AF_PACKET live smoke passed with CAP_NET_RAW only: packets_seen=$packets_seen events_processed=$processed kernel_dropped=$kernel_dropped userspace_dropped=$userspace_dropped"
+if (( packets_seen != packets_parsed + packets_unparsed )); then
+  echo "AF_PACKET live smoke failed: seen packets do not equal parsed + unparsed" >&2
+  printf '%s\n' "$metrics" >&2
+  exit 1
+fi
+
+if (( packets_parsed != processed + userspace_dropped )); then
+  echo "AF_PACKET live smoke failed: parsed packets do not equal processed + userspace drops" >&2
+  printf '%s\n' "$metrics" >&2
+  exit 1
+fi
+
+echo "AF_PACKET live smoke passed with CAP_NET_RAW only: kernel_packets=$kernel_packets packets_seen=$packets_seen parsed=$packets_parsed unparsed=$packets_unparsed events_processed=$processed kernel_dropped=$kernel_dropped queue_freezes=$queue_freezes userspace_dropped=$userspace_dropped"
