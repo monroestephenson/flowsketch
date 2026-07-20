@@ -9,7 +9,8 @@ For deployment hardening and rollout gates, see
 `docs/production-readiness.md`. For Kubernetes manifests, see
 `deploy/kubernetes/`; use `deploy/helm/flowsketch` for configurable production
 installs. For the eBPF collector contract and roadmap, see
-`docs/ebpf-roadmap.md`.
+`docs/ebpf-roadmap.md`. Alert response, gateway recovery, and upgrades are in
+`docs/runbook.md`.
 
 ## Build
 

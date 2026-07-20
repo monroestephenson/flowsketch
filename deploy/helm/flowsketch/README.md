@@ -83,14 +83,20 @@ monitoring:
   enabled: true
   labels:
     release: kube-prometheus-stack
+  dashboards:
+    enabled: true
+    labels:
+      grafana_dashboard: "1"
   rules:
     enabled: true
     severity: warning
 ```
 
-This renders a PodMonitor, ServiceMonitor, and alerts for packet drops, late
-events, readiness, gateway push failures, and rejected snapshots. The cluster
-must already contain the `monitoring.coreos.com` CRDs.
+This renders a PodMonitor, ServiceMonitor, alerts for capture/runtime/export
+failures and gateway merge health, and a Grafana sidecar ConfigMap. The cluster
+must already contain the `monitoring.coreos.com` CRDs, and Grafana must run a
+dashboard sidecar selecting the configured label. The canonical importable
+JSON is `dashboards/flowsketch-overview.json`.
 
 ## Network policy
 
@@ -103,8 +109,21 @@ namespace selectors required by the target cluster.
 
 The current gateway keeps merge state in memory and is intentionally limited
 to one replica. Its Deployment uses `Recreate` to prevent split state during
-upgrades. Gateway HA requires a sharding or replicated-state design, not a
-larger replica count.
+upgrades. Running agents repopulate compatible state after restart; CI verifies
+that behavior and verifies that incompatible state fails closed with
+`scripts/gateway-restart-smoke.sh`. Gateway HA requires a sharding or
+replicated-state design, not a larger replica count.
+
+## HTTP trust boundary
+
+The built-in agent and gateway endpoints are plaintext and unauthenticated.
+Keep them on a protected management network and use a tested layer-7
+mesh/proxy for mTLS and method/path authorization. Agents use `hostNetwork`, so
+confirm whether the selected CNI and mesh actually govern node-network
+traffic; use a node-local proxy/firewall boundary when they do not. Send OTLP
+to a local collector and apply remote TLS credentials there. See
+`docs/security.md` and `docs/runbook.md` for the required controls and rollout
+gates.
 
 Validate every deployment surface locally with:
 

@@ -27,7 +27,7 @@ Implemented today:
 | Sources | Synthetic pcap generation, pcap replay, Linux TPACKET_V3, and tc eBPF ingress capture |
 | Exports | Prometheus text output, HTTP `/metrics`, OTLP/HTTP+JSON metrics export |
 | Distributed merge | Agents can push FSK1 snapshots to a gateway, which validates and merges compatible windows |
-| Deployment prep | Dockerfile, systemd, strict Helm chart/schema, Kustomize baseline, monitors/alerts, deployment CI |
+| Deployment prep | Dockerfile, systemd, strict Helm chart/schema, Kustomize baseline, dashboard/alerts, recovery test, deployment CI |
 | eBPF tc collector | Verifier-safe IPv4/IPv6 parser, Aya loader, ring/drop accounting, least-privilege attach, explicit AF_PACKET fallback |
 | CPU placement | Optional fail-closed Linux pinning for capture and each runtime worker, with affinity metrics and Helm configuration |
 | AF_PACKET fan-out | Linux HASH and RX_QUEUE fan-out, one pinned parser/socket lane per runtime shard, direct lane-to-shard dispatch, per-lane loss accounting |
@@ -326,6 +326,7 @@ flowsketch/
     accuracy-contracts.md
     algorithm-notes.md
     operator-guide.md
+    runbook.md
     security.md
     production-readiness.md
     ebpf-roadmap.md
@@ -810,6 +811,7 @@ flowsketch-gateway Deployment
 Helm chart
 PrometheusRule templates
 ServiceMonitor / PodMonitor templates
+Grafana operations dashboard ConfigMap
 ```
 
 Future Kubernetes control-plane surface:
@@ -818,7 +820,6 @@ Future Kubernetes control-plane surface:
 flowsketch-operator Deployment
 SketchQuery CRD
 Kubernetes metadata enrichment
-Grafana dashboards
 ```
 
 Future CRD shape:
@@ -1004,18 +1005,23 @@ service:
 
 ### Grafana
 
-Grafana adoption should go through Prometheus and OTLP first.
+Grafana adoption goes through Prometheus. The chart ships a sidecar-compatible
+`FlowSketch Operations Overview` dashboard covering readiness, packet-path
+rates, every drop class, AF_PACKET lanes, eBPF terminal outcomes, accounting
+identities, runtime/export activity, gateway merge state, and current sketch
+estimates. Enable it with `monitoring.dashboards.enabled=true`, or import
+[`flowsketch-overview.json`](deploy/helm/flowsketch/dashboards/flowsketch-overview.json)
+directly.
 
-Grafana would want:
+Still useful additions:
 
 - Alloy examples
-- official dashboards
 - Prometheus recording rules
 - Mimir-compatible metrics
 - Loki anomaly-event export later
-- Helm-integrated Kubernetes dashboards
+- domain-specific dashboards after Kubernetes metadata exists
 
-Dashboards to ship:
+Candidate domain dashboards:
 
 | Dashboard | Panels |
 | --------- | ------ |
@@ -1174,7 +1180,7 @@ claims.
 | M7: 25/40 Gb/s | serious infrastructure traffic | kernel fan-out baseline done; hardware evidence pending | HASH/RX_QUEUE TPACKET_V3 lanes, direct queue-to-shard mapping, exact per-lane accounting, and fail-closed CPU affinity pass the Linux VM gate; queue-local channels, physical live replay, and p99 latency remain |
 | M8: 100 Gb/s mixed traffic | realistic 100G packet-size distribution | not done | XDP/eBPF or AF_XDP path, sharded userspace, live NIC validation, public benchmark report |
 | M9: 100 Gb/s minimum packets | 148.8Mpps worst case | research/hardware tier | XDP prefiltering, AF_XDP/DPDK or hardware offload, sampling/preaggregation strategy |
-| M10: production v1 | trusted operational deployment | not done | security posture, auth/TLS guidance, HA gateway story, dashboards, alerts, runbooks, upgrade tests |
+| M10: production v1 | trusted operational deployment | operational baseline done; HA remains | concrete TLS/auth trust-boundary guidance, explicit single-writer gateway recovery, Grafana dashboard, alerts, incident runbook, and executable restart/compatibility upgrade gate exist; replicated gateway HA is not claimed |
 
 The immediate external gates are the physical M4 run and physical M7 fan-out
 run. M4 is the first milestone that can honestly claim "10 Gb/s" in a live
@@ -1277,7 +1283,7 @@ Still needed:
 config reload
 better lifecycle controls
 more live Linux soak tests
-PACKET_MMAP/eBPF/XDP capture paths
+queue-local lane channels and XDP/AF_XDP capture paths
 ```
 
 ### Phase 4: OTLP Export
@@ -1290,7 +1296,7 @@ Still needed:
 more semantic convention coverage
 larger collector compatibility matrix
 anomaly event/log export
-TLS/auth story through sidecar, mesh, or collector
+tested mesh/proxy/collector reference deployment (the trust boundary is documented)
 ```
 
 ### Phase 5: Kubernetes-Native MVP
@@ -1312,6 +1318,8 @@ strict Helm chart and values schema
 immutable default image tag
 ServiceMonitor / PodMonitor
 PrometheusRule alerts
+Grafana operations dashboard
+gateway restart/compatibility CI
 deployment render/lint CI
 ```
 
@@ -1321,7 +1329,6 @@ Still needed:
 SketchQuery CRD
 operator
 Kubernetes metadata enrichment
-Grafana dashboards
 ```
 
 ### Phase 6: eBPF Collector
@@ -1435,8 +1442,8 @@ Later:
 
 ## Production Readiness
 
-FlowSketch is close to a serious v0, not close to a fully production-hardened
-100 Gb/s system.
+FlowSketch now has a controlled operational baseline, but it is not a fully
+production-hardened 100 Gb/s system.
 
 What is solid:
 
@@ -1449,18 +1456,19 @@ What is solid:
 - cross-platform developer CI
 - Docker/systemd packaging and validated Helm/Kustomize deployment surfaces
 - exact-accounting AF_PACKET and tc eBPF Linux VM gates
+- alert-backed Grafana operations dashboard and incident/upgrade runbook
+- executable single-writer gateway restart and compatibility recovery gate
+- concrete proxy/mesh/collector TLS and authorization boundaries
 
-What is missing before a production v1:
+What is missing before a broad production v1 across environments:
 
 - physical live Linux validation at 10/25/40/100 Gb/s
 - XDP/AF_XDP collector and loss accounting
 - queue-local lane-to-worker channels (kernel RX-queue mapping and pinned parser/runtime lanes exist)
-- gateway HA/sharding or clear single-writer semantics
-- TLS/auth/deployment guidance for non-local HTTP endpoints
+- gateway HA/sharding beyond the documented single-writer recovery model
+- a tested reference mesh/proxy deployment if built-in TLS/auth remains a non-goal
 - Kubernetes metadata, CRD, and operator
 - real trace benchmark suite using legally available traces
-- live 10/25/40/100 Gb/s validation on actual NICs
-- dashboards and operational runbooks
 
 See [`docs/production-readiness.md`](docs/production-readiness.md).
 
@@ -1472,9 +1480,9 @@ If the next work is about making FlowSketch more real, prioritize this order:
 2. Add and benchmark an XDP variant against AF_PACKET and eBPF tc with hardware replay where available.
 3. Add Kubernetes metadata enrichment for node, namespace, pod, service, and workload dimensions.
 4. Publish signed chart/release artifacts and a versioned upgrade test matrix.
-5. Add gateway HA strategy: sharding, leader election, replicated state, or explicit single-gateway semantics.
-6. Add auth/TLS guidance through mesh, reverse proxy, or collector-side deployment patterns.
-7. Publish Grafana dashboards and Datadog/OpenMetrics examples.
+5. Add gateway HA through sharding, leader election, or replicated state; keep the single-writer contract until then.
+6. Ship a tested reference mesh/proxy deployment and Datadog/OpenMetrics examples.
+7. Add domain dashboards after Kubernetes metadata is available.
 8. Add a conformance suite for sketch snapshots and query-planner behavior.
 9. Keep tightening benchmark documentation so claims are tied to commands and datasets.
 
@@ -1579,6 +1587,7 @@ NIC evidence.
 ## Documentation
 
 - [`docs/operator-guide.md`](docs/operator-guide.md)
+- [`docs/runbook.md`](docs/runbook.md)
 - [`docs/query-language.md`](docs/query-language.md)
 - [`docs/accuracy-contracts.md`](docs/accuracy-contracts.md)
 - [`docs/algorithm-notes.md`](docs/algorithm-notes.md)

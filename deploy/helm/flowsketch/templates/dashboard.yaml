@@ -1,0 +1,14 @@
+{{- if .Values.monitoring.dashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "flowsketch.fullname" . }}-dashboard
+  labels:
+    {{- include "flowsketch.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.dashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  flowsketch-overview.json: |
+{{ .Files.Get "dashboards/flowsketch-overview.json" | required "dashboards/flowsketch-overview.json is missing from the chart" | nindent 4 }}
+{{- end }}

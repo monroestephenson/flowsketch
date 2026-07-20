@@ -15,6 +15,8 @@ the items below as the gate to broad production rollout.
 - Run `cargo build --locked --release -p flowsketch-cli`.
 - Run `scripts/validate-deploy.sh` to lint, package, and render all Helm and
   Kustomize deployment profiles.
+- Run `scripts/gateway-restart-smoke.sh target/release/flowsketch` to verify
+  single-writer gateway repopulation and fail-closed compatibility handling.
 
 ## Linux capture validation
 
@@ -92,6 +94,9 @@ affinity configuration, and zero unexplained drops.
 - Apply `deploy/kubernetes/monitoring` when using Prometheus Operator and
   verify that its monitor/rule selectors include the `app.kubernetes.io/name`
   label.
+- Import the chart's `FlowSketch Operations Overview` dashboard or enable its
+  Grafana sidecar ConfigMap, then route every bundled alert to the procedures
+  in `docs/runbook.md`.
 - Tune resource requests/limits from benchmark data.
 - Consider node selectors/tolerations for high-throughput nodes.
 
@@ -102,6 +107,20 @@ affinity configuration, and zero unexplained drops.
 - Keep query ConfigMaps under change control.
 - Do not merge snapshots from untrusted sources.
 - Review `docs/security.md`.
+- Exercise certificate rotation and authorization at the selected
+  mesh/proxy/collector boundary; built-in endpoints remain plaintext.
+
+## Gateway and upgrades
+
+- Run exactly one gateway replica. The supported model is an in-memory single
+  writer with `Recreate` upgrades, not high availability.
+- Verify that running agents repopulate all expected query/node state after a
+  gateway restart. Expect a brief absence of merged estimates.
+- Keep gateway and agent hash seeds and query plans compatible. Rejected
+  snapshots must stop after a coordinated rollout completes.
+- Use immutable images and `helm upgrade --atomic --wait`; preserve the prior
+  values, manifests, image digest, and query ConfigMaps for rollback.
+- Follow `docs/runbook.md` for preflight, recovery gates, and rollback.
 
 ## eBPF
 

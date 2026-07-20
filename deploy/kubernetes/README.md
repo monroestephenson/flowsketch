@@ -67,10 +67,13 @@ kubectl apply -k deploy/kubernetes/monitoring
 
 It installs a PodMonitor for host-networked agents, a ServiceMonitor for the
 gateway, and PrometheusRule alerts for AF_PACKET/eBPF/userspace packet drops,
-eBPF parse errors/fallback, late events, readiness, gateway push failures, and rejected snapshots. Install the
+eBPF parse errors/fallback, late events, readiness, OTLP failures, gateway push
+failures, rejected snapshots, and persistent merge gaps. Install the
 `monitoring.coreos.com` CRDs before applying this pack. Operator deployments
 that select monitors or rules by labels may require an environment-specific
-label transformer or Kustomize overlay.
+label transformer or Kustomize overlay. Import the canonical Grafana dashboard
+from `deploy/helm/flowsketch/dashboards/flowsketch-overview.json`; the
+configurable Helm chart can also publish it as a sidecar ConfigMap.
 
 ## Production TODOs
 
@@ -78,3 +81,6 @@ label transformer or Kustomize overlay.
   kernel, container runtime, and node OS.
 - Pin CPU requests/limits after running `flowsketch bench --trace` on real
   cluster traffic.
+- Apply the HTTP trust-boundary and upgrade/recovery procedures in
+  `docs/runbook.md`; the built-in endpoints have no TLS or authentication and
+  the gateway is a single in-memory writer.

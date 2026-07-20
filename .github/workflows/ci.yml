@@ -91,47 +91,8 @@ jobs:
           $BIN replay /tmp/ci-b.pcap --query examples/queries/suspected-scanners.yaml \
             --seed 9 --snapshot-out /tmp/snaps-b > /dev/null
           $BIN merge-snapshots /tmp/snaps-a/*.fsk1 /tmp/snaps-b/*.fsk1
-      - name: Gateway smoke (two agents push -> merged cluster /metrics)
-        run: |
-          BIN=target/release/flowsketch
-          cat > /tmp/gateway-ci.yaml <<EOF
-          gateway:
-            listen: 127.0.0.1:19465
-          queries:
-            - file: $PWD/examples/queries/suspected-scanners.yaml
-          EOF
-          $BIN gateway --config /tmp/gateway-ci.yaml &
-          GATEWAY_PID=$!
-          for node in a b; do
-            cat > /tmp/agent-gw-$node.yaml <<EOF
-          agent:
-            nodeName: node-$node
-            listen: 127.0.0.1:0
-            flushIntervalMs: 100
-            source:
-              kind: pcap
-              path: /tmp/ci-$node.pcap
-          queries:
-            - file: $PWD/examples/queries/suspected-scanners.yaml
-          export:
-            gateway:
-              endpoint: http://127.0.0.1:19465
-              intervalMs: 200
-          EOF
-          done
-          cp /tmp/ci.pcap /tmp/ci-a.pcap
-          $BIN agent --config /tmp/agent-gw-a.yaml &
-          AGENT_A=$!
-          $BIN agent --config /tmp/agent-gw-b.yaml &
-          AGENT_B=$!
-          for _ in $(seq 1 100); do
-            curl -sf localhost:19465/metrics | grep -q 'flowsketch_gateway_nodes_merged{query="suspected_scanners"} 2' && break
-            sleep 0.2
-          done
-          curl -sf localhost:19465/metrics | grep -E "flowsketch_(estimate|gateway_nodes_merged|gateway_pushes_total)" | head -10
-          curl -sf localhost:19465/metrics | grep -q 'flowsketch_gateway_nodes_merged{query="suspected_scanners"} 2'
-          curl -sf localhost:19465/v1/nodes | grep '"node-a"'
-          kill $AGENT_A $AGENT_B $GATEWAY_PID
+      - name: Gateway restart and compatibility recovery smoke
+        run: scripts/gateway-restart-smoke.sh target/release/flowsketch
 
   container:
     name: Production container

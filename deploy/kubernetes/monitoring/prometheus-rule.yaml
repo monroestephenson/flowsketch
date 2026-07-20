@@ -49,6 +49,13 @@ spec:
           annotations:
             summary: FlowSketch rejected late events
             description: Events arrived before the earliest open runtime window.
+        - alert: FlowSketchOtlpExportFailures
+          expr: increase(flowsketch_agent_otlp_export_failures_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch OTLP exports are failing
+            description: At least one agent failed to export metrics to its configured local OpenTelemetry Collector.
     - name: flowsketch-gateway
       rules:
         - alert: FlowSketchGatewayPushFailures
@@ -65,3 +72,11 @@ spec:
           annotations:
             summary: FlowSketch gateway rejected snapshots
             description: The gateway received incompatible or malformed sketch snapshots.
+        - alert: FlowSketchGatewayMergeGap
+          expr: flowsketch_gateway_nodes_known - flowsketch_gateway_nodes_merged > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch gateway cannot merge every known node
+            description: Known agents have remained on different newest window boundaries for five minutes.

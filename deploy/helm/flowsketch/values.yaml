@@ -96,6 +96,10 @@ monitoring:
   interval: 30s
   scrapeTimeout: 10s
   labels: {}
+  dashboards:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
   rules:
     enabled: true
     severity: warning

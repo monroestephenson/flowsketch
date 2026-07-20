@@ -100,12 +100,25 @@
     "monitoring": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "interval", "scrapeTimeout", "labels", "rules"],
+      "required": ["enabled", "interval", "scrapeTimeout", "labels", "dashboards", "rules"],
       "properties": {
         "enabled": {"type": "boolean"},
         "interval": {"type": "string", "pattern": "^[1-9][0-9]*[smh]$"},
         "scrapeTimeout": {"type": "string", "pattern": "^[1-9][0-9]*[smh]$"},
         "labels": {"type": "object"},
+        "dashboards": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "labels"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "labels": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {"type": "string"}
+            }
+          }
+        },
         "rules": {
           "type": "object",
           "additionalProperties": false,

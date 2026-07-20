@@ -6,12 +6,20 @@ CHART="$ROOT/deploy/helm/flowsketch"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/flowsketch-deploy.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
-for command in helm kubectl; do
+for command in helm jq kubectl tar; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "required command not found: $command" >&2
     exit 1
   fi
 done
+
+jq -e '
+  .uid == "flowsketch-overview"
+  and .title == "FlowSketch Operations Overview"
+  and (.panels | length >= 10)
+  and ([.panels[].targets[]?.expr] | any(contains("flowsketch_agent_kernel_dropped_packets_total")))
+  and ([.panels[].targets[]?.expr] | any(contains("flowsketch_gateway_nodes_merged")))
+' "$CHART/dashboards/flowsketch-overview.json" >/dev/null
 
 kubectl kustomize "$ROOT/deploy/kubernetes" >"$TMP/kustomize.yaml"
 kubectl kustomize "$ROOT/deploy/kubernetes/monitoring" >"$TMP/monitoring.yaml"
@@ -19,6 +27,7 @@ helm lint "$CHART"
 helm template default "$CHART" --namespace flowsketch >"$TMP/helm-default.yaml"
 helm template monitored "$CHART" --namespace telemetry \
   --set monitoring.enabled=true \
+  --set monitoring.dashboards.enabled=true \
   --set networkPolicy.enabled=true \
   --set agent.runtimeShards=8 \
   --set agent.runtimeBatchSize=8192 >"$TMP/helm-monitored.yaml"
@@ -64,12 +73,20 @@ grep -q -- '- 3' "$TMP/helm-fanout.yaml"
 grep -q 'kind: PodMonitor' "$TMP/helm-monitored.yaml"
 grep -q 'kind: ServiceMonitor' "$TMP/helm-monitored.yaml"
 grep -q 'kind: PrometheusRule' "$TMP/helm-monitored.yaml"
+grep -q 'name: monitored-flowsketch-dashboard' "$TMP/helm-monitored.yaml"
+grep -q 'grafana_dashboard: "1"' "$TMP/helm-monitored.yaml"
+grep -q 'flowsketch-overview.json: |' "$TMP/helm-monitored.yaml"
+grep -q 'FlowSketchGatewayMergeGap' "$TMP/helm-monitored.yaml"
+grep -q 'FlowSketchOtlpExportFailures' "$TMP/helm-monitored.yaml"
 grep -q 'kind: NetworkPolicy' "$TMP/helm-monitored.yaml"
 grep -q 'runAsNonRoot: true' "$TMP/kustomize.yaml"
 grep -q 'ghcr.io/monroestephenson/flowsketch:0.1.0' "$TMP/kustomize.yaml"
 grep -q 'kind: PodMonitor' "$TMP/monitoring.yaml"
 grep -q 'FlowSketchPacketDrops' "$TMP/monitoring.yaml"
+grep -q 'FlowSketchGatewayMergeGap' "$TMP/monitoring.yaml"
 test -f "$TMP/flowsketch-0.1.0.tgz"
+tar -tzf "$TMP/flowsketch-0.1.0.tgz" |
+  grep -q '^flowsketch/dashboards/flowsketch-overview.json$'
 if grep -R ':latest' "$ROOT/deploy/kubernetes" "$CHART"; then
   echo "deployment manifests contain a mutable latest image tag" >&2
   exit 1

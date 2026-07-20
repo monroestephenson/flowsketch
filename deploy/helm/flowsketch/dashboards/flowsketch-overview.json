@@ -1,0 +1,1070 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Operational health, capture accounting, runtime pressure, and gateway merge state for FlowSketch.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "The minimum readiness value across selected agents. Any zero means at least one agent is not ready.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "red",
+                  "text": "NOT READY"
+                },
+                "1": {
+                  "color": "green",
+                  "text": "READY"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "min(flowsketch_agent_ready{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"})",
+          "instant": true,
+          "legendFormat": "readiness",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Agent readiness",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Configured agents and the gateway's maximum currently merged node count. The gateway is deliberately single-writer and rebuilds this state from agent pushes after restart.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 9,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "count(flowsketch_agent_ready{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"})",
+          "instant": true,
+          "legendFormat": "selected agents",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "max(flowsketch_gateway_nodes_merged{flowsketch_release=~\"${release:regex}\"})",
+          "instant": true,
+          "legendFormat": "nodes merged",
+          "range": false,
+          "refId": "B"
+        }
+      ],
+      "title": "Fleet and merge state",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Total sketch memory across selected agents. This grows with query count, window overlap, and runtime shard count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 9,
+        "x": 15,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(flowsketch_agent_sketch_memory_bytes{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"})",
+          "instant": true,
+          "legendFormat": "sketch memory",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Sketch memory",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Capture and engine rates. During settled operation: seen = parsed + unparsed, and parsed = processed + userspace dropped.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_kernel_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "AF_PACKET kernel",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "eBPF ingress",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_packets_seen_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "seen",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_packets_parsed_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "parsed",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_events_processed_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "processed",
+          "range": true,
+          "refId": "E"
+        }
+      ],
+      "title": "Packet pipeline rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Every nonzero series represents loss or queue pressure and should be investigated using docs/runbook.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "min": 0,
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_kernel_dropped_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "AF_PACKET kernel drops",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_kernel_queue_freezes_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "AF_PACKET freezes",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_ring_dropped_events_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "eBPF ring drops",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_dropped_events_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "userspace drops",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_late_events_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "late events",
+          "range": true,
+          "refId": "E"
+        }
+      ],
+      "title": "Loss and queue pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Kernel-selected AF_PACKET fan-out lane throughput. Idle lanes under representative multi-flow traffic can indicate RSS/queue/fan-out configuration problems.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, lane) (rate(flowsketch_agent_af_packet_lane_kernel_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} lane {{lane}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "AF_PACKET fan-out lanes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "eBPF packet terminal outcomes. Ingress packets must equal emitted events plus ring drops, parse errors, and unsupported packets.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "ingress packets",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_events_emitted_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "emitted",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_ring_dropped_events_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "ring dropped",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_parse_errors_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "parse errors",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_ebpf_unsupported_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "unsupported",
+          "range": true,
+          "refId": "E"
+        }
+      ],
+      "title": "eBPF terminal outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Absolute accounting deltas. Check a quiesced or settled interval; all values should converge to zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "abs(flowsketch_agent_kernel_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_packets_seen_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_kernel_dropped_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}) and flowsketch_agent_kernel_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} > 0",
+          "instant": true,
+          "legendFormat": "{{instance}} AF kernel delta",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "abs(flowsketch_agent_packets_seen_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_packets_parsed_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_packets_unparsed_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"})",
+          "instant": true,
+          "legendFormat": "{{instance}} parser delta",
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "abs(flowsketch_agent_packets_parsed_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_events_processed_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_dropped_events_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"})",
+          "instant": true,
+          "legendFormat": "{{instance}} runtime delta",
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "abs(flowsketch_agent_ebpf_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_ebpf_events_emitted_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_ebpf_ring_dropped_events_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_ebpf_parse_errors_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_ebpf_unsupported_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}) and flowsketch_agent_ebpf_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} > 0",
+          "instant": true,
+          "legendFormat": "{{instance}} eBPF terminal delta",
+          "range": false,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "abs(flowsketch_agent_ebpf_events_emitted_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} - flowsketch_agent_packets_seen_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}) and flowsketch_agent_ebpf_packets_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"} > 0",
+          "instant": true,
+          "legendFormat": "{{instance}} eBPF delivery delta",
+          "range": false,
+          "refId": "E"
+        }
+      ],
+      "title": "Accounting invariants",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Batch processing and exporter activity for the selected agents.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "operations/s",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 6,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_runtime_batches_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "runtime batches",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_gateway_pushes_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "gateway pushes",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_otlp_exports_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "OTLP exports",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Runtime and exporter activity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Known live snapshots versus nodes included in each query's newest mergeable window. A gap can be normal at a window boundary but should not persist.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "nodes",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (query) (flowsketch_gateway_nodes_known{flowsketch_release=~\"${release:regex}\"})",
+          "legendFormat": "{{query}} known",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "max by (query) (flowsketch_gateway_nodes_merged{flowsketch_release=~\"${release:regex}\"})",
+          "legendFormat": "{{query}} merged",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Gateway nodes by query",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Gateway request and snapshot decisions. Rejections mean malformed or merge-incompatible snapshots and must be investigated.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "operations/s",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_gateway_pushes_total{flowsketch_release=~\"${release:regex}\"}[$__rate_interval]))",
+          "legendFormat": "push requests",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_gateway_snapshots_accepted_total{flowsketch_release=~\"${release:regex}\"}[$__rate_interval]))",
+          "legendFormat": "accepted snapshots",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_gateway_snapshots_rejected_total{flowsketch_release=~\"${release:regex}\"}[$__rate_interval]))",
+          "legendFormat": "rejected snapshots",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Gateway push outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current highest exported sketch estimates. Labels carry the query, algorithm, bounded-error contract, window, and group dimensions.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      },
+      "id": 12,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "topk(50, flowsketch_estimate{flowsketch_release=~\"${release:regex}\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Current top estimates",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {},
+            "renameByName": {
+              "Value": "estimate"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "flowsketch",
+    "network-observability"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(flowsketch_agent_ready, flowsketch_release)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Helm release",
+        "multi": true,
+        "name": "release",
+        "options": [],
+        "query": {
+          "query": "label_values(flowsketch_agent_ready, flowsketch_release)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(flowsketch_agent_ready{flowsketch_release=~\"${release:regex}\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Agent instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": {
+          "query": "label_values(flowsketch_agent_ready{flowsketch_release=~\"${release:regex}\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "FlowSketch Operations Overview",
+  "uid": "flowsketch-overview",
+  "version": 1,
+  "weekStart": ""
+}
