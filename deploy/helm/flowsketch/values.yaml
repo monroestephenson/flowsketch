@@ -13,6 +13,8 @@ agent:
   ringBlockSizeBytes: 1048576
   ringBlockCount: 64
   blockRetireTimeoutMs: 64
+  fanoutMode: single
+  fanoutGroup: 0
   ebpf:
     objectPath: /usr/lib/flowsketch/flowsketch_tc.bpf.o
     ringBufferBytes: 16777216
@@ -26,7 +28,7 @@ agent:
   runtimeShardStrategy: flow
   cpuAffinity:
     enabled: false
-    captureCpu: 0
+    captureCpus: [0]
     runtimeCpus: [1]
   gatewayPush:
     enabled: true

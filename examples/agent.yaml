@@ -12,6 +12,8 @@
 #     ringBlockSizeBytes: 1048576
 #     ringBlockCount: 64
 #     blockRetireTimeoutMs: 64
+#     fanoutMode: single      # single | hash | rx_queue
+#     fanoutGroup: 0          # zero derives a process-local group
 #   For tc eBPF instead:
 #     kind: ebpf
 #     interface: eth0
@@ -27,10 +29,11 @@ agent:
   runtimeShards: 1
   runtimeBatchSize: 4096
   runtimeShardStrategy: flow
-  # Linux high-rate deployments can pin the capture thread and each runtime
-  # worker. The runtime list length must equal runtimeShards.
+  # Linux high-rate deployments can pin each capture lane and runtime worker.
+  # The capture list contains one CPU normally, or one per runtime shard when
+  # AF_PACKET fanoutMode is hash/rx_queue.
   # cpuAffinity:
-  #   captureCpu: 0
+  #   captureCpus: [0]
   #   runtimeCpus: [1]
   source:
     kind: pcap

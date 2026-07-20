@@ -150,7 +150,8 @@ performance claims.
 
 ## Next phases
 
-1. Map NIC RSS/RX queues directly to the now-pinnable runtime workers.
+1. Give each implemented AF_PACKET RSS/RX-queue lane a queue-local channel to
+   its pinned runtime worker, removing the shared coordinator bottleneck.
 2. Implement an XDP producer for the same event/accounting contract.
 3. Compare AF_PACKET, tc, and XDP on identical real traces and physical NICs.
 4. Publish a kernel, architecture, container-runtime, and upgrade validation

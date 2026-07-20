@@ -87,12 +87,25 @@ source:
   ringBlockSizeBytes: 1048576
   ringBlockCount: 64
   blockRetireTimeoutMs: 64
+  fanoutMode: single
+  fanoutGroup: 0
 ```
 
 Block size must be a power of two from 64 KiB through 16 MiB, timeout must be
-1–1000 ms, and the full ring may not exceed 1 GiB. Watch the ring gauges,
+1–1000 ms, and all rings combined may not exceed 1 GiB. Watch the ring gauges,
 kernel packet/drop/freeze counters, parser dispositions, and userspace drops
 when tuning. The dedicated M4 runbook is in `docs/m4-validation.md`.
+
+For multi-queue capture, set `fanoutMode: rx_queue`; the agent creates one
+TPACKET_V3 socket and parser lane per runtime shard, and Linux selects the lane
+from the skb receive-queue mapping. `fanoutMode: hash` uses the kernel packet
+hash and is useful for virtual or single-queue devices. Both modes require at
+least two shards and `runtimeShardStrategy: flow`. `fanoutGroup: 0` derives a
+process-local group. If a stable explicit nonzero 16-bit group is required, it
+must remain unique to that agent/interface; sharing it with another capture
+process would split traffic between processes. The kernel-selected lane is
+carried through the bounded channel directly to the same-numbered runtime
+shard. Per-lane metrics reconcile kernel, parser, engine, and drop totals.
 
 For the tc ingress collector, build the object and select `ebpf`:
 
@@ -131,7 +144,7 @@ runtimeShards: 8
 runtimeBatchSize: 8192
 runtimeShardStrategy: flow       # flow or round_robin
 cpuAffinity:                     # optional; Linux logical CPU IDs
-  captureCpu: 0
+  captureCpus: [0]
   runtimeCpus: [1, 2, 3, 4, 5, 6, 7, 8]
 ```
 
@@ -141,9 +154,11 @@ owns its window state; completed states are merged before metrics or gateway
 snapshots are emitted. Memory grows approximately with the shard count, so
 size it from measurements and keep the default of one for small nodes.
 When `cpuAffinity` is present, `runtimeCpus` must contain one unique CPU per
-runtime shard. Startup fails if Linux rejects any requested CPU instead of
-silently running unpinned. The capture CPU may overlap a runtime CPU, but a
-dedicated capture CPU is preferable for high packet rates. In Kubernetes,
+runtime shard. `captureCpus` contains one CPU for ordinary sources and one per
+runtime shard for AF_PACKET `hash`/`rx_queue` fan-out. Startup fails if Linux
+rejects any requested CPU instead of silently running unpinned. Capture CPUs
+may overlap runtime CPUs, but dedicated CPUs are preferable at high packet
+rates. In Kubernetes,
 use Guaranteed QoS with integer CPU requests/limits and a node configured with
 the static CPU Manager policy; the configured host CPU IDs must belong to the
 container's allowed cpuset. The affinity mapping is exported in `/metrics`.

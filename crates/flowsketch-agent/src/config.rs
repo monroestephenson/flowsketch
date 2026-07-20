@@ -9,7 +9,7 @@
 //!   runtimeShards: 4
 //!   runtimeBatchSize: 4096
 //!   cpuAffinity:              # optional, Linux only
-//!     captureCpu: 0
+//!     captureCpus: [0]
 //!     runtimeCpus: [1, 2, 3, 4]
 //!   source:
 //!     kind: pcap            # pcap | af_packet | ebpf
@@ -18,6 +18,8 @@
 //!     ringBlockSizeBytes: 1048576
 //!     ringBlockCount: 64
 //!     blockRetireTimeoutMs: 64
+//!     fanoutMode: rx_queue # single | hash | rx_queue
+//!     fanoutGroup: 0       # derive a process-local group
 //! queries:
 //!   - file: examples/queries/top-talkers.yaml
 //! ```
@@ -40,15 +42,53 @@ pub enum RuntimeShardStrategy {
     RoundRobin,
 }
 
+/// Linux AF_PACKET socket fan-out policy. `rx_queue` maps the kernel skb
+/// queue_mapping to a capture lane; `hash` uses the kernel flow hash and is
+/// useful on virtual/single-queue devices.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AfPacketFanoutMode {
+    Single,
+    Hash,
+    RxQueue,
+}
+
+const fn default_af_packet_fanout_mode() -> AfPacketFanoutMode {
+    AfPacketFanoutMode::Single
+}
+
 /// Optional Linux CPU placement for the capture thread and each long-lived
 /// runtime worker. CPU identifiers are Linux logical CPU numbers.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CpuAffinityConfig {
-    #[serde(rename = "captureCpu", alias = "capture_cpu")]
-    pub capture_cpu: usize,
+    #[serde(
+        rename = "captureCpus",
+        alias = "capture_cpus",
+        alias = "captureCpu",
+        alias = "capture_cpu",
+        deserialize_with = "deserialize_capture_cpus"
+    )]
+    pub capture_cpus: Vec<usize>,
     #[serde(rename = "runtimeCpus", alias = "runtime_cpus")]
     pub runtime_cpus: Vec<usize>,
+}
+
+fn deserialize_capture_cpus<'de, D>(deserializer: D) -> Result<Vec<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(usize),
+        Many(Vec<usize>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(cpu) => vec![cpu],
+        OneOrMany::Many(cpus) => cpus,
+    })
 }
 
 /// Where packets come from.
@@ -85,6 +125,19 @@ pub enum SourceConfig {
             alias = "block_retire_timeout_ms"
         )]
         block_retire_timeout_ms: u32,
+        /// Kernel packet-socket fan-out. Non-single modes create one socket
+        /// and capture lane per runtime shard.
+        #[serde(
+            default = "default_af_packet_fanout_mode",
+            rename = "fanoutMode",
+            alias = "fanout_mode"
+        )]
+        fanout_mode: AfPacketFanoutMode,
+        /// 16-bit packet-socket fan-out group. Zero derives a process-local
+        /// group at startup. An explicit value must be unique to this agent on
+        /// the interface so another capture process cannot join its group.
+        #[serde(default, rename = "fanoutGroup", alias = "fanout_group")]
+        fanout_group: u16,
     },
     /// Linux tc ingress eBPF collector. Loading requires BPF and network
     /// administration capabilities. Fallback is explicit so verifier or
@@ -106,6 +159,26 @@ pub enum SourceConfig {
         )]
         fallback_to_af_packet: bool,
     },
+}
+
+impl SourceConfig {
+    pub(crate) fn capture_lane_count(&self, runtime_shards: usize) -> usize {
+        match self {
+            Self::AfPacket { fanout_mode, .. } if *fanout_mode != AfPacketFanoutMode::Single => {
+                runtime_shards
+            }
+            _ => 1,
+        }
+    }
+
+    pub(crate) fn af_packet_fanout_lanes(&self, runtime_shards: usize) -> usize {
+        match self {
+            Self::AfPacket { fanout_mode, .. } if *fanout_mode != AfPacketFanoutMode::Single => {
+                runtime_shards
+            }
+            _ => 0,
+        }
+    }
 }
 
 const MIN_RING_BLOCK_SIZE_BYTES: u32 = 64 * 1024;
@@ -172,9 +245,17 @@ impl AgentConfig {
                 "agent.runtimeBatchSize must be between 1 and 65536".into(),
             ));
         }
+        let runtime_shard_strategy = raw
+            .agent
+            .runtime_shard_strategy
+            .unwrap_or(RuntimeShardStrategy::Flow);
         let cpu_affinity = raw.agent.cpu_affinity.clone();
-        validate_cpu_affinity(cpu_affinity.as_ref(), runtime_shards)?;
-        validate_source(&raw.agent.source)?;
+        validate_source(&raw.agent.source, runtime_shards, runtime_shard_strategy)?;
+        validate_cpu_affinity(
+            cpu_affinity.as_ref(),
+            raw.agent.source.capture_lane_count(runtime_shards),
+            runtime_shards,
+        )?;
         let export = raw.export.unwrap_or_default();
         let otlp = export.otlp.map(|o| {
             let interval_ms = o.interval_ms.unwrap_or(5_000).max(100);
@@ -230,10 +311,7 @@ impl AgentConfig {
             flush_interval_ms: raw.agent.flush_interval_ms.unwrap_or(1_000).max(10),
             runtime_shards,
             runtime_batch_size,
-            runtime_shard_strategy: raw
-                .agent
-                .runtime_shard_strategy
-                .unwrap_or(RuntimeShardStrategy::Flow),
+            runtime_shard_strategy,
             cpu_affinity,
             source: raw.agent.source,
             query_files: raw.queries.into_iter().map(|q| q.file).collect(),
@@ -293,15 +371,32 @@ impl AgentConfig {
 
 fn validate_cpu_affinity(
     affinity: Option<&CpuAffinityConfig>,
+    capture_lanes: usize,
     runtime_shards: usize,
 ) -> Result<(), AgentError> {
     let Some(affinity) = affinity else {
         return Ok(());
     };
-    if affinity.capture_cpu > MAX_LINUX_CPU_ID {
+    if affinity.capture_cpus.len() != capture_lanes {
         return Err(AgentError::Config(format!(
-            "agent.cpuAffinity.captureCpu must be between 0 and {MAX_LINUX_CPU_ID}"
+            "agent.cpuAffinity.captureCpus must contain exactly one CPU for each of the {capture_lanes} capture lanes"
         )));
+    }
+    if affinity
+        .capture_cpus
+        .iter()
+        .any(|&cpu| cpu > MAX_LINUX_CPU_ID)
+    {
+        return Err(AgentError::Config(format!(
+            "agent.cpuAffinity.captureCpus values must be between 0 and {MAX_LINUX_CPU_ID}"
+        )));
+    }
+    let unique_capture: std::collections::BTreeSet<_> =
+        affinity.capture_cpus.iter().copied().collect();
+    if unique_capture.len() != affinity.capture_cpus.len() {
+        return Err(AgentError::Config(
+            "agent.cpuAffinity.captureCpus must not contain duplicate CPUs".into(),
+        ));
     }
     if affinity.runtime_cpus.len() != runtime_shards {
         return Err(AgentError::Config(format!(
@@ -326,7 +421,11 @@ fn validate_cpu_affinity(
     Ok(())
 }
 
-fn validate_source(source: &SourceConfig) -> Result<(), AgentError> {
+fn validate_source(
+    source: &SourceConfig,
+    runtime_shards: usize,
+    shard_strategy: RuntimeShardStrategy,
+) -> Result<(), AgentError> {
     match source {
         SourceConfig::Pcap { .. } => {}
         SourceConfig::AfPacket {
@@ -334,6 +433,8 @@ fn validate_source(source: &SourceConfig) -> Result<(), AgentError> {
             ring_block_size_bytes,
             ring_block_count,
             block_retire_timeout_ms,
+            fanout_mode,
+            ..
         } => {
             validate_interface(interface, "af_packet")?;
             if !(MIN_RING_BLOCK_SIZE_BYTES..=MAX_RING_BLOCK_SIZE_BYTES)
@@ -350,15 +451,36 @@ fn validate_source(source: &SourceConfig) -> Result<(), AgentError> {
                 ));
             }
             let ring_bytes = u64::from(*ring_block_size_bytes) * u64::from(*ring_block_count);
-            if ring_bytes > MAX_RING_BYTES {
+            let lanes = if *fanout_mode == AfPacketFanoutMode::Single {
+                1
+            } else {
+                runtime_shards
+            };
+            let aggregate_ring_bytes = ring_bytes
+                .checked_mul(lanes as u64)
+                .ok_or_else(|| AgentError::Config("AF_PACKET ring size overflows u64".into()))?;
+            if aggregate_ring_bytes > MAX_RING_BYTES {
                 return Err(AgentError::Config(format!(
-                    "af_packet receive ring is {ring_bytes} bytes; maximum is {MAX_RING_BYTES}"
+                    "aggregate AF_PACKET receive rings are {aggregate_ring_bytes} bytes across {lanes} lane(s); maximum is {MAX_RING_BYTES}"
                 )));
             }
             if !(1..=1_000).contains(block_retire_timeout_ms) {
                 return Err(AgentError::Config(
                     "af_packet blockRetireTimeoutMs must be between 1 and 1000".into(),
                 ));
+            }
+            if *fanout_mode != AfPacketFanoutMode::Single {
+                if runtime_shards < 2 {
+                    return Err(AgentError::Config(
+                        "af_packet fanoutMode requires at least two runtimeShards".into(),
+                    ));
+                }
+                if shard_strategy != RuntimeShardStrategy::Flow {
+                    return Err(AgentError::Config(
+                        "af_packet fanoutMode requires runtimeShardStrategy: flow because the kernel-selected lane maps directly to a runtime shard"
+                            .into(),
+                    ));
+                }
             }
         }
         SourceConfig::Ebpf {
@@ -477,7 +599,7 @@ agent:
   runtimeBatchSize: 8192
   runtimeShardStrategy: round_robin
   cpuAffinity:
-    captureCpu: 0
+    captureCpus: [0]
     runtimeCpus: [1, 2, 3, 4]
   source:
     kind: pcap
@@ -497,7 +619,7 @@ queries:
         assert_eq!(
             cfg.cpu_affinity,
             Some(CpuAffinityConfig {
-                capture_cpu: 0,
+                capture_cpus: vec![0],
                 runtime_cpus: vec![1, 2, 3, 4],
             })
         );
@@ -517,11 +639,15 @@ queries:
                 ring_block_size_bytes,
                 ring_block_count,
                 block_retire_timeout_ms,
+                fanout_mode,
+                fanout_group,
             } => {
                 assert_eq!(interface, "eth0");
                 assert_eq!(ring_block_size_bytes, 1024 * 1024);
                 assert_eq!(ring_block_count, 64);
                 assert_eq!(block_retire_timeout_ms, 64);
+                assert_eq!(fanout_mode, AfPacketFanoutMode::Single);
+                assert_eq!(fanout_group, 0);
             }
             other => panic!("wrong source {other:?}"),
         }
@@ -559,6 +685,32 @@ queries:
             let yaml = format!(
                 "agent:\n  source:\n    kind: af_packet\n    {invalid_source}\nqueries:\n  - file: q.yaml\n"
             );
+            assert!(AgentConfig::from_yaml(&yaml).is_err(), "accepted {yaml}");
+        }
+    }
+
+    #[test]
+    fn validates_af_packet_fanout_against_runtime_shape() {
+        let valid = AgentConfig::from_yaml(
+            "agent:\n  runtimeShards: 4\n  runtimeShardStrategy: flow\n  source:\n    kind: af_packet\n    interface: eth0\n    ringBlockCount: 16\n    fanoutMode: rx_queue\n    fanoutGroup: 77\nqueries:\n  - file: q.yaml\n",
+        )
+        .unwrap();
+        assert_eq!(valid.source.capture_lane_count(valid.runtime_shards), 4);
+        assert!(matches!(
+            valid.source,
+            SourceConfig::AfPacket {
+                fanout_mode: AfPacketFanoutMode::RxQueue,
+                fanout_group: 77,
+                ..
+            }
+        ));
+
+        for agent in [
+            "runtimeShards: 1\n  source: {kind: af_packet, interface: eth0, fanoutMode: hash}",
+            "runtimeShards: 2\n  runtimeShardStrategy: round_robin\n  source: {kind: af_packet, interface: eth0, fanoutMode: rx_queue}",
+            "runtimeShards: 2\n  source: {kind: af_packet, interface: eth0, ringBlockSizeBytes: 16777216, ringBlockCount: 33, fanoutMode: hash}",
+        ] {
+            let yaml = format!("agent:\n  {agent}\nqueries:\n  - file: q.yaml\n");
             assert!(AgentConfig::from_yaml(&yaml).is_err(), "accepted {yaml}");
         }
     }
@@ -661,16 +813,23 @@ queries:
     #[test]
     fn validates_cpu_affinity_shape_and_bounds() {
         let valid = AgentConfig::from_yaml(
-            "agent:\n  runtimeShards: 2\n  cpuAffinity:\n    captureCpu: 0\n    runtimeCpus: [1, 2]\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n",
+            "agent:\n  runtimeShards: 2\n  cpuAffinity:\n    captureCpus: [0]\n    runtimeCpus: [1, 2]\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n",
         )
         .unwrap();
         assert_eq!(valid.cpu_affinity.unwrap().runtime_cpus, vec![1, 2]);
 
+        let legacy = AgentConfig::from_yaml(
+            "agent:\n  runtimeShards: 2\n  cpuAffinity:\n    captureCpu: 0\n    runtimeCpus: [1, 2]\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.cpu_affinity.unwrap().capture_cpus, vec![0]);
+
         for affinity in [
-            "captureCpu: 0\n    runtimeCpus: [1]",
-            "captureCpu: 0\n    runtimeCpus: [1, 1]",
-            "captureCpu: 1024\n    runtimeCpus: [1, 2]",
-            "captureCpu: 0\n    runtimeCpus: [1, 1024]",
+            "captureCpus: []\n    runtimeCpus: [1, 2]",
+            "captureCpus: [0]\n    runtimeCpus: [1]",
+            "captureCpus: [0]\n    runtimeCpus: [1, 1]",
+            "captureCpus: [1024]\n    runtimeCpus: [1, 2]",
+            "captureCpus: [0]\n    runtimeCpus: [1, 1024]",
         ] {
             let yaml = format!(
                 "agent:\n  runtimeShards: 2\n  cpuAffinity:\n    {affinity}\n  source: {{kind: pcap, path: x.pcap}}\nqueries:\n  - file: q.yaml\n"

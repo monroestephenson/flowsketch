@@ -24,12 +24,14 @@ agent:
   ringBlockSizeBytes: 1048576
   ringBlockCount: 64
   blockRetireTimeoutMs: 64
+  fanoutMode: rx_queue
+  fanoutGroup: 0
   runtimeShards: 8
   runtimeBatchSize: 8192
   runtimeShardStrategy: flow
   cpuAffinity:
     enabled: true
-    captureCpu: 0
+    captureCpus: [0, 1, 2, 3, 4, 5, 6, 7]
     runtimeCpus: [1, 2, 3, 4, 5, 6, 7, 8]
 ```
 
@@ -38,13 +40,18 @@ across mergeable sketch shards when elephant flows overload individual queues.
 Sketch memory grows approximately with `runtimeShards`.
 CPU affinity is opt-in and fails closed if a requested logical CPU is outside
 the container's allowed cpuset. `runtimeCpus` must contain one unique CPU per
-runtime shard. For Kubernetes, pair this with Guaranteed QoS and the static
-CPU Manager policy; arbitrary host CPU IDs are not portable between nodes.
+runtime shard; `captureCpus` must contain one CPU per AF_PACKET fan-out lane
+(one for `single`, one per shard for `hash`/`rx_queue`). For Kubernetes, pair
+this with Guaranteed QoS and the static CPU Manager policy; arbitrary host CPU
+IDs are not portable between nodes.
 
-The three ring values configure the Linux TPACKET_V3 receive ring. Their
-defaults allocate 64 MiB per agent. Increase the block count only after
+The three ring values configure each Linux TPACKET_V3 receive ring. Their
+defaults allocate 64 MiB per lane. Increase the block count only after
 measuring kernel drops and container memory on the target node; the chart and
-agent reject rings above 1 GiB. A shorter retire timeout reduces latency for
+agent reject aggregate rings above 1 GiB. `rx_queue` maps skb queue IDs to
+same-numbered runtime shards; `hash` uses Linux packet hashing and works on
+virtual/single-queue devices. Both require `flow` dispatch and at least two
+runtime shards. A shorter retire timeout reduces latency for
 quiet interfaces, while a longer timeout reduces block turnover.
 
 ## tc eBPF source

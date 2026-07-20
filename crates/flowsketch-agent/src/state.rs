@@ -78,8 +78,9 @@ pub struct PublishedState {
     pub gateway_push_failures: AtomicU64,
     pub runtime_batches: AtomicU64,
     pub runtime_shards: usize,
-    capture_cpu_affinity: Option<usize>,
+    capture_cpu_affinity: Vec<usize>,
     runtime_cpu_affinity: Vec<usize>,
+    af_packet_fanout_lanes: Vec<CaptureLaneCounters>,
 
     /// Latest exported window snapshots for the gateway pusher, refreshed
     /// by the engine thread at most once per `interval` (serializing
@@ -88,6 +89,20 @@ pub struct PublishedState {
     snapshot_gate: Mutex<Option<SnapshotGate>>,
     snapshots: Mutex<Vec<SnapshotExport>>,
 }
+
+#[derive(Default)]
+struct CaptureLaneCounters {
+    packets_seen: AtomicU64,
+    packets_parsed: AtomicU64,
+    packets_unparsed: AtomicU64,
+    events_processed: AtomicU64,
+    kernel_packets: AtomicU64,
+    kernel_drops: AtomicU64,
+    queue_freezes: AtomicU64,
+    userspace_drops: AtomicU64,
+}
+
+type CaptureLaneMetric = (&'static str, &'static str, fn(&CaptureLaneCounters) -> u64);
 
 struct SnapshotGate {
     interval: Duration,
@@ -99,6 +114,7 @@ impl PublishedState {
         plans: &[Plan],
         runtime_shards: usize,
         cpu_affinity: Option<&CpuAffinityConfig>,
+        af_packet_fanout_lanes: usize,
     ) -> Self {
         let queries = plans
             .iter()
@@ -147,12 +163,68 @@ impl PublishedState {
             gateway_push_failures: AtomicU64::new(0),
             runtime_batches: AtomicU64::new(0),
             runtime_shards,
-            capture_cpu_affinity: cpu_affinity.map(|affinity| affinity.capture_cpu),
+            capture_cpu_affinity: cpu_affinity
+                .map(|affinity| affinity.capture_cpus.clone())
+                .unwrap_or_default(),
             runtime_cpu_affinity: cpu_affinity
                 .map(|affinity| affinity.runtime_cpus.clone())
                 .unwrap_or_default(),
+            af_packet_fanout_lanes: (0..af_packet_fanout_lanes)
+                .map(|_| CaptureLaneCounters::default())
+                .collect(),
             snapshot_gate: Mutex::new(None),
             snapshots: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn record_capture_lane_packets(
+        &self,
+        lane: usize,
+        seen: u64,
+        parsed: u64,
+        unparsed: u64,
+    ) {
+        if let Some(counters) = self.af_packet_fanout_lanes.get(lane) {
+            counters.packets_seen.fetch_add(seen, Ordering::Relaxed);
+            counters.packets_parsed.fetch_add(parsed, Ordering::Relaxed);
+            counters
+                .packets_unparsed
+                .fetch_add(unparsed, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn record_capture_lane_statistics(
+        &self,
+        lane: usize,
+        packets: u64,
+        drops: u64,
+        queue_freezes: u64,
+    ) {
+        if let Some(counters) = self.af_packet_fanout_lanes.get(lane) {
+            counters
+                .kernel_packets
+                .fetch_add(packets, Ordering::Relaxed);
+            counters.kernel_drops.fetch_add(drops, Ordering::Relaxed);
+            counters
+                .queue_freezes
+                .fetch_add(queue_freezes, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_capture_lane_events_processed(&self, lane: usize, events: u64) {
+        if let Some(counters) = self.af_packet_fanout_lanes.get(lane) {
+            counters
+                .events_processed
+                .fetch_add(events, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn record_capture_lane_userspace_drop(&self, lane: usize) {
+        if let Some(counters) = self.af_packet_fanout_lanes.get(lane) {
+            counters.userspace_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -378,13 +450,13 @@ impl PublishedState {
             ));
         }
         out.push_str(&format!(
-            "# HELP flowsketch_agent_capture_ring_bytes Bytes configured for the Linux TPACKET_V3 receive ring.\n\
+            "# HELP flowsketch_agent_capture_ring_bytes Aggregate bytes configured across Linux TPACKET_V3 receive rings.\n\
              # TYPE flowsketch_agent_capture_ring_bytes gauge\n\
              flowsketch_agent_capture_ring_bytes {}\n",
             self.capture_ring_bytes.load(Ordering::Relaxed)
         ));
         out.push_str(&format!(
-            "# HELP flowsketch_agent_capture_ring_blocks Blocks configured in the Linux TPACKET_V3 receive ring.\n\
+            "# HELP flowsketch_agent_capture_ring_blocks Aggregate blocks configured across Linux TPACKET_V3 receive rings.\n\
              # TYPE flowsketch_agent_capture_ring_blocks gauge\n\
              flowsketch_agent_capture_ring_blocks {}\n",
             self.capture_ring_blocks.load(Ordering::Relaxed)
@@ -408,18 +480,72 @@ impl PublishedState {
             self.runtime_shards
         ));
         out.push_str(&format!(
+            "# HELP flowsketch_agent_af_packet_fanout_lanes Active Linux AF_PACKET kernel fan-out lanes.\n\
+             # TYPE flowsketch_agent_af_packet_fanout_lanes gauge\n\
+             flowsketch_agent_af_packet_fanout_lanes {}\n",
+            self.af_packet_fanout_lanes.len()
+        ));
+        let lane_counters: [CaptureLaneMetric; 8] = [
+            (
+                "flowsketch_agent_af_packet_lane_packets_seen_total",
+                "Packets observed by an AF_PACKET fan-out capture lane.",
+                |lane| lane.packets_seen.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_packets_parsed_total",
+                "Packets converted into flow events by an AF_PACKET fan-out capture lane.",
+                |lane| lane.packets_parsed.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_packets_unparsed_total",
+                "Unsupported or malformed packets skipped by an AF_PACKET fan-out capture lane.",
+                |lane| lane.packets_unparsed.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_events_processed_total",
+                "Kernel-partitioned events processed by the matching runtime shard.",
+                |lane| lane.events_processed.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_kernel_packets_total",
+                "Packets accepted by an AF_PACKET fan-out lane socket, including receive-ring drops.",
+                |lane| lane.kernel_packets.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_kernel_dropped_packets_total",
+                "Packets dropped from an AF_PACKET fan-out lane receive ring before userspace consumed them.",
+                |lane| lane.kernel_drops.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_kernel_queue_freezes_total",
+                "Receive-queue freezes reported by an AF_PACKET fan-out lane.",
+                |lane| lane.queue_freezes.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_af_packet_lane_userspace_dropped_events_total",
+                "Parsed events dropped by an AF_PACKET fan-out lane because the engine channel was full.",
+                |lane| lane.userspace_drops.load(Ordering::Relaxed),
+            ),
+        ];
+        for (name, help, value) in lane_counters {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+            for (lane, counters) in self.af_packet_fanout_lanes.iter().enumerate() {
+                out.push_str(&format!("{name}{{lane=\"{lane}\"}} {}\n", value(counters)));
+            }
+        }
+        out.push_str(&format!(
             "# HELP flowsketch_agent_cpu_affinity_enabled Whether explicit Linux capture/runtime CPU affinity is configured.\n\
              # TYPE flowsketch_agent_cpu_affinity_enabled gauge\n\
              flowsketch_agent_cpu_affinity_enabled {}\n",
-            u8::from(self.capture_cpu_affinity.is_some())
+            u8::from(!self.capture_cpu_affinity.is_empty())
         ));
         out.push_str(
-            "# HELP flowsketch_agent_capture_cpu_affinity Configured Linux logical CPU for the capture thread.\n\
+            "# HELP flowsketch_agent_capture_cpu_affinity Configured Linux logical CPU for each capture lane.\n\
              # TYPE flowsketch_agent_capture_cpu_affinity gauge\n",
         );
-        if let Some(cpu) = self.capture_cpu_affinity {
+        for (lane, cpu) in self.capture_cpu_affinity.iter().enumerate() {
             out.push_str(&format!(
-                "flowsketch_agent_capture_cpu_affinity{{cpu=\"{cpu}\"}} 1\n"
+                "flowsketch_agent_capture_cpu_affinity{{lane=\"{lane}\",cpu=\"{cpu}\"}} 1\n"
             ));
         }
         out.push_str(
@@ -466,10 +592,10 @@ mod tests {
     #[test]
     fn renders_capture_accounting_and_ring_metrics() {
         let affinity = CpuAffinityConfig {
-            capture_cpu: 0,
+            capture_cpus: vec![0, 5],
             runtime_cpus: vec![1, 2, 3, 4],
         };
-        let state = PublishedState::new(&[], 4, Some(&affinity));
+        let state = PublishedState::new(&[], 4, Some(&affinity), 2);
         state.packets_seen.store(11, Ordering::Relaxed);
         state.packets_parsed.store(9, Ordering::Relaxed);
         state.packets_unparsed.store(2, Ordering::Relaxed);
@@ -490,6 +616,10 @@ mod tests {
         state.ebpf_unsupported_packets.store(1, Ordering::Relaxed);
         state.ebpf_fallbacks.store(2, Ordering::Relaxed);
         state.ebpf_ring_bytes.store(16_777_216, Ordering::Relaxed);
+        state.record_capture_lane_packets(1, 7, 6, 1);
+        state.record_capture_lane_statistics(1, 8, 1, 2);
+        state.record_capture_lane_events_processed(1, 5);
+        state.record_capture_lane_userspace_drop(1);
 
         let metrics = state.render_health_metrics();
         for expected in [
@@ -510,8 +640,18 @@ mod tests {
             "flowsketch_agent_ebpf_fallbacks_total 2\n",
             "flowsketch_agent_ebpf_ring_bytes 16777216\n",
             "flowsketch_agent_runtime_shards 4\n",
+            "flowsketch_agent_af_packet_fanout_lanes 2\n",
+            "flowsketch_agent_af_packet_lane_packets_seen_total{lane=\"1\"} 7\n",
+            "flowsketch_agent_af_packet_lane_packets_parsed_total{lane=\"1\"} 6\n",
+            "flowsketch_agent_af_packet_lane_packets_unparsed_total{lane=\"1\"} 1\n",
+            "flowsketch_agent_af_packet_lane_events_processed_total{lane=\"1\"} 5\n",
+            "flowsketch_agent_af_packet_lane_kernel_packets_total{lane=\"1\"} 8\n",
+            "flowsketch_agent_af_packet_lane_kernel_dropped_packets_total{lane=\"1\"} 1\n",
+            "flowsketch_agent_af_packet_lane_kernel_queue_freezes_total{lane=\"1\"} 2\n",
+            "flowsketch_agent_af_packet_lane_userspace_dropped_events_total{lane=\"1\"} 1\n",
             "flowsketch_agent_cpu_affinity_enabled 1\n",
-            "flowsketch_agent_capture_cpu_affinity{cpu=\"0\"} 1\n",
+            "flowsketch_agent_capture_cpu_affinity{lane=\"0\",cpu=\"0\"} 1\n",
+            "flowsketch_agent_capture_cpu_affinity{lane=\"1\",cpu=\"5\"} 1\n",
             "flowsketch_agent_runtime_cpu_affinity{worker=\"3\",cpu=\"4\"} 1\n",
         ] {
             assert!(metrics.contains(expected), "missing {expected:?}");

@@ -20,7 +20,7 @@
     "agent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "source", "interface", "ringBlockSizeBytes", "ringBlockCount", "blockRetireTimeoutMs", "ebpf", "listenPort", "hostPort", "seed", "flushIntervalMs", "runtimeShards", "runtimeBatchSize", "runtimeShardStrategy", "cpuAffinity", "gatewayPush", "otlp", "updateStrategy", "podAnnotations", "podLabels", "priorityClassName", "nodeSelector", "tolerations", "affinity", "resources"],
+      "required": ["enabled", "source", "interface", "ringBlockSizeBytes", "ringBlockCount", "blockRetireTimeoutMs", "fanoutMode", "fanoutGroup", "ebpf", "listenPort", "hostPort", "seed", "flushIntervalMs", "runtimeShards", "runtimeBatchSize", "runtimeShardStrategy", "cpuAffinity", "gatewayPush", "otlp", "updateStrategy", "podAnnotations", "podLabels", "priorityClassName", "nodeSelector", "tolerations", "affinity", "resources"],
       "properties": {
         "enabled": {"type": "boolean"},
         "source": {"enum": ["af_packet", "ebpf"]},
@@ -28,6 +28,8 @@
         "ringBlockSizeBytes": {"type": "integer", "enum": [65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216]},
         "ringBlockCount": {"type": "integer", "minimum": 1, "maximum": 16384},
         "blockRetireTimeoutMs": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "fanoutMode": {"enum": ["single", "hash", "rx_queue"]},
+        "fanoutGroup": {"type": "integer", "minimum": 0, "maximum": 65535},
         "ebpf": {"$ref": "#/definitions/ebpf"},
         "listenPort": {"type": "integer", "minimum": 1024, "maximum": 65535},
         "hostPort": {"type": "integer", "minimum": 0, "maximum": 65535},
@@ -135,10 +137,16 @@
     "cpuAffinity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "captureCpu", "runtimeCpus"],
+      "required": ["enabled", "captureCpus", "runtimeCpus"],
       "properties": {
         "enabled": {"type": "boolean"},
-        "captureCpu": {"type": "integer", "minimum": 0, "maximum": 1023},
+        "captureCpus": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0, "maximum": 1023}
+        },
         "runtimeCpus": {
           "type": "array",
           "minItems": 1,

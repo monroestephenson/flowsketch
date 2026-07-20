@@ -24,6 +24,18 @@ pub(super) struct RingSettings {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) enum FanoutMode {
+    Hash,
+    RxQueue,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FanoutSettings {
+    pub group_id: u16,
+    pub mode: FanoutMode,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct PacketStatistics {
     pub packets: u32,
     pub drops: u32,
@@ -38,8 +50,17 @@ pub(super) struct AfPacketSocket {
     fd: OwnedFd,
 }
 
+// SAFETY: the mmap and fd are uniquely owned by the socket. Moving that
+// ownership to a capture-lane thread does not create aliases; all ring access
+// still requires `&mut self`, and the socket is never shared between threads.
+unsafe impl Send for AfPacketSocket {}
+
 impl AfPacketSocket {
-    pub(super) fn open(interface: &str, settings: RingSettings) -> Result<Self, AgentError> {
+    pub(super) fn open(
+        interface: &str,
+        settings: RingSettings,
+        fanout: Option<FanoutSettings>,
+    ) -> Result<Self, AgentError> {
         // A zero socket protocol keeps capture disabled until bind(2) selects
         // the requested interface. Opening with ETH_P_ALL here would briefly
         // admit packets from every interface while the ring is configured.
@@ -145,6 +166,9 @@ impl AfPacketSocket {
         };
         let socket = AfPacketSocket { ring, fd };
         socket.bind(interface, proto_be)?;
+        if let Some(fanout) = fanout {
+            socket.join_fanout(fanout)?;
+        }
         Ok(socket)
     }
 
@@ -180,6 +204,22 @@ impl AfPacketSocket {
                 io::Error::last_os_error()
             )))
         }
+    }
+
+    fn join_fanout(&self, settings: FanoutSettings) -> Result<(), AgentError> {
+        let argument = fanout_argument(settings);
+        set_option(
+            self.fd.as_raw_fd(),
+            libc::SOL_PACKET,
+            libc::PACKET_FANOUT,
+            &argument,
+        )
+        .map_err(|error| {
+            AgentError::Source(format!(
+                "cannot join PACKET_FANOUT group {} in {:?} mode: {error}",
+                settings.group_id, settings.mode
+            ))
+        })
     }
 
     pub(super) fn ring_bytes(&self) -> usize {
@@ -364,6 +404,14 @@ impl AfPacketSocket {
     }
 }
 
+fn fanout_argument(settings: FanoutSettings) -> libc::c_uint {
+    let mode = match settings.mode {
+        FanoutMode::Hash => libc::PACKET_FANOUT_HASH,
+        FanoutMode::RxQueue => libc::PACKET_FANOUT_QM,
+    };
+    libc::c_uint::from(settings.group_id) | (mode << 16)
+}
+
 struct PacketRing {
     base: NonNull<u8>,
     len: usize,
@@ -430,5 +478,28 @@ fn set_option<T>(
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_packet_fanout_group_and_mode() {
+        assert_eq!(
+            fanout_argument(FanoutSettings {
+                group_id: 0x1234,
+                mode: FanoutMode::Hash,
+            }),
+            0x1234 | (libc::PACKET_FANOUT_HASH << 16)
+        );
+        assert_eq!(
+            fanout_argument(FanoutSettings {
+                group_id: 77,
+                mode: FanoutMode::RxQueue,
+            }),
+            77 | (libc::PACKET_FANOUT_QM << 16)
+        );
     }
 }

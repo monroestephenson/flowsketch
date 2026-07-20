@@ -18,7 +18,10 @@ data:
       runtimeShardStrategy: {{ .Values.agent.runtimeShardStrategy }}
       {{- if .Values.agent.cpuAffinity.enabled }}
       cpuAffinity:
-        captureCpu: {{ .Values.agent.cpuAffinity.captureCpu }}
+        captureCpus:
+          {{- range .Values.agent.cpuAffinity.captureCpus }}
+          - {{ . }}
+          {{- end }}
         runtimeCpus:
           {{- range .Values.agent.cpuAffinity.runtimeCpus }}
           - {{ . }}
@@ -35,6 +38,8 @@ data:
         ringBlockSizeBytes: {{ .Values.agent.ringBlockSizeBytes }}
         ringBlockCount: {{ .Values.agent.ringBlockCount }}
         blockRetireTimeoutMs: {{ .Values.agent.blockRetireTimeoutMs }}
+        fanoutMode: {{ .Values.agent.fanoutMode }}
+        fanoutGroup: {{ .Values.agent.fanoutGroup }}
         {{- end }}
     queries:
       {{- range $name, $_ := .Values.queries }}

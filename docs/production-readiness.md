@@ -112,5 +112,6 @@ affinity configuration, and zero unexplained drops.
 - Alert on ring drops, parse errors, userspace drops, and explicit fallback.
 - Keep fallback disabled unless the deployment intentionally grants NET_RAW
   and accepts an AF_PACKET downgrade.
-- XDP, direct RSS queue mapping, and physical high-rate comparison remain
-  future work.
+- XDP, queue-local lane-to-worker channels, and physical high-rate comparison
+  remain future work. AF_PACKET HASH/RX_QUEUE kernel fan-out and direct
+  lane-to-shard mapping are implemented and VM-gated.

@@ -112,7 +112,7 @@ agent:
   runtimeShards: $RUNTIME_SHARDS
   runtimeBatchSize: 128
   cpuAffinity:
-    captureCpu: $CAPTURE_CPU
+    captureCpus: [$CAPTURE_CPU]
     runtimeCpus: $runtime_cpu_list
   source:
     kind: af_packet
@@ -200,7 +200,7 @@ done
 
 metrics="$(curl -fsS "http://127.0.0.1:$PORT/metrics")"
 grep -q '^flowsketch_agent_cpu_affinity_enabled 1$' <<<"$metrics"
-grep -q "^flowsketch_agent_capture_cpu_affinity{cpu=\"$CAPTURE_CPU\"} 1$" <<<"$metrics"
+grep -q "^flowsketch_agent_capture_cpu_affinity{lane=\"0\",cpu=\"$CAPTURE_CPU\"} 1$" <<<"$metrics"
 for ((worker = 0; worker < RUNTIME_SHARDS; worker++)); do
   grep -q "^flowsketch_agent_runtime_cpu_affinity{worker=\"$worker\",cpu=\"${RUNTIME_CPUS[$worker]}\"} 1$" <<<"$metrics"
 done
@@ -214,7 +214,7 @@ cat >"$INVALID_CONFIG" <<EOF
 agent:
   runtimeShards: 1
   cpuAffinity:
-    captureCpu: $CAPTURE_CPU
+    captureCpus: [$CAPTURE_CPU]
     runtimeCpus: [$DISALLOWED_CPU]
   source: {kind: pcap, path: /does/not/matter.pcap}
 queries:

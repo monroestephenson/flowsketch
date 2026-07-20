@@ -10,11 +10,28 @@
 {{- if and .Values.gateway.enabled (not .Values.serviceAccounts.gateway.create) (empty .Values.serviceAccounts.gateway.name) -}}
 {{- fail "serviceAccounts.gateway.name is required when create=false" -}}
 {{- end -}}
-{{- if and .Values.agent.enabled (eq .Values.agent.source "af_packet") (gt (mul .Values.agent.ringBlockSizeBytes .Values.agent.ringBlockCount) 1073741824) -}}
-{{- fail "agent AF_PACKET receive ring must not exceed 1 GiB" -}}
+{{- $fanoutEnabled := and (eq .Values.agent.source "af_packet") (ne .Values.agent.fanoutMode "single") -}}
+{{- $captureLanes := 1 -}}
+{{- if $fanoutEnabled -}}
+{{- $captureLanes = int .Values.agent.runtimeShards -}}
+{{- end -}}
+{{- if and .Values.agent.enabled (eq .Values.agent.source "af_packet") (gt (mul (mul .Values.agent.ringBlockSizeBytes .Values.agent.ringBlockCount) $captureLanes) 1073741824) -}}
+{{- fail "aggregate agent AF_PACKET receive rings must not exceed 1 GiB" -}}
 {{- end -}}
 {{- if and (ne .Values.agent.source "ebpf") .Values.agent.ebpf.fallbackToAfPacket -}}
 {{- fail "agent.ebpf.fallbackToAfPacket is only valid when agent.source=ebpf" -}}
+{{- end -}}
+{{- if and (ne .Values.agent.source "af_packet") (ne .Values.agent.fanoutMode "single") -}}
+{{- fail "agent.fanoutMode is only valid when agent.source=af_packet" -}}
+{{- end -}}
+{{- if and $fanoutEnabled (lt (int .Values.agent.runtimeShards) 2) -}}
+{{- fail "agent.fanoutMode requires at least two runtime shards" -}}
+{{- end -}}
+{{- if and $fanoutEnabled (ne .Values.agent.runtimeShardStrategy "flow") -}}
+{{- fail "agent.fanoutMode requires agent.runtimeShardStrategy=flow" -}}
+{{- end -}}
+{{- if and .Values.agent.cpuAffinity.enabled (ne (len .Values.agent.cpuAffinity.captureCpus) $captureLanes) -}}
+{{- fail "agent.cpuAffinity.captureCpus must contain exactly one CPU for each capture lane" -}}
 {{- end -}}
 {{- if and .Values.agent.cpuAffinity.enabled (ne (len .Values.agent.cpuAffinity.runtimeCpus) (int .Values.agent.runtimeShards)) -}}
 {{- fail "agent.cpuAffinity.runtimeCpus must contain exactly one CPU for each runtime shard" -}}

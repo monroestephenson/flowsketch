@@ -34,6 +34,14 @@ helm template affinity "$CHART" --namespace flowsketch \
   --set agent.runtimeShards=2 \
   --set 'agent.cpuAffinity.runtimeCpus[0]=1' \
   --set 'agent.cpuAffinity.runtimeCpus[1]=2' >"$TMP/helm-affinity.yaml"
+helm template fanout "$CHART" --namespace flowsketch \
+  --set agent.runtimeShards=2 \
+  --set agent.fanoutMode=rx_queue \
+  --set agent.cpuAffinity.enabled=true \
+  --set 'agent.cpuAffinity.captureCpus[0]=0' \
+  --set 'agent.cpuAffinity.captureCpus[1]=1' \
+  --set 'agent.cpuAffinity.runtimeCpus[0]=2' \
+  --set 'agent.cpuAffinity.runtimeCpus[1]=3' >"$TMP/helm-fanout.yaml"
 helm package "$CHART" --destination "$TMP" >/dev/null
 
 grep -q 'kind: DaemonSet' "$TMP/helm-default.yaml"
@@ -48,8 +56,11 @@ if grep -q 'add:.*NET_RAW' "$TMP/helm-ebpf.yaml"; then
   exit 1
 fi
 grep -q 'add: \["BPF", "NET_ADMIN", "PERFMON", "NET_RAW"\]' "$TMP/helm-ebpf-fallback.yaml"
-grep -q 'captureCpu: 0' "$TMP/helm-affinity.yaml"
+grep -q 'captureCpus:' "$TMP/helm-affinity.yaml"
 grep -q -- '- 2' "$TMP/helm-affinity.yaml"
+grep -q 'fanoutMode: rx_queue' "$TMP/helm-fanout.yaml"
+grep -q 'fanoutGroup: 0' "$TMP/helm-fanout.yaml"
+grep -q -- '- 3' "$TMP/helm-fanout.yaml"
 grep -q 'kind: PodMonitor' "$TMP/helm-monitored.yaml"
 grep -q 'kind: ServiceMonitor' "$TMP/helm-monitored.yaml"
 grep -q 'kind: PrometheusRule' "$TMP/helm-monitored.yaml"
@@ -120,6 +131,33 @@ if helm template invalid "$CHART" \
   --set agent.cpuAffinity.enabled=true \
   --set agent.runtimeShards=2 >"$TMP/invalid" 2>&1; then
   echo "chart accepted CPU affinity without one runtime CPU per shard" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.fanoutMode=hash >"$TMP/invalid" 2>&1; then
+  echo "chart accepted AF_PACKET fan-out with only one runtime shard" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.runtimeShards=2 \
+  --set agent.runtimeShardStrategy=round_robin \
+  --set agent.fanoutMode=hash >"$TMP/invalid" 2>&1; then
+  echo "chart accepted AF_PACKET fan-out with round-robin runtime dispatch" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.runtimeShards=4 \
+  --set agent.fanoutMode=rx_queue \
+  --set agent.ringBlockSizeBytes=16777216 \
+  --set agent.ringBlockCount=17 >"$TMP/invalid" 2>&1; then
+  echo "chart accepted aggregate AF_PACKET fan-out rings larger than 1 GiB" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.source=ebpf \
+  --set agent.runtimeShards=2 \
+  --set agent.fanoutMode=hash >"$TMP/invalid" 2>&1; then
+  echo "chart accepted AF_PACKET fan-out settings for an eBPF source" >&2
   exit 1
 fi
 

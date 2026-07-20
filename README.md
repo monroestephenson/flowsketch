@@ -30,12 +30,13 @@ Implemented today:
 | Deployment prep | Dockerfile, systemd, strict Helm chart/schema, Kustomize baseline, monitors/alerts, deployment CI |
 | eBPF tc collector | Verifier-safe IPv4/IPv6 parser, Aya loader, ring/drop accounting, least-privilege attach, explicit AF_PACKET fallback |
 | CPU placement | Optional fail-closed Linux pinning for capture and each runtime worker, with affinity metrics and Helm configuration |
+| AF_PACKET fan-out | Linux HASH and RX_QUEUE fan-out, one pinned parser/socket lane per runtime shard, direct lane-to-shard dispatch, per-lane loss accounting |
 
 Not implemented yet:
 
 | Gap | Why it matters |
 | --- | -------------- |
-| Parallel RX-queue ingest | Runtime shards exist; capture still needs direct RSS/RX-queue fan-out for 25/40/100 Gb/s |
+| Queue-local handoff | Kernel RX-queue fan-out exists, but capture lanes still converge on one bounded event channel and engine coordinator |
 | XDP collector | Needed to compare a pre-skb path and progress beyond tc ingress at higher packet rates |
 | Kubernetes CRD/operator | Needed for declarative query lifecycle and admission control |
 | Kubernetes metadata enrichment | Needed for namespace, pod, service, and workload queries |
@@ -52,8 +53,9 @@ kubectl kustomize deploy/kubernetes
 scripts/validate-deploy.sh
 ```
 
-The workspace test suite currently has 171 passing cross-platform tests and
-174 on Linux, where capture, eBPF accounting, and CPU-affinity tests are enabled.
+The workspace test suite currently has 173 passing cross-platform tests and
+177 on Linux, where capture, fan-out, eBPF accounting, and CPU-affinity tests
+are enabled.
 
 ## Live Capture Today
 
@@ -65,12 +67,16 @@ FlowSketch currently has three agent source modes:
 | `af_packet` | Linux only, needs root or `CAP_NET_RAW` | live packets are drained from a bounded TPACKET_V3 mmap ring into the runtime |
 | `ebpf` | Linux 5.8+; validated on x86_64 Linux 6.8 | tc ingress emits header-only records through a bounded BPF ring buffer |
 
-The live Linux path uses a configurable TPACKET_V3 memory-mapped AF_PACKET
-receive ring, parses Ethernet/IP/TCP/UDP headers with kernel packet timestamps,
-and pushes `FlowEvent`s into the same merge-correct sharded sketch runtime used
-by replay. It reports exact parser dispositions, AF_PACKET packet/drop/freeze
-counters, ring sizing, and userspace channel drops. Socket statistics are
-sampled about once per second, including while capture is idle.
+The live Linux path uses configurable TPACKET_V3 memory-mapped AF_PACKET
+receive rings, parses Ethernet/IP/TCP/UDP headers with kernel packet
+timestamps, and pushes `FlowEvent`s into the same merge-correct sharded sketch
+runtime used by replay. `fanoutMode: rx_queue` assigns the skb queue mapping to
+one socket/parser lane per runtime shard; `hash` uses Linux packet hashing for
+virtual or single-queue devices. The kernel-selected lane maps directly to the
+same-numbered runtime shard without another userspace 5-tuple hash. Aggregate
+and per-lane metrics reconcile packet/drop/freeze counters, parser
+dispositions, engine events, ring sizing, and userspace channel drops. Socket
+statistics are sampled about once per second, including while capture is idle.
 
 The tc eBPF path parses Ethernet, up to two VLAN tags, IPv4/IPv6, bounded IPv6
 extension chains, TCP, and UDP without altering packets. It exposes mutually
@@ -79,7 +85,9 @@ headers, and unsupported packets, then feeds the same bounded runtime channel.
 It fails closed unless `fallbackToAfPacket: true` is configured. The loader was
 validated in the Linux VM as a non-root process with `CAP_BPF`,
 `CAP_NET_ADMIN`, and `CAP_PERFMON`, without `CAP_SYS_ADMIN` or `CAP_NET_RAW`.
-It does not yet use XDP, AF_XDP, or direct RSS receive-queue ingestion.
+It does not yet use XDP or AF_XDP. Fan-out parser lanes still converge on one
+bounded event channel and engine coordinator, so this is not yet a fully
+queue-local 25/40/100 Gb/s architecture.
 
 GitHub Actions can run a true live functional test by creating a veth pair,
 running AF_PACKET with only `CAP_NET_RAW` and tc eBPF with only its three
@@ -96,6 +104,7 @@ For local Linux VMs, the same smoke test can be run with:
 ```bash
 cargo build --locked --release -p flowsketch-cli
 bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
+bash scripts/linux-afpacket-fanout-smoke.sh target/release/flowsketch
 bash scripts/linux-m4-live-validation.sh target/release/flowsketch
 bash scripts/linux-ebpf-live-smoke.sh target/release/flowsketch
 ```
@@ -1162,14 +1171,15 @@ claims.
 | M4: 10 Gb/s live Linux | real 10 Gb/s capture without silent loss | validation-ready; physical evidence pending | TPACKET_V3 capture, exact replay/interface/kernel/parser/engine accounting, CPU/loss report, and CI veth gate exist; a clean two-port 10 GbE hardware PASS is still required |
 | M5: Kubernetes v1 | normal platform-team deployment | packaging done, control plane partial | strict Helm schema, hardened workloads, monitors/alerts, render CI, and resource defaults exist; metadata enrichment and operator/CRD remain |
 | M6: eBPF collector | production Linux ingest path | baseline done | tc ingress program, ring-buffer drop counters, verifier-safe parser, explicit AF_PACKET fallback, and VM attach/detach gate exist |
-| M7: 25/40 Gb/s | serious infrastructure traffic | runtime/CPU placement partial | merge-correct sharded runtime, balanced dispatch, and fail-closed Linux CPU affinity exist; direct RSS queue mapping, physical live replay, and p99 latency remain |
+| M7: 25/40 Gb/s | serious infrastructure traffic | kernel fan-out baseline done; hardware evidence pending | HASH/RX_QUEUE TPACKET_V3 lanes, direct queue-to-shard mapping, exact per-lane accounting, and fail-closed CPU affinity pass the Linux VM gate; queue-local channels, physical live replay, and p99 latency remain |
 | M8: 100 Gb/s mixed traffic | realistic 100G packet-size distribution | not done | XDP/eBPF or AF_XDP path, sharded userspace, live NIC validation, public benchmark report |
 | M9: 100 Gb/s minimum packets | 148.8Mpps worst case | research/hardware tier | XDP prefiltering, AF_XDP/DPDK or hardware offload, sampling/preaggregation strategy |
 | M10: production v1 | trusted operational deployment | not done | security posture, auth/TLS guidance, HA gateway story, dashboards, alerts, runbooks, upgrade tests |
 
-The immediate external gate is the physical M4 run, then the capture side of
-M7. M4 is the first milestone that can honestly claim "10 Gb/s" in a live
-environment; virtual validation alone does not satisfy it.
+The immediate external gates are the physical M4 run and physical M7 fan-out
+run. M4 is the first milestone that can honestly claim "10 Gb/s" in a live
+environment; virtual validation alone does not satisfy either throughput
+claim.
 
 ## Roadmap
 
@@ -1444,7 +1454,7 @@ What is missing before a production v1:
 
 - physical live Linux validation at 10/25/40/100 Gb/s
 - XDP/AF_XDP collector and loss accounting
-- direct parallel RX-queue ingestion (runtime execution and optional Linux CPU pinning exist)
+- queue-local lane-to-worker channels (kernel RX-queue mapping and pinned parser/runtime lanes exist)
 - gateway HA/sharding or clear single-writer semantics
 - TLS/auth/deployment guidance for non-local HTTP endpoints
 - Kubernetes metadata, CRD, and operator
@@ -1458,7 +1468,7 @@ See [`docs/production-readiness.md`](docs/production-readiness.md).
 
 If the next work is about making FlowSketch more real, prioritize this order:
 
-1. Feed pinned runtime workers directly from RSS/RX queues, avoiding the serial parser/dispatcher.
+1. Replace the shared capture channel/coordinator with queue-local lane-to-worker handoff, preserving the implemented RSS/RX-queue mapping.
 2. Add and benchmark an XDP variant against AF_PACKET and eBPF tc with hardware replay where available.
 3. Add Kubernetes metadata enrichment for node, namespace, pod, service, and workload dimensions.
 4. Publish signed chart/release artifacts and a versioned upgrade test matrix.
@@ -1555,7 +1565,7 @@ The practical order remains:
 7. flowsketch-otel
 8. flowsketch-gateway
 9. eBPF tc collector
-10. direct RSS queue ingestion, CPU affinity, and XDP
+10. queue-local RSS handoff and XDP (kernel fan-out and CPU affinity are implemented)
 11. Kubernetes metadata and operator/CRD
 12. planner v1 expansion
 13. Hubble, Datadog, Grafana, ClickHouse, Kafka

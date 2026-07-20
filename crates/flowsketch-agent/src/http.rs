@@ -99,7 +99,9 @@ fn route(method: &str, path: &str, state: &PublishedState) -> (u16, &'static str
             }
         }
         "/readyz" => {
-            if state.ready.load(Ordering::Acquire) {
+            if state.source_error.lock().unwrap().is_some() {
+                (503, "text/plain", "capture source failed\n".into())
+            } else if state.ready.load(Ordering::Acquire) {
                 (200, "text/plain", "ready\n".into())
             } else {
                 (503, "text/plain", "starting\n".into())
@@ -231,5 +233,15 @@ mod tests {
         let mut reader = BufReader::new(std::io::Cursor::new(b"GET / HTTP/1.1\r\n"));
         let line = read_line_bounded(&mut reader, 1024).unwrap().unwrap();
         assert_eq!(line, "GET / HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn readiness_fails_after_capture_source_error() {
+        let state = PublishedState::new(&[], 1, None, 0);
+        assert_eq!(route("GET", "/readyz", &state).0, 503);
+        state.ready.store(true, Ordering::Release);
+        assert_eq!(route("GET", "/readyz", &state).0, 200);
+        *state.source_error.lock().unwrap() = Some("attach failed".into());
+        assert_eq!(route("GET", "/readyz", &state).0, 503);
     }
 }

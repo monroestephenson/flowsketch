@@ -42,6 +42,14 @@ pub use state::PublishedState;
 /// engine falls behind, capture drops (and counts) rather than blocking.
 const EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
+/// A parsed event plus an optional kernel-selected AF_PACKET lane. Fan-out
+/// lanes map one-to-one to runtime shards, so carrying the lane through the
+/// bounded channel avoids hashing the directional tuple a second time.
+pub(crate) struct CapturedEvent {
+    pub(crate) event: FlowEvent,
+    pub(crate) lane: Option<usize>,
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("config error: {0}")]
@@ -76,10 +84,12 @@ pub fn run(
         ShardedQueryEngine::new(plans.clone(), hash, config.runtime_shards)?
     };
 
+    let fanout_lanes = config.source.af_packet_fanout_lanes(config.runtime_shards);
     let published = Arc::new(PublishedState::new(
         &plans,
         config.runtime_shards,
         config.cpu_affinity.as_ref(),
+        fanout_lanes,
     ));
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| AgentError::Http(format!("cannot bind {}: {e}", config.listen)))?;
@@ -95,29 +105,25 @@ pub fn run(
     }
     on_ready(addr);
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<FlowEvent>(EVENT_CHANNEL_CAPACITY);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<CapturedEvent>(EVENT_CHANNEL_CAPACITY);
     let capture_state = Arc::clone(&published);
     let source_cfg = config.source.clone();
-    let capture_cpu = config
+    let capture_runtime_shards = config.runtime_shards;
+    let capture_cpus = config
         .cpu_affinity
         .as_ref()
-        .map(|affinity| affinity.capture_cpu);
+        .map(|affinity| affinity.capture_cpus.clone())
+        .unwrap_or_default();
     let capture = std::thread::Builder::new()
         .name("fs-capture".into())
         .spawn(move || {
-            #[cfg(target_os = "linux")]
-            if let Some(cpu) = capture_cpu {
-                affinity::pin_current_thread(cpu).map_err(|error| {
-                    AgentError::Source(format!("cannot pin capture thread to CPU {cpu}: {error}"))
-                })?;
-            }
-            #[cfg(not(target_os = "linux"))]
-            if capture_cpu.is_some() {
-                return Err(AgentError::Config(
-                    "CPU affinity is supported only on Linux".into(),
-                ));
-            }
-            source::capture_loop(source_cfg, tx, capture_state)
+            source::capture_loop(
+                source_cfg,
+                tx,
+                capture_state,
+                capture_cpus,
+                capture_runtime_shards,
+            )
         })
         .map_err(AgentError::Io)?;
 
@@ -262,14 +268,18 @@ fn spawn_gateway_pusher(
 /// Push events into the channel, counting drops instead of blocking.
 #[cfg(target_os = "linux")]
 pub(crate) fn offer_event(
-    tx: &SyncSender<FlowEvent>,
+    tx: &SyncSender<CapturedEvent>,
     event: FlowEvent,
     state: &PublishedState,
+    lane: Option<usize>,
 ) -> bool {
-    match tx.try_send(event) {
+    match tx.try_send(CapturedEvent { event, lane }) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
             state.dropped_events.fetch_add(1, Ordering::Relaxed);
+            if let Some(lane) = lane {
+                state.record_capture_lane_userspace_drop(lane);
+            }
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -278,7 +288,7 @@ pub(crate) fn offer_event(
 
 fn engine_loop(
     mut engine: ShardedQueryEngine,
-    rx: Receiver<FlowEvent>,
+    rx: Receiver<CapturedEvent>,
     published: Arc<PublishedState>,
     flush_interval: Duration,
     batch_size: usize,
@@ -297,16 +307,11 @@ fn engine_loop(
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
-                let strategy = match shard_strategy {
-                    config::RuntimeShardStrategy::Flow => flowsketch_runtime::ShardStrategy::Flow,
-                    config::RuntimeShardStrategy::RoundRobin => {
-                        flowsketch_runtime::ShardStrategy::RoundRobin
-                    }
-                };
-                engine.process_batch_with_strategy(&batch, strategy)?;
+                let event_count = batch.len();
+                process_captured_batch(&mut engine, &mut batch, shard_strategy, &published)?;
                 published
                     .events_processed
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    .fetch_add(event_count as u64, Ordering::Relaxed);
                 published.runtime_batches.fetch_add(1, Ordering::Relaxed);
                 batch.clear();
             }
@@ -326,5 +331,56 @@ fn engine_loop(
     published.publish(&mut engine)?;
     published.export_snapshots_now(&engine);
     published.source_done.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn process_captured_batch(
+    engine: &mut ShardedQueryEngine,
+    batch: &mut Vec<CapturedEvent>,
+    shard_strategy: config::RuntimeShardStrategy,
+    published: &PublishedState,
+) -> Result<(), AgentError> {
+    let kernel_partitioned = batch.first().is_some_and(|event| event.lane.is_some());
+    if kernel_partitioned {
+        let mut shard_batches = (0..engine.shard_count())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        let mut lane_counts = vec![0u64; engine.shard_count()];
+        for captured in batch.drain(..) {
+            let lane = captured.lane.ok_or_else(|| {
+                AgentError::Source(
+                    "capture batch mixed kernel-partitioned and unpartitioned events".into(),
+                )
+            })?;
+            let shard = shard_batches.get_mut(lane).ok_or_else(|| {
+                AgentError::Source(format!("capture lane {lane} has no matching runtime shard"))
+            })?;
+            shard.push(captured.event);
+            lane_counts[lane] += 1;
+        }
+        engine.process_shard_batches(&shard_batches)?;
+        for (lane, events) in lane_counts.into_iter().enumerate() {
+            if events != 0 {
+                published.record_capture_lane_events_processed(lane, events);
+            }
+        }
+    } else {
+        let mut events = Vec::with_capacity(batch.len());
+        for captured in batch.drain(..) {
+            if captured.lane.is_some() {
+                return Err(AgentError::Source(
+                    "capture batch mixed unpartitioned and kernel-partitioned events".into(),
+                ));
+            }
+            events.push(captured.event);
+        }
+        let strategy = match shard_strategy {
+            config::RuntimeShardStrategy::Flow => flowsketch_runtime::ShardStrategy::Flow,
+            config::RuntimeShardStrategy::RoundRobin => {
+                flowsketch_runtime::ShardStrategy::RoundRobin
+            }
+        };
+        engine.process_batch_with_strategy(&events, strategy)?;
+    }
     Ok(())
 }
