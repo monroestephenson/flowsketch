@@ -9,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use flowsketch_pcap::linktype;
 use libc::tpacket_versions::TPACKET_V3;
 
 use crate::AgentError;
@@ -58,6 +59,7 @@ pub(super) struct AfPacketSocket {
     // struct fields in declaration order, so keep `ring` before `fd`.
     ring: PacketRing,
     fd: OwnedFd,
+    linktype: u32,
 }
 
 // SAFETY: the mmap and fd are uniquely owned by the socket. Moving that
@@ -71,6 +73,7 @@ impl AfPacketSocket {
         settings: RingSettings,
         fanout: Option<FanoutSettings>,
     ) -> Result<Self, AgentError> {
+        let linktype = interface_linktype(interface)?;
         // A zero socket protocol keeps capture disabled until bind(2) selects
         // the requested interface. Opening with ETH_P_ALL here would briefly
         // admit packets from every interface while the ring is configured.
@@ -174,7 +177,7 @@ impl AfPacketSocket {
             block_count: settings.block_count as usize,
             current_block: 0,
         };
-        let socket = AfPacketSocket { ring, fd };
+        let socket = AfPacketSocket { ring, fd, linktype };
         socket.bind(interface, proto_be)?;
         if let Some(fanout) = fanout {
             socket.join_fanout(fanout)?;
@@ -273,6 +276,12 @@ impl AfPacketSocket {
 
     pub(super) fn block_size_bytes(&self) -> usize {
         self.ring.block_size
+    }
+
+    /// Parser link type selected from the interface's Linux ARPHRD type.
+    /// This is fixed for the lifetime of a bound packet socket.
+    pub(super) fn linktype(&self) -> u32 {
+        self.linktype
     }
 
     /// Wait for and drain one kernel-owned block. `None` is an idle poll
@@ -445,6 +454,45 @@ impl AfPacketSocket {
     }
 }
 
+// Values from Linux UAPI <linux/if_arp.h>. libc does not expose the complete
+// ARPHRD set consistently across targets.
+const ARPHRD_ETHER: u32 = 1;
+const ARPHRD_RAWIP: u32 = 519;
+const ARPHRD_LOOPBACK: u32 = 772;
+const ARPHRD_NONE: u32 = 65_534;
+
+fn interface_linktype(interface: &str) -> Result<u32, AgentError> {
+    let path = std::path::Path::new("/sys/class/net")
+        .join(interface)
+        .join("type");
+    let raw = std::fs::read_to_string(&path).map_err(|error| {
+        AgentError::Source(format!(
+            "cannot determine link-layer type for interface {interface:?} from {}: {error}",
+            path.display()
+        ))
+    })?;
+    let hardware_type = raw.trim().parse::<u32>().map_err(|error| {
+        AgentError::Source(format!(
+            "invalid Linux ARPHRD type {:?} for interface {interface:?}: {error}",
+            raw.trim()
+        ))
+    })?;
+    linktype_for_hardware_type(hardware_type).ok_or_else(|| {
+        AgentError::Source(format!(
+            "interface {interface:?} uses unsupported Linux ARPHRD type {hardware_type}; \
+             FlowSketch supports Ethernet/loopback and raw-IP (TUN/WireGuard) interfaces"
+        ))
+    })
+}
+
+fn linktype_for_hardware_type(hardware_type: u32) -> Option<u32> {
+    match hardware_type {
+        ARPHRD_ETHER | ARPHRD_LOOPBACK => Some(linktype::ETHERNET),
+        ARPHRD_RAWIP | ARPHRD_NONE => Some(linktype::RAW_IP),
+        _ => None,
+    }
+}
+
 fn fanout_argument(settings: FanoutSettings) -> libc::c_uint {
     let mode = match settings.mode {
         FanoutMode::Hash => libc::PACKET_FANOUT_HASH,
@@ -553,5 +601,26 @@ mod tests {
             }),
             (libc::PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_UNIQUEID) << 16
         );
+    }
+
+    #[test]
+    fn maps_linux_ethernet_and_raw_ip_hardware_types() {
+        assert_eq!(
+            linktype_for_hardware_type(ARPHRD_ETHER),
+            Some(linktype::ETHERNET)
+        );
+        assert_eq!(
+            linktype_for_hardware_type(ARPHRD_LOOPBACK),
+            Some(linktype::ETHERNET)
+        );
+        assert_eq!(
+            linktype_for_hardware_type(ARPHRD_RAWIP),
+            Some(linktype::RAW_IP)
+        );
+        assert_eq!(
+            linktype_for_hardware_type(ARPHRD_NONE),
+            Some(linktype::RAW_IP)
+        );
+        assert_eq!(linktype_for_hardware_type(ARPHRD_NONE - 1), None);
     }
 }

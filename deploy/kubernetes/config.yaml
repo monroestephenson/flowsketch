@@ -106,6 +106,7 @@ data:
       listen: 0.0.0.0:9465
       seed: 0
       staleAfterMs: 300000
+      maxNodes: 128
     queries:
       - file: /etc/flowsketch/queries/top-talkers.yaml
       - file: /etc/flowsketch/queries/suspected-scanners.yaml

@@ -124,8 +124,10 @@ The current gateway keeps merge state in memory and is intentionally limited
 to one replica. Its Deployment uses `Recreate` to prevent split state during
 upgrades. Running agents repopulate compatible state after restart; CI verifies
 that behavior and verifies that incompatible state fails closed with
-`scripts/gateway-restart-smoke.sh`. Gateway HA requires a sharding or
-replicated-state design, not a larger replica count.
+`scripts/gateway-restart-smoke.sh`. `gateway.maxNodes` defaults to 128 and is a
+hard admission limit across all queries; size it against every query's planned
+state and alert on the retained/capacity gauges before raising it. Gateway HA
+requires a sharding or replicated-state design, not a larger replica count.
 
 ## HTTP trust boundary
 

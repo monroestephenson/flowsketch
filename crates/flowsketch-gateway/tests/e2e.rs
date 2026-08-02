@@ -88,12 +88,16 @@ fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
 /// Run an engine over `dst_prefix`-scoped scanning traffic and return its
 /// push batch: one node's view of the same scanner.
 fn node_batch(node: &str, dst_prefix: u8, seed: u64) -> PushBatch {
+    node_batch_at(node, dst_prefix, seed, 5)
+}
+
+fn node_batch_at(node: &str, dst_prefix: u8, seed: u64, ts_s: u64) -> PushBatch {
     let q = parse_query_yaml(SCANNER_YAML).unwrap();
     let p = plan(q, &HashSpec::new(seed)).unwrap();
     let mut eng = QueryEngine::new(vec![p], HashSpec::new(seed)).unwrap();
     for i in 0..1_000u32 {
         let dst = format!("10.{dst_prefix}.{}.{}", i / 256, i % 256);
-        eng.process(&event(5, "10.0.1.50", &dst, 60)).unwrap();
+        eng.process(&event(ts_s, "10.0.1.50", &dst, 60)).unwrap();
     }
     PushBatch {
         node: node.to_string(),
@@ -108,6 +112,30 @@ fn node_batch(node: &str, dst_prefix: u8, seed: u64) -> PushBatch {
             })
             .collect(),
     }
+}
+
+#[test]
+fn gateway_http_suppresses_estimates_while_any_known_node_lags() {
+    let addr = start_gateway(0);
+    let url = format!("http://{addr}/v1/snapshots");
+
+    push_batch(&url, &node_batch_at("node-a", 1, 0, 5).encode()).unwrap();
+    push_batch(&url, &node_batch_at("node-b", 2, 0, 5).encode()).unwrap();
+    let (_, complete) = http_get(addr, "/metrics");
+    assert!(complete.contains("flowsketch_estimate{query=\"scanners\""));
+
+    // Only node-a advances. The gateway must expose the merge gap but never
+    // publish node-a's subset as the ordinary cluster estimate.
+    push_batch(&url, &node_batch_at("node-a", 1, 0, 15).encode()).unwrap();
+    let (status, partial) = http_get(addr, "/metrics");
+    assert_eq!(status, 200);
+    assert!(partial.contains("flowsketch_gateway_nodes_known{query=\"scanners\"} 2"));
+    assert!(partial.contains("flowsketch_gateway_nodes_merged{query=\"scanners\"} 1"));
+    assert!(partial.contains("flowsketch_gateway_merge_complete{query=\"scanners\"} 0"));
+    assert!(
+        !partial.contains("flowsketch_estimate{query=\"scanners\""),
+        "partial cluster estimate leaked through HTTP: {partial}"
+    );
 }
 
 #[test]

@@ -58,6 +58,64 @@ full-rescore cliffs, but saturated key churn remains materially slower than
 steady state and must be capacity-tested with the expected source-cardinality
 distribution.
 
+## Accuracy contract verification
+
+Measured on 2026-08-02 from a release build on a local x86_64 Mac, against the
+hash-family v2 / Ertl-estimator code. These runs re-execute the external audit
+methodology that originally measured 11% HLL interval coverage and a
+depth-independent Count-Min failure floor on the v1 hash family.
+
+HyperLogLog: 200 independent seeds per configuration, distinct string keys,
+coverage counted when the true cardinality falls inside the published
+±2-standard-error interval (`confidence = 0.95`):
+
+| precision | n / m | interval coverage | mean relative bias |
+| --- | --- | ---: | ---: |
+| 12 | 2.5 (former linear-counting transition) | 99.5% | +0.07% |
+| 14 | 2.5 (former linear-counting transition) | 98.5% | +0.04% |
+| 12 | 1.0 | 98.5% | +0.10% |
+| 14 | 5.0 | 97.5% | -0.08% |
+
+Coverage now exceeds the claimed 95% everywhere measured, including the
+transition range where the v1 estimator covered 11-76%. Residual bias is
+within ±0.1% (previously up to +2.6%).
+
+Count-Min: width 128, 20 independent seeds per depth, a 1,000-key Zipf stream
+per seed, then 50,000 absent probe keys per seed (1M probes per depth). A
+failure is an absent-key estimate exceeding `epsilon * N`:
+
+| depth | claimed `delta` | observed failure rate |
+| --- | ---: | ---: |
+| 2 | 1.353e-1 | 3.86e-3 |
+| 4 | 1.832e-2 | 1.50e-5 |
+| 8 | 3.355e-4 | 0 in 1M |
+| 16 | 1.125e-7 | 0 in 1M |
+| 32 | 1.266e-14 | 0 in 1M |
+
+The observed failure rate is below the claimed `delta` at every depth and
+keeps falling as depth grows. On the v1 hash family it saturated near 6e-4
+regardless of depth. Depths 8+ claim failure probabilities below what 1M
+probes can resolve; the measurement confirms no violations at that resolution,
+not the full claimed exponent.
+
+## SpaceSaving saturated-update comparison
+
+Measured on 2026-08-02 with optimized x86_64 Linux builds in the same 4-vCPU
+Colima VM. Both binaries processed 2,000,000 events, 100,000 possible keys,
+and the default 4,096-entry capacity. The baseline used the lazy heap whose
+first stale minimum triggered a full O(capacity) rebuild; the current build
+uses stable arena slots and an indexed integer heap.
+
+| distribution | baseline | indexed heap | speedup | precision@100 |
+| --- | ---: | ---: | ---: | ---: |
+| uniform | 0.88M updates/s/core | 2.78M updates/s/core | 3.2x | 4/100 current (all truth counts are tied) |
+| Zipf (s=1) | 1.49M updates/s/core | 5.93M updates/s/core | 4.0x | 100/100, zero top-100 ARE |
+
+The uniform precision number is not a heavy-hitter quality signal because all
+100,000 keys have equal expected weight; the deterministic tie-break selects
+one valid retained subset. The skewed workload retains the full true top 100
+with no measured error while removing the O(capacity) rebuild cliff.
+
 ## Generated pcap plus runtime
 
 Trace command:

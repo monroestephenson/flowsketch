@@ -142,7 +142,7 @@ impl Sketch for CountSketch {
     }
 
     fn estimate(&self, key: &[u8]) -> f64 {
-        self.estimate_signed(key).max(0) as f64
+        self.estimate_signed(key) as f64
     }
 
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
@@ -206,6 +206,14 @@ mod tests {
         s.update_signed(b"k", 100);
         s.update_signed(b"k", -100);
         assert_eq!(s.estimate_signed(b"k"), 0);
+    }
+
+    #[test]
+    fn sketch_trait_preserves_negative_estimates() {
+        let mut s = CountSketch::new(1024, 5, HashSpec::new(3)).unwrap();
+        s.update_signed(b"negative-delta", -75);
+        assert_eq!(s.estimate_signed(b"negative-delta"), -75);
+        assert_eq!(Sketch::estimate(&s, b"negative-delta"), -75.0);
     }
 
     #[test]

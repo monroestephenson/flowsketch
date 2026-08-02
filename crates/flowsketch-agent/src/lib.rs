@@ -264,8 +264,17 @@ pub fn run_until(
 
     published.ready.store(false, Ordering::Release);
     services_shutdown.store(true, Ordering::Release);
-    if http.join().is_err() && result.is_ok() {
-        result = Err(AgentError::Http("agent HTTP thread panicked".into()));
+    match http.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if result.is_ok() => {
+            result = Err(AgentError::Http(format!(
+                "agent HTTP shutdown failed: {error}"
+            )));
+        }
+        Err(_) if result.is_ok() => {
+            result = Err(AgentError::Http("agent HTTP thread panicked".into()));
+        }
+        Ok(Err(_)) | Err(_) => {}
     }
     for exporter in exporters {
         if exporter.join().is_err() && result.is_ok() {

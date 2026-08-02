@@ -79,6 +79,28 @@ spec:
           annotations:
             summary: FlowSketch gateway rejected snapshots
             description: The gateway received incompatible or malformed sketch snapshots.
+        - alert: FlowSketchGatewayNodeAdmissionRejected
+          expr: increase(flowsketch_gateway_node_admission_rejections_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch gateway node capacity is exhausted
+            description: At least one new node identity was rejected; raise maxNodes only after validating the gateway memory budget.
+        - alert: FlowSketchGatewayBodyBudgetExhausted
+          expr: increase(flowsketch_gateway_body_budget_rejections_total[10m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch gateway snapshot body budget is exhausted
+            description: Concurrent snapshot uploads exceeded the bounded in-flight body budget.
+        - alert: FlowSketchGatewayNodeCapacityHigh
+          expr: flowsketch_gateway_nodes_tracked / flowsketch_gateway_nodes_capacity >= 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: FlowSketch gateway node capacity is nearly full
+            description: The gateway has retained at least 90 percent of its configured live-node identities for five minutes.
         - alert: FlowSketchGatewayMergeGap
           expr: flowsketch_gateway_nodes_known - flowsketch_gateway_nodes_merged > 0
           for: 5m

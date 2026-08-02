@@ -222,6 +222,24 @@ transition; the counter must stop increasing after all agents run the same
 configuration. Never work around this alert by accepting incompatible FSK1
 state.
 
+### FlowSketchGatewayNodeAdmissionRejected / NodeCapacityHigh
+
+The gateway retains at most `gateway.maxNodes` distinct live identities across
+all queries. Confirm that node names are stable and unique, then compare
+`flowsketch_gateway_nodes_tracked` with
+`flowsketch_gateway_nodes_capacity`. Unexpected churn usually indicates an
+agent identity configuration problem. Increase `maxNodes` only after sizing
+the planner-bounded state for every configured query at the larger node count;
+stale identities leave automatically after `staleAfterMs`.
+
+### FlowSketchGatewayBodyBudgetExhausted
+
+Concurrent snapshot POSTs exceeded the gateway's aggregate raw-body budget.
+Inspect push size, query count, retry synchronization, and gateway CPU before
+raising pod resources. Individual bodies remain capped at 64 MiB and the
+aggregate raw-body reservation at 128 MiB; retries should recover after the
+overlapping requests drain.
+
 ### FlowSketchGatewayMergeGap
 
 `nodes_known - nodes_merged` remained positive for one query for five minutes.

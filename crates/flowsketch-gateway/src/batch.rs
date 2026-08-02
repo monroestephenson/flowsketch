@@ -28,6 +28,14 @@ pub const BATCH_VERSION: u16 = 1;
 /// component snapshots per query, so anything huge is a corrupt or hostile
 /// payload, not a bigger deployment.
 pub const MAX_ENTRIES: usize = 4_096;
+/// Kubernetes node names are DNS subdomains and therefore at most 253 bytes.
+/// Applying the same bound to every gateway client prevents identity strings
+/// from becoming an independent memory-amplification path.
+pub const MAX_NODE_NAME_BYTES: usize = 253;
+/// Query and component identifiers come from local plans and are never
+/// expected to be remotely supplied blobs.
+pub const MAX_QUERY_NAME_BYTES: usize = 256;
+pub const MAX_COMPONENT_NAME_BYTES: usize = 128;
 
 /// One component snapshot inside a push batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +89,7 @@ impl PushBatch {
                 "unsupported push batch version {version}"
             )));
         }
-        let node = utf8(r.lp_bytes()?, "node")?;
+        let node = utf8_bounded(r.lp_bytes()?, "node", MAX_NODE_NAME_BYTES)?;
         let count = r.u32()? as usize;
         if count > MAX_ENTRIES {
             return Err(SketchError::Snapshot(format!(
@@ -91,8 +99,8 @@ impl PushBatch {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             entries.push(PushEntry {
-                query_name: utf8(r.lp_bytes()?, "query name")?,
-                component: utf8(r.lp_bytes()?, "component")?,
+                query_name: utf8_bounded(r.lp_bytes()?, "query name", MAX_QUERY_NAME_BYTES)?,
+                component: utf8_bounded(r.lp_bytes()?, "component", MAX_COMPONENT_NAME_BYTES)?,
                 snapshot: r.lp_bytes()?.to_vec(),
             });
         }
@@ -105,9 +113,26 @@ impl PushBatch {
     }
 }
 
-fn utf8(bytes: &[u8], what: &str) -> Result<String, SketchError> {
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| SketchError::Snapshot(format!("push batch {what} is not UTF-8")))
+fn utf8_bounded(bytes: &[u8], what: &str, max_bytes: usize) -> Result<String, SketchError> {
+    if bytes.is_empty() {
+        return Err(SketchError::Snapshot(format!(
+            "push batch {what} must not be empty"
+        )));
+    }
+    if bytes.len() > max_bytes {
+        return Err(SketchError::Snapshot(format!(
+            "push batch {what} is {} bytes (max {max_bytes})",
+            bytes.len()
+        )));
+    }
+    let value = String::from_utf8(bytes.to_vec())
+        .map_err(|_| SketchError::Snapshot(format!("push batch {what} is not UTF-8")))?;
+    if value.trim().is_empty() {
+        return Err(SketchError::Snapshot(format!(
+            "push batch {what} must not be blank"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -173,5 +198,25 @@ mod tests {
         bytes[n - 8..].copy_from_slice(&sum.to_le_bytes());
         let err = PushBatch::decode(&bytes).unwrap_err();
         assert!(err.to_string().contains("FSKB"), "{err}");
+    }
+
+    #[test]
+    fn oversized_or_blank_wire_identifiers_are_rejected() {
+        let mut batch = sample();
+        batch.node = "n".repeat(MAX_NODE_NAME_BYTES + 1);
+        let error = PushBatch::decode(&batch.encode()).unwrap_err();
+        assert!(error.to_string().contains("node"), "{error}");
+
+        batch = sample();
+        batch.node = "   ".into();
+        assert!(PushBatch::decode(&batch.encode()).is_err());
+
+        batch = sample();
+        batch.entries[0].query_name = "q".repeat(MAX_QUERY_NAME_BYTES + 1);
+        assert!(PushBatch::decode(&batch.encode()).is_err());
+
+        batch = sample();
+        batch.entries[0].component = "c".repeat(MAX_COMPONENT_NAME_BYTES + 1);
+        assert!(PushBatch::decode(&batch.encode()).is_err());
     }
 }

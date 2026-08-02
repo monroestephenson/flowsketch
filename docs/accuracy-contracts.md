@@ -4,7 +4,10 @@ Every FlowSketch estimate is explicitly approximate. Exported samples carry
 `algorithm` and `error_kind` labels; `SketchEstimate` carries per-row
 `lower_bound` / `upper_bound` / `confidence`; and `flowsketch explain`
 prints the contract before anything runs. This document defines what those
-contracts mean.
+contracts mean. The Count-Min failure-rate and HyperLogLog interval-coverage
+claims below are empirically verified in
+[`benchmarks/current-results.md`](../benchmarks/current-results.md)
+("Accuracy contract verification").
 
 ## Error kinds
 

@@ -15,6 +15,9 @@ NAME="flowsketch-cap-smoke-$$"
 TMP_ROOT=${FLOWSKETCH_CONTAINER_SMOKE_TMPDIR:-"$PWD/target"}
 mkdir -p "$TMP_ROOT"
 TMP=$(mktemp -d "$TMP_ROOT/flowsketch-container.XXXXXX")
+# Native Linux bind mounts preserve mktemp's mode 0700. Make this synthetic,
+# secret-free fixture traversable by the image's fixed non-root UID.
+chmod 0755 "$TMP"
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
@@ -63,6 +66,7 @@ agent:
 queries:
   - file: /config/query.yaml
 EOF
+chmod 0644 "$TMP/query.yaml" "$TMP/agent.yaml"
 
 docker run -d --name "$NAME" \
   --read-only \

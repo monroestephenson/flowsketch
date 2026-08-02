@@ -99,10 +99,14 @@ The agent supports three source modes:
 | `af_packet` | live TPACKET_V3 capture | `CAP_NET_RAW` |
 | `ebpf` | tc ingress capture through a BPF ring buffer | `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` |
 
-AF_PACKET `hash` and `rx_queue` modes create one socket/parser lane and one
-dedicated bounded runtime queue per shard. The Linux smoke suite verifies exact
-aggregate and per-lane accounting, capture/runtime pinning, and fail-closed
-affinity behavior. tc eBPF fallback to AF_PACKET is explicit and counted.
+AF_PACKET selects its parser from the interface hardware type: Ethernet and
+loopback use Ethernet framing, while TUN, WireGuard, and raw-IP interfaces use
+raw IPv4/IPv6 framing. Unknown link types fail startup instead of remaining
+healthy while parsing nothing. `hash` and `rx_queue` modes create one
+socket/parser lane and one dedicated bounded runtime queue per shard. The Linux
+smoke suite verifies both framing paths, exact aggregate and per-lane
+accounting, capture/runtime pinning, and fail-closed affinity behavior. tc eBPF
+fallback to AF_PACKET is explicit and counted.
 
 Start with the [operator guide](docs/operator-guide.md) before granting
 capabilities or enabling host-network capture.
@@ -127,18 +131,21 @@ is one in-memory gateway writer; replicated gateway HA is not claimed.
 
 ## Deployment
 
-Build the container:
+A published container image is not available yet; one will accompany the
+first tagged release. Until then, build the container locally:
 
 ```bash
 docker build -t flowsketch:local .
 ```
 
-Install the Helm chart with an immutable image tag or digest:
+The Helm chart installs against an image you have built and pushed to your
+own registry, using an immutable tag or digest:
 
 ```bash
 helm upgrade --install flowsketch deploy/helm/flowsketch \
   --namespace flowsketch \
   --create-namespace \
+  --set image.repository=<your-registry>/flowsketch \
   --set image.tag=0.1.0 \
   --set agent.interface=eth0
 ```
@@ -161,6 +168,7 @@ network namespaces:
 
 ```bash
 scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
+scripts/linux-afpacket-rawip-smoke.sh target/release/flowsketch
 scripts/linux-afpacket-fanout-smoke.sh target/release/flowsketch
 scripts/linux-cpu-affinity-smoke.sh target/release/flowsketch
 scripts/linux-ebpf-live-smoke.sh target/release/flowsketch

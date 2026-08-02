@@ -9,9 +9,9 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flowsketch_pcap::PcapReader;
 #[cfg(target_os = "linux")]
-use flowsketch_pcap::{linktype, parse_packet_with_wire_len};
+use flowsketch_pcap::parse_packet_with_wire_len;
+use flowsketch_pcap::PcapReader;
 
 use crate::config::{
     default_block_retire_timeout_ms, default_ring_block_count, default_ring_block_size_bytes,
@@ -528,6 +528,7 @@ fn af_packet_socket_loop(
     lane: Option<usize>,
     stop: Option<&AtomicBool>,
 ) -> Result<(), AgentError> {
+    let packet_linktype = sock.linktype();
     let mut last_statistics = Instant::now();
     loop {
         let timestamp_bounds = LiveTimestampBounds::sample()?;
@@ -546,9 +547,7 @@ fn af_packet_socket_loop(
                 return false;
             }
             packets_seen += 1;
-            if let Some(mut event) =
-                parse_packet_with_wire_len(linktype::ETHERNET, packet, wire_len)
-            {
+            if let Some(mut event) = parse_packet_with_wire_len(packet_linktype, packet, wire_len) {
                 if !timestamp_bounds.contains(timestamp_nanos) {
                     packets_unparsed += 1;
                     state.invalid_timestamps.fetch_add(1, Ordering::Relaxed);

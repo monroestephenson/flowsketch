@@ -60,10 +60,16 @@ impl PhysicalSketch {
     pub fn estimated_memory_bytes(&self, avg_key_bytes: usize) -> u64 {
         const HASH_ENTRY_OVERHEAD: u64 = 48;
         const EVICTION_HEAP_ENTRY_OVERHEAD: u64 = 32;
+        // Stable slot + digest index + indexed-heap position, including
+        // hash-table load-factor/allocation slack and collision bookkeeping.
+        const SPACE_SAVING_ENTRY_OVERHEAD: u64 = 192;
         match self {
             PhysicalSketch::CountMin { width, depth, .. } => (width * depth) as u64 * 8 + 64,
             PhysicalSketch::CountSketch { width, depth } => (width * depth) as u64 * 8 + 64,
-            PhysicalSketch::SpaceSaving { capacity } | PhysicalSketch::MisraGries { capacity } => {
+            PhysicalSketch::SpaceSaving { capacity } => {
+                *capacity as u64 * (avg_key_bytes as u64 + SPACE_SAVING_ENTRY_OVERHEAD) + 128
+            }
+            PhysicalSketch::MisraGries { capacity } => {
                 *capacity as u64 * (avg_key_bytes as u64 + 16 + HASH_ENTRY_OVERHEAD) + 64
             }
             PhysicalSketch::HyperLogLog { precision } => (1u64 << precision) + 64,

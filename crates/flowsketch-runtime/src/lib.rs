@@ -1808,6 +1808,22 @@ mod tests {
     }
 
     #[test]
+    fn saturated_spacesaving_stays_inside_physical_memory_estimate() {
+        let capacity = 4_096;
+        let physical = PhysicalSketch::SpaceSaving { capacity };
+        let planned_bytes = physical.estimated_memory_bytes(32);
+        let mut summary = SpaceSaving::new(capacity, HashSpec::new(17)).unwrap();
+        for index in 0..500_000u64 {
+            summary.add(&(index % 100_000).to_le_bytes(), 1);
+        }
+        assert!(
+            summary.memory_bytes() as u64 <= planned_bytes,
+            "saturated SpaceSaving used {} bytes above its {planned_bytes}-byte physical estimate",
+            summary.memory_bytes()
+        );
+    }
+
+    #[test]
     fn sharded_engine_rejects_duplicate_query_names() {
         let yaml =
             "name: duplicate\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";

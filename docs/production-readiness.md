@@ -47,7 +47,8 @@ the items below as the gate to broad production rollout.
   - `flowsketch_agent_late_events_total`
   - `flowsketch_agent_af_packet_queue_local_handoff`
   - `flowsketch_agent_af_packet_lane_channel_capacity`
-  - gateway rejected snapshots and merged-node counts
+  - gateway rejected snapshots, node admission/body-budget rejections,
+    retained/capacity nodes, merge completeness, and cache-shard rebuilds
 
 ## Capacity testing
 

@@ -61,6 +61,7 @@ gateway:
   listenPort: 9465
   seed: 0
   staleAfterMs: 300000
+  maxNodes: 128
   podAnnotations: {}
   podLabels: {}
   priorityClassName: ""

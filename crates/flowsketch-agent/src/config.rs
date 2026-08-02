@@ -187,6 +187,7 @@ const MAX_RING_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_EBPF_RING_BYTES: u32 = 64 * 1024;
 const MAX_EBPF_RING_BYTES: u32 = 1024 * 1024 * 1024;
 const MAX_LINUX_CPU_ID: usize = 1023;
+const MAX_LINUX_INTERFACE_NAME_BYTES: usize = 15;
 
 pub(crate) const fn default_ring_block_size_bytes() -> u32 {
     1024 * 1024
@@ -232,6 +233,20 @@ impl AgentConfig {
             return Err(AgentError::Config(
                 "agent config must list at least one query file".into(),
             ));
+        }
+        if let Some(node_name) = raw.agent.node_name.as_deref() {
+            if node_name.trim().is_empty() {
+                return Err(AgentError::Config(
+                    "agent.nodeName must not be blank".into(),
+                ));
+            }
+            if node_name.len() > flowsketch_gateway::batch::MAX_NODE_NAME_BYTES {
+                return Err(AgentError::Config(format!(
+                    "agent.nodeName is {} bytes; maximum is {}",
+                    node_name.len(),
+                    flowsketch_gateway::batch::MAX_NODE_NAME_BYTES
+                )));
+            }
         }
         let runtime_shards = raw.agent.runtime_shards.unwrap_or(1);
         if !(1..=256).contains(&runtime_shards) {
@@ -288,14 +303,7 @@ impl AgentConfig {
             // The gateway keys snapshots by node name. Agents left on the
             // default would all push as "unknown" and overwrite each other,
             // so a unique nodeName is mandatory in gateway mode.
-            if raw
-                .agent
-                .node_name
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-            {
+            if raw.agent.node_name.is_none() {
                 return Err(AgentError::Config(
                     "agent.nodeName must be set to a unique value when export.gateway is \
                      configured; the gateway keys snapshots by node name and agents sharing \
@@ -513,6 +521,15 @@ fn validate_interface(interface: &str, source: &str) -> Result<(), AgentError> {
             "{source} source interface must not be empty"
         )));
     }
+    if interface.len() > MAX_LINUX_INTERFACE_NAME_BYTES
+        || interface.contains('/')
+        || interface.contains('\0')
+    {
+        return Err(AgentError::Config(format!(
+            "{source} source interface must be a Linux interface name of at most \
+             {MAX_LINUX_INTERFACE_NAME_BYTES} bytes without '/' or NUL"
+        )));
+    }
     Ok(())
 }
 
@@ -677,6 +694,8 @@ queries:
 
         for invalid_source in [
             "interface: ''",
+            "interface: ../eth0",
+            "interface: interface-name-too-long",
             "interface: eth0\n    ringBlockSizeBytes: 1000000",
             "interface: eth0\n    ringBlockCount: 0",
             "interface: eth0\n    ringBlockSizeBytes: 16777216\n    ringBlockCount: 65",
@@ -808,6 +827,13 @@ queries:
             "agent:\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
         )
         .is_ok());
+
+        let oversized = "n".repeat(flowsketch_gateway::batch::MAX_NODE_NAME_BYTES + 1);
+        let yaml = format!(
+            "agent:\n  nodeName: {oversized}\n  source: {{kind: pcap, path: x.pcap}}\n\
+             queries:\n  - file: q.yaml\n"
+        );
+        assert!(AgentConfig::from_yaml(&yaml).is_err());
     }
 
     #[test]

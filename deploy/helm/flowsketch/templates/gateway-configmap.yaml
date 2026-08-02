@@ -12,6 +12,7 @@ data:
       listen: 0.0.0.0:{{ .Values.gateway.listenPort }}
       seed: {{ .Values.gateway.seed }}
       staleAfterMs: {{ .Values.gateway.staleAfterMs }}
+      maxNodes: {{ .Values.gateway.maxNodes }}
     queries:
       {{- range $name, $_ := .Values.queries }}
       - file: /etc/flowsketch/queries/{{ $name }}

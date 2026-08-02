@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::state::PublishedState;
 
@@ -17,12 +17,13 @@ const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(11);
 
 pub fn serve_in_background(
     listener: TcpListener,
     state: Arc<PublishedState>,
     shutdown: Arc<AtomicBool>,
-) -> std::io::Result<JoinHandle<()>> {
+) -> std::io::Result<JoinHandle<std::io::Result<()>>> {
     listener.set_nonblocking(true)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new()
@@ -36,10 +37,7 @@ pub fn serve_in_background(
                         continue;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        eprintln!("agent HTTP accept failed: {error}");
-                        break;
-                    }
+                    Err(error) => return Err(error),
                 };
                 if !try_acquire_connection(&active_connections) {
                     let _ = respond(stream, 503, "text/plain", "server busy\n");
@@ -57,6 +55,7 @@ pub fn serve_in_background(
                     active_connections.fetch_sub(1, Ordering::AcqRel);
                 }
             }
+            wait_for_connections(&active_connections, CONNECTION_DRAIN_TIMEOUT)
         })
 }
 
@@ -198,6 +197,23 @@ impl Drop for ConnectionGuard {
     }
 }
 
+fn wait_for_connections(active: &AtomicUsize, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while active.load(Ordering::Acquire) != 0 {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{} agent HTTP connection(s) did not drain before shutdown",
+                    active.load(Ordering::Acquire)
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
 fn read_line_bounded<R: BufRead>(
     reader: &mut R,
     max_bytes: usize,
@@ -256,5 +272,14 @@ mod tests {
         assert_eq!(route("GET", "/readyz", &state).0, 200);
         *state.source_error.lock().unwrap() = Some("attach failed".into());
         assert_eq!(route("GET", "/readyz", &state).0, 503);
+    }
+
+    #[test]
+    fn connection_drain_reports_a_stuck_worker() {
+        let active = AtomicUsize::new(1);
+        let error = wait_for_connections(&active, Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        active.store(0, Ordering::Release);
+        wait_for_connections(&active, Duration::ZERO).unwrap();
     }
 }

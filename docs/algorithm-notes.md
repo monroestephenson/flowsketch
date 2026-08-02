@@ -29,6 +29,8 @@ included in the reported delta.
 Signed counters with a per-row ±1 sign hash; estimate = median of rows.
 Unbiased, supports turnstile (signed) updates, error bounded in the L2
 norm — the tool for change detection between windows (planned measure).
+Signed estimates remain signed through the generic `Sketch` interface; a
+negative estimate is not clamped to zero.
 
 ## HyperLogLog (`hll.rs`)
 
@@ -52,12 +54,14 @@ workloads directly.
 
 ## SpaceSaving (`space_saving.rs`)
 
-Classic stream-summary: capacity-bounded map of (count, error). On
-overflow, the minimum entry is evicted and its count inherited as the new
-key's error. Counts are upper bounds; `count - error` is guaranteed.
-The v0 min-search is an O(capacity) scan on eviction — correct and simple;
-a linked "buckets of equal count" structure is the known optimization if
-eviction-heavy workloads show up in profiles.
+Classic stream-summary: a capacity-bounded stable-slot arena of
+`(key, count, error)` entries plus an exact digest index and an indexed binary
+min-heap. On overflow, the minimum entry is replaced in place and its count is
+inherited as the new key's error. Counts are upper bounds;
+`count - error` is guaranteed. Lookup is expected O(1), updates/evictions are
+O(log capacity), keys are owned once, digest collisions are resolved by exact
+byte comparison, and deterministic count/digest/key ordering makes tied
+evictions reproducible.
 
 ## Misra-Gries (`misra_gries.rs`)
 

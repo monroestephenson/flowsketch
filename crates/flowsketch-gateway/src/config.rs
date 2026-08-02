@@ -5,6 +5,7 @@
 //!   listen: 0.0.0.0:9465
 //!   seed: 0               # must match the agents' seed for mergeability
 //!   staleAfterMs: 300000  # forget nodes that stop pushing
+//!   maxNodes: 128         # hard admission bound across all queries
 //! queries:
 //!   - file: examples/queries/top-talkers.yaml
 //! ```
@@ -25,11 +26,15 @@ use flowsketch_planner::{plan, Plan};
 
 use crate::GatewayError;
 
+pub const DEFAULT_MAX_NODES: usize = 128;
+pub const MAX_CONFIGURED_NODES: usize = 65_536;
+
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub listen: String,
     pub seed: u64,
     pub stale_after_ms: u64,
+    pub max_nodes: usize,
     pub query_files: Vec<PathBuf>,
 }
 
@@ -42,6 +47,12 @@ impl GatewayConfig {
                 "gateway config must list at least one query file".into(),
             ));
         }
+        let max_nodes = raw.gateway.max_nodes.unwrap_or(DEFAULT_MAX_NODES);
+        if !(1..=MAX_CONFIGURED_NODES).contains(&max_nodes) {
+            return Err(GatewayError::Config(format!(
+                "gateway.maxNodes must be between 1 and {MAX_CONFIGURED_NODES}"
+            )));
+        }
         Ok(GatewayConfig {
             listen: raw
                 .gateway
@@ -49,6 +60,7 @@ impl GatewayConfig {
                 .unwrap_or_else(|| "127.0.0.1:9465".into()),
             seed: raw.gateway.seed.unwrap_or(0),
             stale_after_ms: raw.gateway.stale_after_ms.unwrap_or(300_000).max(1_000),
+            max_nodes,
             query_files: raw.queries.into_iter().map(|q| q.file).collect(),
         })
     }
@@ -106,6 +118,8 @@ struct RawGateway {
     seed: Option<u64>,
     #[serde(default, rename = "staleAfterMs", alias = "stale_after_ms")]
     stale_after_ms: Option<u64>,
+    #[serde(default, rename = "maxNodes", alias = "max_nodes")]
+    max_nodes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,13 +135,14 @@ mod tests {
     #[test]
     fn parses_full_config() {
         let cfg = GatewayConfig::from_yaml(
-            "gateway:\n  listen: 127.0.0.1:0\n  seed: 7\n  staleAfterMs: 60000\n\
+            "gateway:\n  listen: 127.0.0.1:0\n  seed: 7\n  staleAfterMs: 60000\n  maxNodes: 42\n\
              queries:\n  - file: q1.yaml\n  - file: q2.yaml\n",
         )
         .unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:0");
         assert_eq!(cfg.seed, 7);
         assert_eq!(cfg.stale_after_ms, 60_000);
+        assert_eq!(cfg.max_nodes, 42);
         assert_eq!(cfg.query_files.len(), 2);
     }
 
@@ -137,6 +152,7 @@ mod tests {
         assert_eq!(cfg.listen, "127.0.0.1:9465");
         assert_eq!(cfg.seed, 0);
         assert_eq!(cfg.stale_after_ms, 300_000);
+        assert_eq!(cfg.max_nodes, DEFAULT_MAX_NODES);
     }
 
     #[test]
@@ -144,6 +160,10 @@ mod tests {
         assert!(GatewayConfig::from_yaml("gateway: {}\nqueries: []\n").is_err());
         assert!(
             GatewayConfig::from_yaml("gateway:\n  bogus: 1\nqueries:\n  - file: q.yaml\n").is_err()
+        );
+        assert!(
+            GatewayConfig::from_yaml("gateway:\n  maxNodes: 0\nqueries:\n  - file: q.yaml\n")
+                .is_err()
         );
     }
 }

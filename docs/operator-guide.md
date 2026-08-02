@@ -66,7 +66,10 @@ curl -s localhost:9464/v1/queries | jq           # plans, memory, error contract
 
 For simple live capture on Linux, set `source.kind: af_packet` with an
 `interface` — this opens a TPACKET_V3 memory-mapped AF_PACKET ring and needs
-CAP_NET_RAW (or root). On
+CAP_NET_RAW (or root). Ethernet and loopback interfaces use Ethernet framing;
+ARPHRD_NONE/RAWIP interfaces such as TUN and WireGuard use raw IPv4/IPv6
+framing. Unsupported Linux hardware types fail startup rather than serving a
+green readiness endpoint with every packet classified as unparsed. On
 macOS and other non-Linux platforms, `source.kind: pcap` is supported for
 development, demos, and offline analysis; `af_packet` returns a clear
 "Linux only" error. Single-socket AF_PACKET uses a capture thread feeding a
@@ -268,11 +271,16 @@ Semantics and safety:
   the selected window, preventing a partial freshest-node subset from looking
   like a complete cluster total.
 - Gateway memory is bounded: one window state per (query, live node),
-  each within the planner's budget; nodes that stop pushing are evicted
-  after `staleAfterMs`.
+  each within the planner's budget; `gateway.maxNodes` is a hard identity
+  admission limit and nodes that stop pushing are evicted after
+  `staleAfterMs`. Capacity and rejection metrics expose pressure.
+- Accepted pushes update one of 16 deterministic merge-cache shards. A scrape
+  merges at most those 16 summaries after a cache miss; unchanged scrapes
+  reuse the final merged state instead of re-merging every node sketch.
 - The gateway HTTP server caps concurrent connections, request-line/header
-  sizes, POST body size, and read/write timeouts. Agent push clients cap
-  endpoint length, request body size, response reads, and retry count.
+  sizes, POST body size, aggregate in-flight body bytes, and read/write
+  timeouts. Agent push clients cap endpoint length, request body size,
+  response reads, and retry count.
 - Estimates keep their error contracts: the merged output carries the
   same `algorithm`/`error_kind` labels and series caps as node-local
   export.

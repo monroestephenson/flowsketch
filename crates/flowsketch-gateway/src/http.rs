@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::batch::PushBatch;
 use crate::state::GatewayState;
@@ -14,12 +14,18 @@ use crate::state::GatewayState;
 /// Cap on POST bodies. Sketch memory is planner-budgeted (tens of MiB at
 /// the extreme), so a larger push is corrupt or hostile, not legitimate.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Raw POST buffers admitted concurrently. Decoding and sketch validation
+/// can temporarily duplicate this memory, so keep this well below the
+/// default gateway pod limit instead of multiplying MAX_BODY_BYTES by every
+/// connection worker.
+const MAX_INFLIGHT_BODY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(21);
 
 /// Accept connections until the process is terminated.
 pub fn serve(listener: TcpListener, state: Arc<GatewayState>) -> std::io::Result<()> {
@@ -35,6 +41,7 @@ pub fn serve_until(
 ) -> std::io::Result<()> {
     listener.set_nonblocking(true)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let inflight_body_bytes = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::Acquire) {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -51,20 +58,25 @@ pub fn serve_until(
         }
         let state = Arc::clone(&state);
         let active = Arc::clone(&active_connections);
+        let body_bytes = Arc::clone(&inflight_body_bytes);
         let spawn = std::thread::Builder::new()
             .name("fs-gw-conn".into())
             .spawn(move || {
                 let _guard = ConnectionGuard(active);
-                let _ = handle_connection(stream, &state);
+                let _ = handle_connection(stream, &state, &body_bytes);
             });
         if spawn.is_err() {
             active_connections.fetch_sub(1, Ordering::AcqRel);
         }
     }
-    Ok(())
+    wait_for_connections(&active_connections, CONNECTION_DRAIN_TIMEOUT)
 }
 
-fn handle_connection(stream: TcpStream, state: &GatewayState) -> std::io::Result<()> {
+fn handle_connection(
+    stream: TcpStream,
+    state: &GatewayState,
+    inflight_body_bytes: &Arc<AtomicUsize>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -111,12 +123,23 @@ fn handle_connection(stream: TcpStream, state: &GatewayState) -> std::io::Result
                 (400, "text/plain", "empty body\n".to_string())
             } else if content_length > MAX_BODY_BYTES {
                 (413, "text/plain", "body too large\n".to_string())
-            } else {
+            } else if let Some(_body_guard) = try_reserve_body_bytes(
+                Arc::clone(inflight_body_bytes),
+                content_length,
+                MAX_INFLIGHT_BODY_BYTES,
+            ) {
                 let mut body = vec![0u8; content_length];
                 match reader.read_exact(&mut body) {
                     Ok(()) => receive_snapshots(&body, state),
                     Err(_) => (400, "text/plain", "truncated body\n".to_string()),
                 }
+            } else {
+                state.body_budget_rejections.fetch_add(1, Ordering::Relaxed);
+                (
+                    503,
+                    "text/plain",
+                    "in-flight snapshot body budget exhausted\n".to_string(),
+                )
             }
         }
         _ => route_get(method, path, state),
@@ -214,6 +237,54 @@ impl Drop for ConnectionGuard {
     }
 }
 
+struct BodyBytesGuard {
+    active: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for BodyBytesGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+fn try_reserve_body_bytes(
+    active: Arc<AtomicUsize>,
+    bytes: usize,
+    limit: usize,
+) -> Option<BodyBytesGuard> {
+    loop {
+        let current = active.load(Ordering::Acquire);
+        let next = current.checked_add(bytes)?;
+        if next > limit {
+            return None;
+        }
+        if active
+            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(BodyBytesGuard { active, bytes });
+        }
+    }
+}
+
+fn wait_for_connections(active: &AtomicUsize, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while active.load(Ordering::Acquire) != 0 {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{} gateway HTTP connection(s) did not drain before shutdown",
+                    active.load(Ordering::Acquire)
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
 fn read_line_bounded<R: BufRead>(
     reader: &mut R,
     max_bytes: usize,
@@ -243,5 +314,32 @@ fn read_line_bounded<R: BufRead>(
         if buf.ends_with(b"\n") {
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inflight_body_budget_is_atomic_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = try_reserve_body_bytes(Arc::clone(&active), 60, 100).unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 60);
+        assert!(try_reserve_body_bytes(Arc::clone(&active), 41, 100).is_none());
+        let second = try_reserve_body_bytes(Arc::clone(&active), 40, 100).unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 100);
+        drop(second);
+        drop(first);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn connection_drain_reports_a_stuck_worker() {
+        let active = AtomicUsize::new(1);
+        let error = wait_for_connections(&active, Duration::ZERO).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        active.store(0, Ordering::Release);
+        wait_for_connections(&active, Duration::ZERO).unwrap();
     }
 }

@@ -88,6 +88,26 @@ fn validate_rejects_broken_query() {
 }
 
 #[test]
+fn validate_rejects_grouped_low_threshold_as_unenumerable() {
+    let dir = std::env::temp_dir().join("flowsketch-e2e-grouped-low-alert");
+    std::fs::create_dir_all(&dir).unwrap();
+    let query = dir.join("grouped-low.yaml");
+    std::fs::write(
+        &query,
+        "name: unreachable_low\nwindow: {size: 60s}\ngroupBy: [src.ip]\n\
+         measure: {type: count}\nalertIf: {lt: 5}\nexport: {maxSeries: 100}\n",
+    )
+    .unwrap();
+
+    let output = flowsketch().arg("validate").arg(&query).output().unwrap();
+    assert!(!output.status.success());
+    let text = stdout(&output);
+    assert!(text.contains("FAIL"), "{text}");
+    assert!(text.contains("alertIf.lt is not sound"), "{text}");
+    assert!(text.contains("cannot enumerate"), "{text}");
+}
+
+#[test]
 fn explain_shows_plan_memory_and_error_contract() {
     let out = run_ok(
         flowsketch()
