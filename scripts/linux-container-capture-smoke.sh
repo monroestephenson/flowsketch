@@ -20,7 +20,9 @@ cleanup() {
   trap - EXIT HUP INT TERM
   if [ "$status" -ne 0 ]; then
     docker inspect --format '{{json .State}}' "$NAME" >&2 2>/dev/null || true
-    docker logs "$NAME" >&2 2>/dev/null || true
+    # Merge both streams before redirecting. The previous redirection order
+    # discarded the container's stderr, which is where CLI startup errors go.
+    docker logs "$NAME" 2>&1 || true
     if [ "${FLOWSKETCH_CONTAINER_SMOKE_KEEP_FAILED:-0}" = 1 ]; then
       echo "preserving failed container $NAME and config $TMP" >&2
       exit "$status"
@@ -79,6 +81,7 @@ for _ in $(seq 1 100); do
     ready=true
     break
   fi
+  [ "$(docker inspect --format '{{.State.Running}}' "$NAME")" = true ] || break
   sleep 0.1
 done
 [ "$ready" = true ] || {
