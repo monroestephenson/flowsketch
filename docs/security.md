@@ -11,6 +11,9 @@ security boundary, packet firewall, TLS endpoint, SIEM, or secret store.
   timestamps.
 - Query outputs are approximate aggregates. Raw packet records are not
   stored by the runtime.
+- Live AF_PACKET and normalized eBPF timestamps are accepted only within five
+  minutes of realtime. Outliers are dropped and counted before event-time
+  windowing, so one corrupt record cannot fast-forward all runtime shards.
 - Group labels can still contain sensitive metadata such as IP addresses.
   Use `export.maxSeries`, query filters, and downstream retention controls
   accordingly.
@@ -48,6 +51,12 @@ security boundary, packet firewall, TLS endpoint, SIEM, or secret store.
 - Linux AF_PACKET live capture requires CAP_NET_RAW or root. Prefer granting
   only CAP_NET_RAW to the agent binary/container instead of running a broad
   privileged process.
+- The production image keeps the ordinary CLI unprivileged and ships three
+  dedicated agent copies with exact file capabilities: AF_PACKET (NET_RAW),
+  eBPF-only (BPF, NET_ADMIN, PERFMON), and explicit eBPF fallback (those plus
+  NET_RAW). Kubernetes selects one inside a matching drop-all bounding set.
+  The agent must allow the exec-time capability transition; the gateway uses
+  `no_new_privs` and has no file-capability entrypoint.
 - macOS and other non-Linux platforms support pcap replay for development
   and offline analysis. AF_PACKET live capture returns a clear Linux-only
   error.
@@ -69,8 +78,9 @@ security boundary, packet firewall, TLS endpoint, SIEM, or secret store.
 
 ## Snapshots
 
-- FSK1 snapshots include compatibility metadata and a checksum to detect
-  accidental corruption.
+- FSK1 version 2 snapshots include compatibility metadata and a checksum to
+  detect accidental corruption. Hash/snapshot version changes fail closed and
+  require a coordinated agent/gateway rollout.
 - The checksum is not a cryptographic authenticity guarantee. Treat
   snapshots as trusted operational artifacts; do not merge snapshots from
   untrusted sources.

@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use flowsketch_core::hash::HashSpec;
-use flowsketch_core::SketchEstimate;
+use flowsketch_core::{SketchError, SketchEstimate};
 use flowsketch_ir::logical::humanize_nanos;
 use flowsketch_pcap::PcapReader;
 use flowsketch_planner::Plan;
@@ -45,11 +45,43 @@ pub fn run(
 
     let started = Instant::now();
     let mut events = 0u64;
+    let mut estimates = Vec::new();
     while let Some(event) = reader.next_event()? {
-        engine.process(&event).context("sketch update failed")?;
+        loop {
+            match engine.process(&event) {
+                Ok(()) => break,
+                Err(SketchError::Backpressure(_)) => {
+                    let drained = engine.take_estimates();
+                    if drained.is_empty() {
+                        anyhow::bail!(
+                            "query engine reported output backpressure without a drainable window"
+                        );
+                    }
+                    estimates.extend(drained);
+                }
+                Err(error) => return Err(error).context("sketch update failed"),
+            }
+        }
+        if engine.pending_windows_full() {
+            estimates.extend(engine.take_estimates());
+        }
         events += 1;
     }
-    engine.finish().context("final window flush failed")?;
+    loop {
+        match engine.finish() {
+            Ok(()) => break,
+            Err(SketchError::Backpressure(_)) => {
+                let drained = engine.take_estimates();
+                if drained.is_empty() {
+                    anyhow::bail!(
+                        "query engine reported final-output backpressure without a drainable window"
+                    );
+                }
+                estimates.extend(drained);
+            }
+            Err(error) => return Err(error).context("final window flush failed"),
+        }
+    }
     let elapsed = started.elapsed();
 
     if let Some(dir) = snapshot_out {
@@ -65,7 +97,7 @@ pub fn run(
         }
     }
 
-    let estimates = engine.take_estimates();
+    estimates.extend(engine.take_estimates());
 
     match format {
         OutputFormat::Prometheus => {

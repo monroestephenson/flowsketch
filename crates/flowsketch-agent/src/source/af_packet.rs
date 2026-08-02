@@ -15,6 +15,10 @@ use crate::AgentError;
 
 const FRAME_SIZE_BYTES: u32 = 2_048;
 const POLL_TIMEOUT_MS: libc::c_int = 1_000;
+// Linux UAPI flag from <linux/if_packet.h>. libc does not expose it on every
+// supported target. With a zero group ID, the kernel allocates a group that
+// is unique in the current network namespace.
+const PACKET_FANOUT_FLAG_UNIQUEID: libc::c_uint = 0x2000;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RingSettings {
@@ -30,8 +34,14 @@ pub(super) enum FanoutMode {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) enum FanoutGroup {
+    AllocateUnique,
+    Join(u16),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct FanoutSettings {
-    pub group_id: u16,
+    pub group: FanoutGroup,
     pub mode: FanoutMode,
 }
 
@@ -216,10 +226,41 @@ impl AfPacketSocket {
         )
         .map_err(|error| {
             AgentError::Source(format!(
-                "cannot join PACKET_FANOUT group {} in {:?} mode: {error}",
-                settings.group_id, settings.mode
+                "cannot configure PACKET_FANOUT {:?} in {:?} mode: {error}",
+                settings.group, settings.mode
             ))
         })
+    }
+
+    /// Return the fan-out group selected by the kernel. This is used after
+    /// `PACKET_FANOUT_FLAG_UNIQUEID` allocation so subsequent lane sockets
+    /// can join the same group without a userspace-generated collision.
+    pub(super) fn fanout_group_id(&self) -> Result<u16, AgentError> {
+        let mut argument: libc::c_uint = 0;
+        let mut len = std::mem::size_of_val(&argument) as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `len` bytes to the initialized
+        // argument and updates the valid socklen_t pointer.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_FANOUT,
+                (&mut argument as *mut libc::c_uint).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(AgentError::Source(format!(
+                "cannot read kernel-assigned PACKET_FANOUT group: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        if len < std::mem::size_of_val(&argument) as libc::socklen_t {
+            return Err(AgentError::Source(
+                "short PACKET_FANOUT getsockopt response".into(),
+            ));
+        }
+        Ok(argument as u16)
     }
 
     pub(super) fn ring_bytes(&self) -> usize {
@@ -238,7 +279,7 @@ impl AfPacketSocket {
     /// timeout; `Some(false)` means the visitor requested shutdown.
     pub(super) fn poll_block(
         &mut self,
-        mut visit: impl FnMut(&[u8], u64) -> bool,
+        mut visit: impl FnMut(&[u8], u32, u64) -> bool,
     ) -> io::Result<Option<bool>> {
         let block = self.ring.current_block_ptr();
         // SAFETY: block points into self.ring's live mmap and the returned
@@ -346,7 +387,7 @@ impl AfPacketSocket {
             let timestamp_nanos = u64::from(packet_header.tp_sec)
                 .saturating_mul(1_000_000_000)
                 .saturating_add(u64::from(packet_header.tp_nsec));
-            keep_running = visit(bytes, timestamp_nanos);
+            keep_running = visit(bytes, packet_header.tp_len, timestamp_nanos);
             if !keep_running {
                 break;
             }
@@ -409,7 +450,11 @@ fn fanout_argument(settings: FanoutSettings) -> libc::c_uint {
         FanoutMode::Hash => libc::PACKET_FANOUT_HASH,
         FanoutMode::RxQueue => libc::PACKET_FANOUT_QM,
     };
-    libc::c_uint::from(settings.group_id) | (mode << 16)
+    let (group_id, flags) = match settings.group {
+        FanoutGroup::AllocateUnique => (0, PACKET_FANOUT_FLAG_UNIQUEID),
+        FanoutGroup::Join(group_id) => (group_id, 0),
+    };
+    libc::c_uint::from(group_id) | ((mode | flags) << 16)
 }
 
 struct PacketRing {
@@ -489,17 +534,24 @@ mod tests {
     fn encodes_packet_fanout_group_and_mode() {
         assert_eq!(
             fanout_argument(FanoutSettings {
-                group_id: 0x1234,
+                group: FanoutGroup::Join(0x1234),
                 mode: FanoutMode::Hash,
             }),
             0x1234 | (libc::PACKET_FANOUT_HASH << 16)
         );
         assert_eq!(
             fanout_argument(FanoutSettings {
-                group_id: 77,
+                group: FanoutGroup::Join(77),
                 mode: FanoutMode::RxQueue,
             }),
             77 | (libc::PACKET_FANOUT_QM << 16)
+        );
+        assert_eq!(
+            fanout_argument(FanoutSettings {
+                group: FanoutGroup::AllocateUnique,
+                mode: FanoutMode::Hash,
+            }),
+            (libc::PACKET_FANOUT_HASH | PACKET_FANOUT_FLAG_UNIQUEID) << 16
         );
     }
 }

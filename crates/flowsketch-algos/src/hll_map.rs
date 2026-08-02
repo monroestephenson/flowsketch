@@ -7,7 +7,8 @@
 //! dropped). High-fan-out keys — the ones scanner/fan-out queries care
 //! about — are strongly favored for retention.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 use flowsketch_core::hash::{hash64, HashSpec};
 use flowsketch_core::snapshot::{
@@ -28,12 +29,44 @@ struct Slot {
     dirty: bool,
 }
 
+/// Reverse-ordered heap entry: `BinaryHeap::pop` returns the smallest
+/// cardinality, with the lexicographically smallest key as a stable tie-break.
+#[derive(Debug, Clone)]
+struct EvictionCandidate {
+    cardinality: f64,
+    key: Vec<u8>,
+}
+
+impl PartialEq for EvictionCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cardinality.total_cmp(&other.cardinality) == Ordering::Equal && self.key == other.key
+    }
+}
+
+impl Eq for EvictionCandidate {}
+
+impl PartialOrd for EvictionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EvictionCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cardinality
+            .total_cmp(&self.cardinality)
+            .then_with(|| other.key.cmp(&self.key))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HllMap {
     max_keys: usize,
     precision: u8,
     hash: HashSpec,
     map: HashMap<Vec<u8>, Slot>,
+    eviction: BinaryHeap<EvictionCandidate>,
     evicted_keys: u64,
     updates: u64,
 }
@@ -52,6 +85,7 @@ impl HllMap {
             precision,
             hash,
             map: HashMap::new(),
+            eviction: BinaryHeap::with_capacity(max_keys),
             evicted_keys: 0,
             updates: 0,
         })
@@ -86,38 +120,23 @@ impl HllMap {
             return;
         }
         if self.map.len() >= self.max_keys {
-            // Refresh only the estimates that changed since the last scan,
-            // then evict the key with the smallest estimated cardinality.
-            for slot in self.map.values_mut() {
-                if slot.dirty {
-                    slot.cached_cardinality = slot.hll.cardinality();
-                    slot.dirty = false;
-                }
-            }
-            if let Some(evict) = self
-                .map
-                .iter()
-                .min_by(|a, b| {
-                    a.1.cached_cardinality
-                        .partial_cmp(&b.1.cached_cardinality)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&evict);
-                self.evicted_keys += 1;
-            }
+            self.evict_smallest();
         }
         let mut hll = HyperLogLog::new(self.precision, self.hash).expect("validated params");
         hll.insert(item);
+        let key = key.to_vec();
         self.map.insert(
-            key.to_vec(),
+            key.clone(),
             Slot {
                 hll,
                 cached_cardinality: 1.0,
                 dirty: false,
             },
         );
+        self.eviction.push(EvictionCandidate {
+            cardinality: 1.0,
+            key,
+        });
     }
 
     pub fn cardinality(&self, key: &[u8]) -> Option<f64> {
@@ -137,6 +156,48 @@ impl HllMap {
                 .then_with(|| a.0.cmp(&b.0))
         });
         all
+    }
+
+    /// Evict the true minimum without rescanning every register array for
+    /// every new key. Cached estimates are monotone lower bounds; a dirty
+    /// heap head is refreshed lazily until a clean minimum is reached.
+    fn evict_smallest(&mut self) {
+        loop {
+            let candidate = self
+                .eviction
+                .pop()
+                .expect("a full HLLMap has an eviction candidate per slot");
+            let Some(slot) = self.map.get_mut(candidate.key.as_slice()) else {
+                continue;
+            };
+            if slot.dirty
+                || slot.cached_cardinality.total_cmp(&candidate.cardinality) != Ordering::Equal
+            {
+                slot.cached_cardinality = slot.hll.cardinality();
+                slot.dirty = false;
+                self.eviction.push(EvictionCandidate {
+                    cardinality: slot.cached_cardinality,
+                    key: candidate.key,
+                });
+                continue;
+            }
+            self.map.remove(candidate.key.as_slice());
+            self.evicted_keys += 1;
+            return;
+        }
+    }
+
+    fn rebuild_eviction_heap(&mut self) {
+        self.eviction.clear();
+        self.eviction.reserve(self.map.len());
+        for (key, slot) in &mut self.map {
+            slot.cached_cardinality = slot.hll.cardinality();
+            slot.dirty = false;
+            self.eviction.push(EvictionCandidate {
+                cardinality: slot.cached_cardinality,
+                key: key.clone(),
+            });
+        }
     }
 
     fn params_hash(&self) -> u64 {
@@ -240,14 +301,17 @@ impl HllMap {
                 },
             );
         }
-        Ok(HllMap {
+        let mut result = HllMap {
             max_keys,
             precision,
             hash: header.hash,
             map,
+            eviction: BinaryHeap::with_capacity(max_keys),
             evicted_keys,
             updates,
-        })
+        };
+        result.rebuild_eviction_heap();
+        Ok(result)
     }
 }
 
@@ -278,18 +342,10 @@ impl Sketch for HllMap {
                 }
             }
         }
-        // Trim back to max_keys, dropping the smallest cardinalities.
-        if self.map.len() > self.max_keys {
-            let mut all: Vec<(Vec<u8>, f64)> = self
-                .map
-                .iter()
-                .map(|(k, s)| (k.clone(), s.hll.cardinality()))
-                .collect();
-            all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (k, _) in all.into_iter().skip(self.max_keys) {
-                self.map.remove(&k);
-                self.evicted_keys += 1;
-            }
+        // Rebuild once after a bulk merge, then trim deterministically.
+        self.rebuild_eviction_heap();
+        while self.map.len() > self.max_keys {
+            self.evict_smallest();
         }
         self.evicted_keys += other.evicted_keys;
         self.updates += other.updates;
@@ -302,11 +358,16 @@ impl Sketch for HllMap {
             .iter()
             .map(|(k, s)| k.len() + s.hll.memory_bytes() + 48)
             .sum();
-        inner + std::mem::size_of::<Self>()
+        let heap_keys: usize = self.eviction.iter().map(|entry| entry.key.len()).sum();
+        inner
+            + heap_keys
+            + self.eviction.capacity() * std::mem::size_of::<EvictionCandidate>()
+            + std::mem::size_of::<Self>()
     }
 
     fn reset(&mut self) {
         self.map.clear();
+        self.eviction.clear();
         self.evicted_keys = 0;
         self.updates = 0;
     }
@@ -363,6 +424,20 @@ mod tests {
         assert!(m.evicted_keys() > 0);
         let card = m.cardinality(b"scanner").expect("scanner retained");
         assert!(card > 4_000.0, "scanner cardinality {card}");
+    }
+
+    #[test]
+    fn tied_evictions_are_deterministic_across_hashmap_instances() {
+        let hash = HashSpec::new(2);
+        let mut a = HllMap::new(16, 10, hash).unwrap();
+        let mut b = HllMap::new(16, 10, hash).unwrap();
+        for key in 0..200u32 {
+            let key = format!("key-{key:03}");
+            a.insert(key.as_bytes(), b"one-item");
+            b.insert(key.as_bytes(), b"one-item");
+        }
+        assert_eq!(a.entries(), b.entries());
+        assert_eq!(a.to_snapshot(0, 1), b.to_snapshot(0, 1));
     }
 
     #[test]

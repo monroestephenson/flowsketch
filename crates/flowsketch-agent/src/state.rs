@@ -56,6 +56,7 @@ pub struct PublishedState {
     pub packets_seen: AtomicU64,
     pub packets_parsed: AtomicU64,
     pub packets_unparsed: AtomicU64,
+    pub invalid_timestamps: AtomicU64,
     pub kernel_packets: AtomicU64,
     pub kernel_dropped_packets: AtomicU64,
     pub kernel_queue_freezes: AtomicU64,
@@ -81,6 +82,7 @@ pub struct PublishedState {
     capture_cpu_affinity: Vec<usize>,
     runtime_cpu_affinity: Vec<usize>,
     af_packet_fanout_lanes: Vec<CaptureLaneCounters>,
+    queue_local_channel_capacities: Mutex<Vec<usize>>,
 
     /// Latest exported window snapshots for the gateway pusher, refreshed
     /// by the engine thread at most once per `interval` (serializing
@@ -141,6 +143,7 @@ impl PublishedState {
             packets_seen: AtomicU64::new(0),
             packets_parsed: AtomicU64::new(0),
             packets_unparsed: AtomicU64::new(0),
+            invalid_timestamps: AtomicU64::new(0),
             kernel_packets: AtomicU64::new(0),
             kernel_dropped_packets: AtomicU64::new(0),
             kernel_queue_freezes: AtomicU64::new(0),
@@ -172,6 +175,7 @@ impl PublishedState {
             af_packet_fanout_lanes: (0..af_packet_fanout_lanes)
                 .map(|_| CaptureLaneCounters::default())
                 .collect(),
+            queue_local_channel_capacities: Mutex::new(Vec::new()),
             snapshot_gate: Mutex::new(None),
             snapshots: Mutex::new(Vec::new()),
         }
@@ -228,6 +232,10 @@ impl PublishedState {
         }
     }
 
+    pub(crate) fn configure_queue_local_channels(&self, capacities: &[usize]) {
+        *self.queue_local_channel_capacities.lock().unwrap() = capacities.to_vec();
+    }
+
     /// Turn on periodic snapshot export (called before the engine starts
     /// when a gateway push is configured).
     pub fn enable_snapshot_export(&self, interval: Duration) {
@@ -247,25 +255,42 @@ impl PublishedState {
     /// publish when a finite source completes, so the trailing window is
     /// available to push regardless of timing.
     pub fn export_snapshots_now(&self, engine: &ShardedQueryEngine) {
-        if self.snapshot_gate.lock().unwrap().is_none() {
+        if !self.snapshot_export_due(true) {
             return;
         }
         if let Ok(snaps) = engine.export_snapshots() {
             *self.snapshots.lock().unwrap() = snaps;
+            self.mark_snapshot_exported();
         }
     }
 
     fn maybe_export_snapshots(&self, engine: &ShardedQueryEngine) {
-        let mut gate = self.snapshot_gate.lock().unwrap();
-        let Some(gate) = gate.as_mut() else { return };
-        if gate
-            .last_export
-            .is_some_and(|last| last.elapsed() < gate.interval)
-        {
+        if !self.snapshot_export_due(false) {
             return;
         }
         if let Ok(snaps) = engine.export_snapshots() {
             *self.snapshots.lock().unwrap() = snaps;
+            self.mark_snapshot_exported();
+        }
+    }
+
+    pub(crate) fn snapshot_export_due(&self, force: bool) -> bool {
+        let mut gate = self.snapshot_gate.lock().unwrap();
+        let Some(gate) = gate.as_mut() else {
+            return false;
+        };
+        if !force
+            && gate
+                .last_export
+                .is_some_and(|last| last.elapsed() < gate.interval)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn mark_snapshot_exported(&self) {
+        if let Some(gate) = self.snapshot_gate.lock().unwrap().as_mut() {
             gate.last_export = Some(Instant::now());
         }
     }
@@ -282,8 +307,30 @@ impl PublishedState {
         self.late_events
             .store(engine.late_events(), Ordering::Relaxed);
         self.maybe_export_snapshots(engine);
+        self.publish_estimates(drained);
+        Ok(())
+    }
+
+    pub(crate) fn publish_queue_local(
+        &self,
+        estimates: Vec<SketchEstimate>,
+        sketch_memory_bytes: usize,
+        late_events: u64,
+        snapshots: Option<Vec<SnapshotExport>>,
+    ) {
+        self.sketch_memory_bytes
+            .store(sketch_memory_bytes as u64, Ordering::Relaxed);
+        self.late_events.store(late_events, Ordering::Relaxed);
+        if let Some(snapshots) = snapshots {
+            *self.snapshots.lock().unwrap() = snapshots;
+            self.mark_snapshot_exported();
+        }
+        self.publish_estimates(estimates);
+    }
+
+    fn publish_estimates(&self, drained: Vec<SketchEstimate>) {
         if drained.is_empty() {
-            return Ok(());
+            return;
         }
         let mut map = self.estimates.lock().unwrap();
         for e in drained {
@@ -300,7 +347,6 @@ impl PublishedState {
                 None => per_query.push(e),
             }
         }
-        Ok(())
     }
 
     /// Estimates of the latest window across all queries.
@@ -332,7 +378,7 @@ impl PublishedState {
     /// Agent health block appended to /metrics.
     pub fn render_health_metrics(&self) -> String {
         let mut out = String::new();
-        let counters: [(&str, &str, u64); 21] = [
+        let counters: [(&str, &str, u64); 22] = [
             (
                 "flowsketch_agent_events_processed_total",
                 "Flow events processed by the sketch engine.",
@@ -352,6 +398,11 @@ impl PublishedState {
                 "flowsketch_agent_packets_unparsed_total",
                 "Captured packets skipped because they are unsupported or malformed.",
                 self.packets_unparsed.load(Ordering::Relaxed),
+            ),
+            (
+                "flowsketch_agent_invalid_timestamps_total",
+                "Live capture events quarantined because their timestamp was outside the trusted wall-clock range.",
+                self.invalid_timestamps.load(Ordering::Relaxed),
             ),
             (
                 "flowsketch_agent_kernel_packets_total",
@@ -435,7 +486,7 @@ impl PublishedState {
             ),
             (
                 "flowsketch_agent_runtime_batches_total",
-                "Event batches dispatched to runtime shards.",
+                "Event batches completed by runtime workers.",
                 self.runtime_batches.load(Ordering::Relaxed),
             ),
         ];
@@ -485,6 +536,23 @@ impl PublishedState {
              flowsketch_agent_af_packet_fanout_lanes {}\n",
             self.af_packet_fanout_lanes.len()
         ));
+        let queue_capacities = self.queue_local_channel_capacities.lock().unwrap();
+        out.push_str(&format!(
+            "# HELP flowsketch_agent_af_packet_queue_local_handoff Whether fan-out capture lanes feed dedicated runtime workers without a shared event receiver.\n\
+             # TYPE flowsketch_agent_af_packet_queue_local_handoff gauge\n\
+             flowsketch_agent_af_packet_queue_local_handoff {}\n",
+            u8::from(!queue_capacities.is_empty())
+        ));
+        out.push_str(
+            "# HELP flowsketch_agent_af_packet_lane_channel_capacity Event slots reserved for each queue-local AF_PACKET lane.\n\
+             # TYPE flowsketch_agent_af_packet_lane_channel_capacity gauge\n",
+        );
+        for (lane, capacity) in queue_capacities.iter().enumerate() {
+            out.push_str(&format!(
+                "flowsketch_agent_af_packet_lane_channel_capacity{{lane=\"{lane}\"}} {capacity}\n"
+            ));
+        }
+        drop(queue_capacities);
         let lane_counters: [CaptureLaneMetric; 8] = [
             (
                 "flowsketch_agent_af_packet_lane_packets_seen_total",
@@ -523,7 +591,7 @@ impl PublishedState {
             ),
             (
                 "flowsketch_agent_af_packet_lane_userspace_dropped_events_total",
-                "Parsed events dropped by an AF_PACKET fan-out lane because the engine channel was full.",
+                "Parsed events dropped by an AF_PACKET fan-out lane because its dedicated runtime channel was full.",
                 |lane| lane.userspace_drops.load(Ordering::Relaxed),
             ),
         ];
@@ -599,6 +667,7 @@ mod tests {
         state.packets_seen.store(11, Ordering::Relaxed);
         state.packets_parsed.store(9, Ordering::Relaxed);
         state.packets_unparsed.store(2, Ordering::Relaxed);
+        state.invalid_timestamps.store(4, Ordering::Relaxed);
         state.kernel_packets.store(12, Ordering::Relaxed);
         state.kernel_dropped_packets.store(1, Ordering::Relaxed);
         state.kernel_queue_freezes.store(3, Ordering::Relaxed);
@@ -620,12 +689,14 @@ mod tests {
         state.record_capture_lane_statistics(1, 8, 1, 2);
         state.record_capture_lane_events_processed(1, 5);
         state.record_capture_lane_userspace_drop(1);
+        state.configure_queue_local_channels(&[32_768, 32_768]);
 
         let metrics = state.render_health_metrics();
         for expected in [
             "flowsketch_agent_packets_seen_total 11\n",
             "flowsketch_agent_packets_parsed_total 9\n",
             "flowsketch_agent_packets_unparsed_total 2\n",
+            "flowsketch_agent_invalid_timestamps_total 4\n",
             "flowsketch_agent_kernel_packets_total 12\n",
             "flowsketch_agent_kernel_dropped_packets_total 1\n",
             "flowsketch_agent_kernel_queue_freezes_total 3\n",
@@ -641,6 +712,9 @@ mod tests {
             "flowsketch_agent_ebpf_ring_bytes 16777216\n",
             "flowsketch_agent_runtime_shards 4\n",
             "flowsketch_agent_af_packet_fanout_lanes 2\n",
+            "flowsketch_agent_af_packet_queue_local_handoff 1\n",
+            "flowsketch_agent_af_packet_lane_channel_capacity{lane=\"0\"} 32768\n",
+            "flowsketch_agent_af_packet_lane_channel_capacity{lane=\"1\"} 32768\n",
             "flowsketch_agent_af_packet_lane_packets_seen_total{lane=\"1\"} 7\n",
             "flowsketch_agent_af_packet_lane_packets_parsed_total{lane=\"1\"} 6\n",
             "flowsketch_agent_af_packet_lane_packets_unparsed_total{lane=\"1\"} 1\n",

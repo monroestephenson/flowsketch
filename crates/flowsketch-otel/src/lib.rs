@@ -1,4 +1,4 @@
-//! OTLP metrics export (README Phase 4).
+//! OTLP metrics export.
 //!
 //! Encodes `SketchEstimate`s as OTLP/HTTP + JSON — the protobuf-JSON
 //! mapping accepted on `/v1/metrics` by the OpenTelemetry Collector,

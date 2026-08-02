@@ -75,6 +75,12 @@ packets parsed = events processed + userspace drops
 The sum of every `flowsketch_agent_af_packet_lane_*` counter must equal its
 aggregate agent counter once a fan-out run settles. Queue freezes are a
 separate kernel-pressure signal and are not added to the packet identity.
+For HASH/RX_QUEUE fan-out,
+`flowsketch_agent_af_packet_queue_local_handoff` must be 1 and the sum of
+`flowsketch_agent_af_packet_lane_channel_capacity` must be 65,536. A missing
+lane capacity or a zero handoff gauge means the expected queue-local topology
+is not active; stop the rollout and inspect the rendered source mode and
+runtime shard count.
 
 For tc eBPF:
 
@@ -182,6 +188,15 @@ suspend, VM migration, or clock correction. For replay, verify trace ordering
 and window settings. Increasing a window only to hide late input changes query
 semantics and requires a reviewed query update.
 
+### FlowSketchInvalidTimestamps
+
+A live AF_PACKET timestamp or normalized eBPF monotonic timestamp fell outside
+the five-minute realtime trust window and was quarantined before windowing.
+Inspect host clock synchronization, suspend/resume or VM migration events,
+kernel capture records, and the eBPF clock-conversion path. Do not widen the
+trust window merely to silence the alert: a sufficiently future timestamp can
+otherwise advance every shard and make subsequent traffic appear late.
+
 ### FlowSketchOtlpExportFailures
 
 Confirm the node-local collector is ready and accepting OTLP/HTTP on the
@@ -210,6 +225,9 @@ state.
 ### FlowSketchGatewayMergeGap
 
 `nodes_known - nodes_merged` remained positive for one query for five minutes.
+While this gap is positive, `flowsketch_gateway_merge_complete` is `0` and the
+gateway intentionally suppresses that query's cluster estimate rather than
+publishing an undercount from only the freshest subset.
 Inspect `/v1/nodes` for window boundaries and snapshot ages. Verify clocks,
 query files, flush intervals, stalled agents, and packet timestamps. A brief
 gap at a sliding-window boundary is valid; a persistent gap means the cluster
@@ -297,10 +315,12 @@ configured `maxUnavailable`. During the rollout, watch:
 - sketch memory and exported-series truncation;
 - the external Prometheus/OTLP ingest path.
 
-Changing queries or the hash seed is a coordinated compatibility change.
-Mixed old/new agents can be rejected by the new gateway until the DaemonSet
-finishes. Stop and roll back if rejections persist, expected nodes do not
-recover, readiness fails, or loss begins increasing.
+Changing queries, the hash seed, the hash-family version, or the FSK1 version
+is a coordinated compatibility change. The current FSK1/hash v2 boundary is
+intentionally incompatible with v1 state. Mixed old/new agents can be rejected
+by the new gateway until the DaemonSet finishes. Stop and roll back if
+rejections persist, expected nodes do not recover, readiness fails, or loss
+begins increasing.
 
 ### Rollback
 

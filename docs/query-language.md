@@ -34,6 +34,11 @@ resources:
   maxMemory: 64MiB              # plan budget; over-budget queries are rejected
 ```
 
+`alertIf.lt` is supported only for ungrouped queries. Grouped plans retain a
+bounded top-k/key set, so they cannot soundly enumerate every low-valued or
+absent group; the planner rejects that combination instead of silently making
+the low-threshold alert unreachable. Grouped `alertIf.gt` remains supported.
+
 ## Fields
 
 ```
@@ -72,5 +77,6 @@ merged at each slide boundary. Estimates are emitted once per slide.
 
 ## What v0 deliberately does not have
 
-No SQL, no cross-query joins, no payload predicates, no per-packet
-sampling controls. See README §6.3 — the runtime is proven first.
+No SQL, cross-query joins, payload predicates, or per-packet sampling controls.
+Sampling, when required, must happen upstream and be reflected in how results
+are interpreted.

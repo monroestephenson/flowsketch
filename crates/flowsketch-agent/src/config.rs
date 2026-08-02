@@ -19,7 +19,7 @@
 //!     ringBlockCount: 64
 //!     blockRetireTimeoutMs: 64
 //!     fanoutMode: rx_queue # single | hash | rx_queue
-//!     fanoutGroup: 0       # derive a process-local group
+//!     fanoutGroup: 0       # ask Linux for a unique group in this netns
 //! queries:
 //!   - file: examples/queries/top-talkers.yaml
 //! ```

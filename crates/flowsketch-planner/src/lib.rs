@@ -63,7 +63,11 @@ pub struct PhysicalPlan {
     pub sketch: PhysicalSketch,
     /// Number of tumbling buckets realizing the (sliding) window.
     pub window_buckets: usize,
-    /// Estimated memory across all buckets plus one merge scratch copy.
+    /// Maximum completed window states retained until the consumer drains.
+    /// Reaching this limit returns explicit runtime backpressure.
+    pub pending_window_capacity: usize,
+    /// Estimated resident memory across open buckets, bounded completed
+    /// windows, and one transient merge scratch copy.
     pub estimated_memory_bytes: u64,
     /// Upper bound on exported series per flush.
     pub export_series_upper_bound: usize,
@@ -85,12 +89,23 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
     let _ = hash; // reserved: future planners may pick per-query seeds
     let mut warnings = Vec::new();
     let buckets = query.window.bucket_count();
+    let pending_window_capacity = buckets;
+    let resident_sketches = buckets as u64 + pending_window_capacity as u64 + 1;
     let max_series = query.export.max_series;
 
     let reject = |reason: String| PlanError::Rejected {
         name: query.name.clone(),
         reason,
     };
+
+    if !query.group_by.is_empty() && query.alert.lt.is_some() {
+        return Err(reject(
+            "alertIf.lt is not sound for grouped queries: bounded top-k/key-retention plans \
+             cannot enumerate every low-valued or absent group; use alertIf.gt, remove groupBy, \
+             or alert on an explicitly enumerated downstream series"
+                .into(),
+        ));
+    }
 
     let (sketch, error_kind, error_contract, series_bound) = match &query.measure {
         Measure::Count | Measure::Sum { .. } => {
@@ -176,7 +191,37 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
                 );
                 (sketch, ErrorKind::Relative, contract, 1)
             } else {
-                let max_keys = (max_series * 4).clamp(1_024, 65_536);
+                let preferred_max_keys = (max_series * 4).clamp(1_024, 65_536);
+                // HLLMap is often the largest state in the runtime. Size its
+                // bounded key-retention map against the query's declared
+                // resident budget, including open buckets, completed-window
+                // output, and merge scratch. This keeps the useful default
+                // query executable without pretending pending output is free.
+                let per_key_bytes = (1u64 << precision)
+                    + 2 * AVG_KEY_BYTES as u64
+                    + 48 // HashMap entry/allocation allowance
+                    + 32; // deterministic eviction-heap entry
+                let per_sketch_budget = query.max_memory_bytes / resident_sketches;
+                let budgeted_max_keys = per_sketch_budget
+                    .saturating_sub(64)
+                    .checked_div(per_key_bytes)
+                    .unwrap_or(0) as usize;
+                let minimum_max_keys = max_series.min(preferred_max_keys);
+                if budgeted_max_keys < minimum_max_keys {
+                    return Err(reject(format!(
+                        "resources.maxMemory can retain only {budgeted_max_keys} grouped HLL \
+                         keys across {buckets} window buckets and bounded output, below the \
+                         configured export.maxSeries requirement of {minimum_max_keys}"
+                    )));
+                }
+                let max_keys = preferred_max_keys.min(budgeted_max_keys);
+                if max_keys < preferred_max_keys {
+                    warnings.push(format!(
+                        "HLLMap key retention reduced from preferred {preferred_max_keys} to \
+                         {max_keys} groups to stay within resources.maxMemory; raise the budget \
+                         for more low-cardinality retention headroom"
+                    ));
+                }
                 let sketch = PhysicalSketch::HllMap {
                     max_keys,
                     precision,
@@ -187,7 +232,12 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
                      may be evicted under pressure (evictions are exported as a health metric)",
                     rel * 100.0
                 );
-                (sketch, ErrorKind::Relative, contract, max_series)
+                (
+                    sketch,
+                    ErrorKind::Relative,
+                    contract,
+                    max_series.min(max_keys),
+                )
             }
         }
 
@@ -251,10 +301,13 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
         }
     };
 
-    // Memory: one sketch per window bucket, plus one scratch copy used when
-    // merging buckets at flush time.
+    // A large event-time gap can close one decaying window per open bucket
+    // in a single operation. Retain exactly that many completed states so
+    // the operation is lossless, then require the consumer to drain before
+    // accepting more output. Account for open buckets, pending states, and
+    // one transient scratch copy used while merging a window.
     let per_bucket = sketch.estimated_memory_bytes(AVG_KEY_BYTES);
-    let estimated_memory_bytes = per_bucket * (buckets as u64 + 1);
+    let estimated_memory_bytes = per_bucket * resident_sketches;
     if estimated_memory_bytes > query.max_memory_bytes {
         return Err(reject(format!(
             "plan needs ~{} across {} window buckets but resources.maxMemory is {}; \
@@ -283,6 +336,7 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
         physical: PhysicalPlan {
             sketch,
             window_buckets: buckets,
+            pending_window_capacity,
             estimated_memory_bytes,
             export_series_upper_bound: series_bound,
             error_kind,
@@ -293,11 +347,17 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
 }
 
 fn count_min_dimensions(epsilon: f64, delta: f64) -> Result<(usize, usize), String> {
+    const HASH_FAILURE_FLOOR: f64 = 1.0 / 18_446_744_073_709_551_616.0;
     if !(epsilon > 0.0 && epsilon < 1.0 && delta > 0.0 && delta < 1.0) {
         return Err("epsilon and delta must be in (0, 1)".into());
     }
+    if delta <= HASH_FAILURE_FLOOR {
+        return Err(format!(
+            "delta must exceed the fsk1 hash confidence floor {HASH_FAILURE_FLOOR}"
+        ));
+    }
     let width = (std::f64::consts::E / epsilon).ceil() as usize;
-    let depth = (1.0 / delta).ln().ceil().max(1.0) as usize;
+    let depth = (1.0 / (delta - HASH_FAILURE_FLOOR)).ln().ceil().max(1.0) as usize;
     Ok((width, depth))
 }
 
@@ -547,6 +607,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("grouped quantile"));
+    }
+
+    #[test]
+    fn grouped_low_threshold_alert_is_rejected_as_unenumerable() {
+        let err = plan_yaml(
+            "name: low\nwindow: {size: 30s}\ngroupBy: [src.ip]\n\
+             measure: {type: count}\nalertIf: {lt: 5}\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("alertIf.lt"), "{err}");
+
+        plan_yaml(
+            "name: global_low\nwindow: {size: 30s}\nmeasure: {type: count}\n\
+             alertIf: {lt: 5}\n",
+        )
+        .unwrap();
     }
 
     #[test]

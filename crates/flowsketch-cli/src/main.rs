@@ -9,6 +9,9 @@ mod synth;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -16,6 +19,48 @@ use clap::{Parser, Subcommand, ValueEnum};
 use flowsketch_core::hash::HashSpec;
 use flowsketch_ir::parse_query_yaml;
 use flowsketch_planner::{explain, plan, Plan};
+
+#[cfg(unix)]
+static PROCESS_SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn request_process_shutdown(_signal: libc::c_int) {
+    PROCESS_SIGNALLED.store(true, Ordering::Release);
+}
+
+fn install_shutdown_flag() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        PROCESS_SIGNALLED.store(false, Ordering::Release);
+        // SAFETY: sigaction is initialized before use, the handler performs
+        // only one lock-free atomic store, and its static storage outlives
+        // both installed dispositions.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = request_process_shutdown as *const () as usize;
+            if libc::sigemptyset(&mut action.sa_mask) != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+                || libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        let propagated = Arc::clone(&shutdown);
+        std::thread::Builder::new()
+            .name("fs-signal".into())
+            .spawn(move || {
+                while !PROCESS_SIGNALLED.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                propagated.store(true, Ordering::Release);
+            })
+            .context("cannot spawn signal propagation thread")?;
+    }
+    Ok(shutdown)
+}
 
 #[derive(Parser)]
 #[command(
@@ -201,7 +246,8 @@ fn main() -> Result<()> {
                 cfg.query_files.len(),
                 cfg.source
             );
-            flowsketch_agent::run(cfg, |addr| {
+            let shutdown = install_shutdown_flag()?;
+            flowsketch_agent::run_until(cfg, shutdown, |addr| {
                 eprintln!("listening on http://{addr} (/metrics /healthz /readyz /v1/queries)");
             })
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -214,13 +260,18 @@ fn main() -> Result<()> {
                 cfg.query_files.len(),
                 cfg.stale_after_ms
             );
-            flowsketch_gateway::run(cfg, |addr| {
+            let shutdown = install_shutdown_flag()?;
+            let result = flowsketch_gateway::run_until(cfg, Arc::clone(&shutdown), |addr| {
                 eprintln!(
                     "listening on http://{addr} (POST /v1/snapshots; GET /metrics /healthz \
                      /readyz /v1/queries /v1/nodes)"
                 );
             })
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("{e}"));
+            if result.is_ok() && shutdown.load(Ordering::Acquire) {
+                eprintln!("flowsketch gateway graceful shutdown complete");
+            }
+            result
         }
         Command::MergeSnapshots { snapshots, out } => merge::run(&snapshots, out.as_deref()),
         Command::Explain { query } => {

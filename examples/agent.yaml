@@ -13,7 +13,7 @@
 #     ringBlockCount: 64
 #     blockRetireTimeoutMs: 64
 #     fanoutMode: single      # single | hash | rx_queue
-#     fanoutGroup: 0          # zero derives a process-local group
+#     fanoutGroup: 0          # zero asks Linux for a netns-unique group
 #   For tc eBPF instead:
 #     kind: ebpf
 #     interface: eth0

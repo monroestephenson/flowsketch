@@ -25,7 +25,10 @@ use crate::error::SketchError;
 use crate::hash::{hash64, HashFamily, HashSpec};
 
 pub const MAGIC: [u8; 4] = *b"FSK1";
-pub const SNAPSHOT_VERSION: u16 = 1;
+/// Version 2 accompanies hash family version 2 and the sparse/dense HLL
+/// payload. Version 1 readers reject it at the header instead of silently
+/// interpreting a changed algorithm payload.
+pub const SNAPSHOT_VERSION: u16 = 2;
 
 /// Stable algorithm identifiers for the snapshot header.
 pub mod algorithm_id {

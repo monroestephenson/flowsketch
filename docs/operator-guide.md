@@ -1,9 +1,7 @@
 # Operator guide
 
-Everything runs from a single static binary: offline replay (README §26),
-the live userspace agent (Phase 3), and distributed merge — both the
-offline `merge-snapshots` primitive and the live cluster gateway
-(Phase 7).
+Everything runs from a single CLI binary: offline replay, the live Linux
+agent, offline `merge-snapshots`, and the live cluster gateway.
 
 For deployment hardening and rollout gates, see
 `docs/production-readiness.md`. For Kubernetes manifests, see
@@ -46,6 +44,7 @@ table; only the planted scanners (`10.66.0.x`) cross the scanner alert.
 | `flowsketch explain q.yaml` | physical plan, memory estimate, error contract, warnings |
 | `flowsketch validate q.yaml...` | parse + plan check; nonzero exit on failure |
 | `flowsketch bench --algo count-min --events 10000000` | throughput + accuracy vs exact |
+| `flowsketch bench --algo hll-map --events 10000000 --keys 100000` | grouped-cardinality throughput, churn, and accuracy |
 | `flowsketch synth --out t.pcap ...` | reproducible synthetic traces |
 | `flowsketch agent --config agent.yaml` | live agent: capture + HTTP endpoints |
 | `flowsketch replay ... --snapshot-out DIR` | dump final sketch state as FSK1 files |
@@ -70,13 +69,21 @@ For simple live capture on Linux, set `source.kind: af_packet` with an
 CAP_NET_RAW (or root). On
 macOS and other non-Linux platforms, `source.kind: pcap` is supported for
 development, demos, and offline analysis; `af_packet` returns a clear
-"Linux only" error. The agent is a capture thread feeding a bounded channel
-into the engine thread; when the engine falls behind, capture drops events
-and counts them in `flowsketch_agent_dropped_events_total` rather than
-blocking the NIC path. Linux AF_PACKET socket overflow is reported separately
-as `flowsketch_agent_kernel_dropped_packets_total`; the socket counters are
-sampled about once per second even when capture is idle. A capture failure flips
-`/healthz` to 503 while `/metrics` keeps serving the last good state.
+"Linux only" error. Single-socket AF_PACKET uses a capture thread feeding a
+bounded channel into the sharded engine; when the engine falls behind, capture
+drops events and counts them in `flowsketch_agent_dropped_events_total` rather
+than blocking the NIC path. Linux AF_PACKET socket overflow is reported
+separately as `flowsketch_agent_kernel_dropped_packets_total`; the socket
+counters are sampled about once per second even when capture is idle. A
+capture failure flips `/healthz` to 503 while `/metrics` keeps serving the last
+good state.
+
+AF_PACKET and normalized eBPF timestamps must be within five minutes of the
+current realtime clock before they can reach event-time windowing. Outliers
+are quarantined in `flowsketch_agent_invalid_timestamps_total`, preventing one
+corrupt record from fast-forwarding every shard. This is separate from
+`flowsketch_agent_late_events_total`, which reports valid but out-of-window
+ordering.
 
 The default receive ring is 64 blocks of 1 MiB (64 MiB total), with partially
 filled blocks retired after 64 ms:
@@ -101,12 +108,19 @@ For multi-queue capture, set `fanoutMode: rx_queue`; the agent creates one
 TPACKET_V3 socket and parser lane per runtime shard, and Linux selects the lane
 from the skb receive-queue mapping. `fanoutMode: hash` uses the kernel packet
 hash and is useful for virtual or single-queue devices. Both modes require at
-least two shards and `runtimeShardStrategy: flow`. `fanoutGroup: 0` derives a
-process-local group. If a stable explicit nonzero 16-bit group is required, it
-must remain unique to that agent/interface; sharing it with another capture
-process would split traffic between processes. The kernel-selected lane is
-carried through the bounded channel directly to the same-numbered runtime
-shard. Per-lane metrics reconcile kernel, parser, engine, and drop totals.
+least two shards and `runtimeShardStrategy: flow`. `fanoutGroup: 0` uses
+Linux's `PACKET_FANOUT_FLAG_UNIQUEID` allocation, avoiding PID/interface hash
+collisions inside the network namespace. If a stable explicit nonzero 16-bit
+group is required, it must remain unique to that agent/interface; sharing it
+with another capture process would split traffic between processes. Each kernel-selected lane owns
+a dedicated bounded channel into a long-lived same-numbered runtime worker;
+packet events do not cross a shared receiver or dispatch coordinator. The
+existing 65,536 event slots are divided across lanes rather than multiplied.
+A publication barrier periodically aligns workers and merges their window
+states. Verify
+`flowsketch_agent_af_packet_queue_local_handoff == 1`, sum
+`flowsketch_agent_af_packet_lane_channel_capacity` to 65,536, and use the
+per-lane counters to reconcile kernel, parser, engine, and drop totals.
 
 For the tc ingress collector, build the object and select `ebpf`:
 
@@ -132,6 +146,8 @@ Watch `flowsketch_agent_ebpf_{packets,events_emitted,ring_dropped_events,
 parse_errors,unsupported_packets}_total`; the kernel identity is packets =
 emitted + ring drops + parse errors + unsupported. See
 `docs/ebpf-roadmap.md` for validation and support boundaries.
+Kernel `bpf_ktime_get_ns()` values are converted from `CLOCK_MONOTONIC` to
+Unix nanoseconds on every poll before validation and export.
 
 For systemd installs, copy
 `deploy/systemd/flowsketch-agent-ebpf.conf` into the unit's drop-in directory
@@ -169,7 +185,9 @@ processed, the agent marks `flowsketch_agent_source_done` and keeps serving
 the final published window until the process is terminated. Thread startup
 failures return errors instead of panicking, and the embedded HTTP server
 caps concurrent connections, request-line/header sizes, and read/write
-timeouts.
+timeouts. SIGINT/SIGTERM stop capture, drain bounded runtime queues, flush
+trailing windows and snapshots, attempt final OTLP/gateway exports, and close
+HTTP before returning success.
 
 ## OTLP export
 
@@ -184,10 +202,12 @@ export:
     intervalMs: 5000
 ```
 
-Estimates become `network.flowsketch.<unit>.estimated` gauges with
+Each estimate becomes four numeric gauges:
+`network.flowsketch.<unit>.{estimated,lower_bound,upper_bound,confidence}` with
 `service.name`/`host.name` resource attributes and query metadata plus
 group labels as attributes (`src.ip` maps to `source.address`, `protocol`
-to `network.protocol.name`, and so on). Already-exported windows are
+to `network.protocol.name`, and so on). Error bounds are values, not
+continuously varying string attributes. Already-exported windows are
 skipped, transient failures retry with exponential backoff, and export
 health shows up in `/metrics` as `flowsketch_agent_otlp_exports_total` /
 `flowsketch_agent_otlp_export_failures_total`. Plain `http://` only in
@@ -239,10 +259,14 @@ Semantics and safety:
   that query (algorithm, parameters, hash family and seed) before it may
   merge; incompatible or unknown pushes are rejected with HTTP 400 and
   counted in `flowsketch_gateway_snapshots_rejected_total`.
-- Only nodes covering **exactly the same window boundaries** merge
-  (README §17.3). Nodes on other boundaries are excluded from that round
-  and visible as the gap between `flowsketch_gateway_nodes_known` and
-  `flowsketch_gateway_nodes_merged`.
+- Only nodes covering **exactly the same window boundaries** merge. Nodes on
+  other boundaries are excluded from that round and visible as the gap between
+  `flowsketch_gateway_nodes_known` and
+  `flowsketch_gateway_nodes_merged`. The gateway exports
+  `flowsketch_gateway_merge_complete{query}` and suppresses the ordinary
+  cluster `flowsketch_estimate` samples whenever not every live node matches
+  the selected window, preventing a partial freshest-node subset from looking
+  like a complete cluster total.
 - Gateway memory is bounded: one window state per (query, live node),
   each within the planner's budget; nodes that stop pushing are evicted
   after `staleAfterMs`.
@@ -274,5 +298,5 @@ handling.
 Classic pcap (`.pcap`, both endiannesses, µs/ns timestamps) over Ethernet
 (incl. 802.1Q/QinQ), raw-IP, or Linux SLL link types; IPv4/IPv6 (with
 extension-header walking); TCP/UDP ports and TCP flags. Linux live capture
-is available through AF_PACKET. pcapng, macOS BPF live capture, eBPF, and
-Hubble/NetFlow receivers are later phases (README §10).
+is available through AF_PACKET and tc eBPF. pcapng, macOS BPF live capture,
+XDP/AF_XDP, and Hubble/NetFlow receivers are not currently implemented.

@@ -262,6 +262,7 @@ dependencies = [
  "flowsketch-planner",
  "flowsketch-prometheus",
  "flowsketch-runtime",
+ "libc",
  "serde_json",
 ]
 

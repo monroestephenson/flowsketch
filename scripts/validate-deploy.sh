@@ -56,15 +56,19 @@ helm package "$CHART" --destination "$TMP" >/dev/null
 grep -q 'kind: DaemonSet' "$TMP/helm-default.yaml"
 grep -q 'kind: Deployment' "$TMP/helm-default.yaml"
 grep -q 'runAsNonRoot: true' "$TMP/helm-default.yaml"
+grep -q 'allowPrivilegeEscalation: true' "$TMP/helm-default.yaml"
+grep -q '/usr/local/libexec/flowsketch-agent-afpacket' "$TMP/helm-default.yaml"
 grep -q 'add: \["NET_RAW"\]' "$TMP/helm-default.yaml"
 grep -q 'kind: ebpf' "$TMP/helm-ebpf.yaml"
 grep -q 'objectPath: /usr/lib/flowsketch/flowsketch_tc.bpf.o' "$TMP/helm-ebpf.yaml"
 grep -q 'add: \["BPF", "NET_ADMIN", "PERFMON"\]' "$TMP/helm-ebpf.yaml"
+grep -q '/usr/local/libexec/flowsketch-agent-ebpf agent' "$TMP/helm-ebpf.yaml"
 if grep -q 'add:.*NET_RAW' "$TMP/helm-ebpf.yaml"; then
   echo "eBPF-only render unexpectedly grants NET_RAW" >&2
   exit 1
 fi
 grep -q 'add: \["BPF", "NET_ADMIN", "PERFMON", "NET_RAW"\]' "$TMP/helm-ebpf-fallback.yaml"
+grep -q '/usr/local/libexec/flowsketch-agent-ebpf-fallback' "$TMP/helm-ebpf-fallback.yaml"
 grep -q 'captureCpus:' "$TMP/helm-affinity.yaml"
 grep -q -- '- 2' "$TMP/helm-affinity.yaml"
 grep -q 'fanoutMode: rx_queue' "$TMP/helm-fanout.yaml"
@@ -80,6 +84,8 @@ grep -q 'FlowSketchGatewayMergeGap' "$TMP/helm-monitored.yaml"
 grep -q 'FlowSketchOtlpExportFailures' "$TMP/helm-monitored.yaml"
 grep -q 'kind: NetworkPolicy' "$TMP/helm-monitored.yaml"
 grep -q 'runAsNonRoot: true' "$TMP/kustomize.yaml"
+grep -q 'allowPrivilegeEscalation: true' "$TMP/kustomize.yaml"
+grep -q '/usr/local/libexec/flowsketch-agent-afpacket' "$TMP/kustomize.yaml"
 grep -q 'ghcr.io/monroestephenson/flowsketch:0.1.0' "$TMP/kustomize.yaml"
 grep -q 'kind: PodMonitor' "$TMP/monitoring.yaml"
 grep -q 'FlowSketchPacketDrops' "$TMP/monitoring.yaml"

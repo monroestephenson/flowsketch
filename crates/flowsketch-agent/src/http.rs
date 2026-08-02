@@ -4,8 +4,9 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::state::PublishedState;
@@ -20,13 +21,26 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn serve_in_background(
     listener: TcpListener,
     state: Arc<PublishedState>,
-) -> std::io::Result<()> {
+    shutdown: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("fs-http".into())
         .spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
+            while !shutdown.load(Ordering::Acquire) {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        eprintln!("agent HTTP accept failed: {error}");
+                        break;
+                    }
+                };
                 if !try_acquire_connection(&active_connections) {
                     let _ = respond(stream, 503, "text/plain", "server busy\n");
                     continue;
@@ -44,7 +58,6 @@ pub fn serve_in_background(
                 }
             }
         })
-        .map(|_| ())
 }
 
 fn handle_connection(stream: TcpStream, state: &PublishedState) -> std::io::Result<()> {

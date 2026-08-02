@@ -6,9 +6,10 @@ Implementation notes for the sketches in `flowsketch-algos`. See
 ## Hashing (`flowsketch-core::hash`)
 
 All sketches hash through the named, versioned `fsk1` family: seeded
-FNV-1a with a SplitMix64 finalizer. Multi-row sketches derive per-row
-hashes with the Kirsch–Mitzenmacher construction `h_i = h1 + i*h2` (h2
-forced odd), so one pass over the key bytes serves every row. Seeds are
+FNV-1a with a SplitMix64 finalizer. Hash-family version 2 derives multi-row
+indexes and signs with nonlinear, domain-separated mixing of a two-word base
+digest; it does not use the arithmetic `h1 + i*h2` sequence whose signature
+aliases made deep sketches ineffective. Seeds are
 explicit: same seed ⇒ mergeable across nodes; different seed ⇒ merge
 rejected. `HASH_VERSION` is baked into snapshots and compatibility checks;
 golden tests pin the function's output.
@@ -20,7 +21,8 @@ underestimates. Optional conservative update raises each row only to the
 new point estimate — strictly less overestimation on skewed traffic, still
 mergeable (merged conservative sketches may exceed a single-node sketch of
 the same stream, but remain upper bounds). Sizing: `w = ceil(e/eps)`,
-`d = ceil(ln(1/delta))`.
+`d = ceil(ln(1/(delta - 2^-64)))`; the finite base-digest confidence floor is
+included in the reported delta.
 
 ## CountSketch (`count_sketch.rs`)
 
@@ -30,18 +32,23 @@ norm — the tool for change detection between windows (planned measure).
 
 ## HyperLogLog (`hll.rs`)
 
-`2^p` 1-byte registers, 64-bit hashes: index = top `p` bits, rho = leading
-zeros of the rest + 1. Standard alpha bias correction plus small-range
-linear counting; no large-range correction is needed with 64-bit hashes.
-Merge = register-wise max (exactly the union sketch — tested).
+Small cardinalities use a sorted exact set of 64-bit hashes and convert before
+its allocation reaches one quarter of the dense representation. Dense mode
+uses `2^p` 1-byte registers: index = top `p` bits, rho = leading zeros of the
+rest + 1, and Ertl's improved raw estimator for bias correction across the
+full range. No large-range correction is needed with 64-bit hashes. Sparse
+and dense forms have a versioned snapshot encoding; merge remains the exact
+union sketch operation and is tested across representations.
 
 ## HLLMap (`hll_map.rs`)
 
 Bounded map key → HLL for grouped distinct counts. Eviction picks the
-smallest estimated cardinality. Estimates are cached per key and refreshed
-lazily (dirty flag) during eviction scans — naive rescoring of every key on
-every eviction made replay ~60x slower before this was fixed. Eviction
-count is exposed as a health signal.
+smallest estimated cardinality with a stable key tie-break. Estimates are
+cached per key and refreshed lazily through a deterministic min-heap. The
+sparse HLL form avoids allocating a dense register array for singleton and
+low-fanout churn. Eviction count is exposed as a health signal, and
+`flowsketch bench --algo hll-map` measures both saturated and steady-state
+workloads directly.
 
 ## SpaceSaving (`space_saving.rs`)
 
@@ -84,7 +91,9 @@ production queries; exists so benchmarks and tests have ground truth.
 
 ## Snapshots
 
-Every sketch serializes to the `FSK1` format (`flowsketch-core::snapshot`):
+Every sketch serializes to FSK1 version 2 (`flowsketch-core::snapshot`):
 magic, version, algorithm id, full hash spec, window bounds, params,
 payload, checksum. Snapshot payloads are written in deterministic (sorted)
-key order so identical state produces identical bytes.
+key order so identical state produces identical bytes. Version 2 accompanies
+hash-family version 2 and the sparse/dense HLL encoding; mixed-version state
+fails closed.

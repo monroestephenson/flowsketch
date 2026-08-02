@@ -270,9 +270,11 @@ pub struct WindowState {
 /// engine consumer drains it. Sharded runtimes merge these states before
 /// converting them into estimates.
 #[derive(Debug, Clone)]
-struct WindowOutput {
-    query_name: String,
-    state: WindowState,
+pub struct QueryWindowState {
+    /// Name of the planned query that owns this state.
+    pub query_name: String,
+    /// Mergeable state for one completed or currently open query window.
+    pub state: WindowState,
 }
 
 impl WindowState {
@@ -375,6 +377,20 @@ impl WindowState {
     pub fn update_count(&self) -> u64 {
         self.state.update_count()
     }
+
+    /// Serialize this mergeable window into the same FSK1 component set the
+    /// distributed gateway accepts.
+    pub fn snapshot_exports(&self, query_name: &str) -> Vec<SnapshotExport> {
+        self.state
+            .to_snapshots(self.window_start_nanos, self.window_end_nanos)
+            .into_iter()
+            .map(|(component, bytes)| SnapshotExport {
+                query_name: query_name.to_string(),
+                component,
+                bytes,
+            })
+            .collect()
+    }
 }
 
 /// One serialized component sketch exported from a running engine.
@@ -434,7 +450,8 @@ struct RunningQuery {
     value_field: Option<Field>,
     hash: HashSpec,
     buckets: VecDeque<Bucket>,
-    /// Mergeable states emitted at each window close.
+    /// Mergeable states emitted at each window close. Its capacity is part
+    /// of the physical plan; consumers must drain before it fills again.
     emitted: Vec<WindowState>,
     /// Events dropped because they arrived before the earliest open bucket.
     late_events: u64,
@@ -461,7 +478,7 @@ impl RunningQuery {
             value_field,
             hash,
             buckets: VecDeque::new(),
-            emitted: Vec::new(),
+            emitted: Vec::with_capacity(plan.physical.pending_window_capacity),
             late_events: 0,
             key_buf: Vec::with_capacity(64),
             distinct_buf: Vec::with_capacity(32),
@@ -477,6 +494,10 @@ impl RunningQuery {
         self.plan.physical.window_buckets
     }
 
+    fn pending_window_capacity(&self) -> usize {
+        self.plan.physical.pending_window_capacity
+    }
+
     fn bucket_start_for(&self, ts: u64) -> u64 {
         ts - ts % self.slide_nanos()
     }
@@ -488,8 +509,65 @@ impl RunningQuery {
         })
     }
 
+    fn rebuild_trailing_ring(&mut self, target: u64) -> Result<(), SketchError> {
+        self.buckets.clear();
+        let slide = self.slide_nanos();
+        let ring = self.bucket_count() as u64;
+        let first = target - slide * (ring - 1).min(target / slide);
+        let mut start = first;
+        loop {
+            self.buckets.push_back(self.new_bucket(start)?);
+            if start == target {
+                break;
+            }
+            start += slide;
+        }
+        Ok(())
+    }
+
+    fn windows_closed_by_advance(&self, target: u64) -> usize {
+        let Some(back) = self.buckets.back().map(|bucket| bucket.start_nanos) else {
+            return 0;
+        };
+        if target <= back {
+            return 0;
+        }
+        let slides = ((target - back) / self.slide_nanos()) as usize;
+        if slides > self.bucket_count() {
+            self.bucket_count()
+        } else {
+            slides
+        }
+    }
+
+    fn ensure_emit_capacity(&self, additional: usize) -> Result<(), SketchError> {
+        let pending = self.emitted.len();
+        let capacity = self.pending_window_capacity();
+        if pending.saturating_add(additional) > capacity {
+            return Err(SketchError::Backpressure(format!(
+                "query {:?} has {pending} completed window(s) pending and needs room for \
+                 {additional} more (capacity {capacity}); drain estimates or window states and \
+                 retry",
+                self.plan.query.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_can_advance(&self, target: u64) -> Result<(), SketchError> {
+        self.ensure_emit_capacity(self.windows_closed_by_advance(target))
+    }
+
+    fn ensure_can_process(&self, event: &FlowEvent) -> Result<(), SketchError> {
+        if self.plan.query.filter.matches(event) {
+            self.ensure_can_advance(self.bucket_start_for(event.ts_nanos))?;
+        }
+        Ok(())
+    }
+
     /// Advance time to `target`, closing any windows that end at or before it.
     fn advance_to_bucket(&mut self, target: u64) -> Result<(), SketchError> {
+        self.ensure_can_advance(target)?;
         let slide = self.slide_nanos();
         if self.buckets.is_empty() {
             self.buckets.push_back(self.new_bucket(target)?);
@@ -501,19 +579,23 @@ impl RunningQuery {
         // live agent) would spin one iteration per slide across the gap.
         let back = self.buckets.back().unwrap().start_nanos;
         if target > back && (target - back) / slide > self.bucket_count() as u64 {
-            self.flush_window(back + slide)?;
-            self.buckets.clear();
+            // Preserve the slow path's decaying trailing windows before
+            // skipping the empty middle of a large gap. Each iteration
+            // advances one slide and evicts at most one real bucket, so a
+            // bounded `bucket_count` iterations are sufficient.
+            for _ in 0..self.bucket_count() {
+                let next = self.buckets.back().unwrap().start_nanos + slide;
+                self.flush_window(next)?;
+                self.buckets.push_back(self.new_bucket(next)?);
+                while self.buckets.len() > self.bucket_count() {
+                    self.buckets.pop_front();
+                }
+            }
             // Rebuild the full (empty) trailing ring at the target time, not
             // just the target bucket, so slightly out-of-order events that
             // are still inside the new window land in a bucket instead of
-            // being counted late — identical to what the slow path leaves.
-            let ring = self.bucket_count() as u64;
-            let first = target - slide * (ring - 1).min(target / slide);
-            let mut start = first;
-            while start <= target {
-                self.buckets.push_back(self.new_bucket(start)?);
-                start += slide;
-            }
+            // being counted late.
+            self.rebuild_trailing_ring(target)?;
             return Ok(());
         }
         while self.buckets.back().unwrap().start_nanos < target {
@@ -580,6 +662,7 @@ impl RunningQuery {
         if self.buckets.is_empty() {
             return Ok(());
         }
+        self.ensure_emit_capacity(1)?;
         let mut merged = self.buckets[0].state.clone();
         for b in self.buckets.iter().skip(1) {
             merged.merge_from(&b.state)?;
@@ -596,6 +679,7 @@ impl RunningQuery {
     /// Final flush for offline replay: close the trailing partial window.
     fn finish(&mut self) -> Result<(), SketchError> {
         if let Some(last) = self.buckets.back() {
+            self.ensure_emit_capacity(1)?;
             let window_end = last.start_nanos + self.slide_nanos();
             self.flush_window(window_end)?;
         }
@@ -750,6 +834,12 @@ impl QueryEngine {
     }
 
     pub fn process(&mut self, event: &FlowEvent) -> Result<(), SketchError> {
+        // Capacity is preflighted across every query so a backpressure error
+        // never leaves a multi-query event partially applied. The caller may
+        // drain completed windows and retry this exact event safely.
+        for q in &self.queries {
+            q.ensure_can_process(event)?;
+        }
         self.events_processed += 1;
         for q in &mut self.queries {
             q.process(event)?;
@@ -761,6 +851,9 @@ impl QueryEngine {
     /// for queries already at or beyond the watermark and is used to keep
     /// independently fed shards on identical window boundaries.
     pub fn advance_to(&mut self, ts_nanos: u64) -> Result<(), SketchError> {
+        for q in &self.queries {
+            q.ensure_can_advance(q.bucket_start_for(ts_nanos))?;
+        }
         for q in &mut self.queries {
             q.advance_to_bucket(q.bucket_start_for(ts_nanos))?;
         }
@@ -769,6 +862,11 @@ impl QueryEngine {
 
     /// Close trailing windows (offline replay end-of-stream).
     pub fn finish(&mut self) -> Result<(), SketchError> {
+        for q in &self.queries {
+            if !q.buckets.is_empty() {
+                q.ensure_emit_capacity(1)?;
+            }
+        }
         for q in &mut self.queries {
             q.finish()?;
         }
@@ -786,10 +884,12 @@ impl QueryEngine {
         out
     }
 
-    fn take_window_outputs(&mut self) -> Vec<WindowOutput> {
+    /// Drain completed windows as mergeable sketch states. This is the
+    /// low-frequency handoff used by independently owned runtime lanes.
+    pub fn take_window_states(&mut self) -> Vec<QueryWindowState> {
         let mut out = Vec::new();
         for q in &mut self.queries {
-            out.extend(q.emitted.drain(..).map(|state| WindowOutput {
+            out.extend(q.emitted.drain(..).map(|state| QueryWindowState {
                 query_name: q.plan.query.name.clone(),
                 state,
             }));
@@ -797,7 +897,21 @@ impl QueryEngine {
         out
     }
 
-    fn current_window_outputs(&self) -> Result<Vec<WindowOutput>, SketchError> {
+    /// Number of completed mergeable windows currently awaiting a drain.
+    pub fn pending_window_count(&self) -> usize {
+        self.queries.iter().map(|q| q.emitted.len()).sum()
+    }
+
+    /// Whether any query has filled its planned completed-window buffer.
+    pub fn pending_windows_full(&self) -> bool {
+        self.queries
+            .iter()
+            .any(|q| q.emitted.len() == q.pending_window_capacity())
+    }
+
+    /// Clone each query's current open window into a mergeable sketch state.
+    /// Callers should request this only when a snapshot export is due.
+    pub fn current_window_states(&self) -> Result<Vec<QueryWindowState>, SketchError> {
         let mut out = Vec::new();
         for q in &self.queries {
             if q.buckets.is_empty() {
@@ -807,7 +921,7 @@ impl QueryEngine {
             for bucket in q.buckets.iter().skip(1) {
                 state.merge_from(&bucket.state)?;
             }
-            out.push(WindowOutput {
+            out.push(QueryWindowState {
                 query_name: q.plan.query.name.clone(),
                 state: WindowState {
                     state,
@@ -828,12 +942,21 @@ impl QueryEngine {
         self.queries.iter().map(|q| q.late_events).sum()
     }
 
-    /// Current sketch memory across all queries and buckets.
+    /// Resident sketch memory across open buckets and completed windows
+    /// awaiting a consumer drain.
     pub fn sketch_memory_bytes(&self) -> usize {
         self.queries
             .iter()
-            .flat_map(|q| q.buckets.iter())
-            .map(|b| b.state.memory_bytes())
+            .map(|q| {
+                q.buckets
+                    .iter()
+                    .map(|bucket| bucket.state.memory_bytes())
+                    .sum::<usize>()
+                    + q.emitted
+                        .iter()
+                        .map(WindowState::memory_bytes)
+                        .sum::<usize>()
+            })
             .sum()
     }
 
@@ -855,17 +978,8 @@ impl QueryEngine {
     /// all currently open buckets.
     pub fn export_snapshots(&self) -> Result<Vec<SnapshotExport>, SketchError> {
         let mut out = Vec::new();
-        for window in self.current_window_outputs()? {
-            for (component, bytes) in window.state.state.to_snapshots(
-                window.state.window_start_nanos,
-                window.state.window_end_nanos,
-            ) {
-                out.push(SnapshotExport {
-                    query_name: window.query_name.clone(),
-                    component,
-                    bytes,
-                });
-            }
+        for window in self.current_window_states()? {
+            out.extend(window.state.snapshot_exports(&window.query_name));
         }
         Ok(out)
     }
@@ -1123,6 +1237,11 @@ impl ShardedQueryEngine {
     }
 
     fn process_shard_refs(&mut self, batches: &[Vec<&FlowEvent>]) -> Result<(), SketchError> {
+        let batch_start = batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .map(|event| event.ts_nanos)
+            .min();
         let watermark = batches
             .iter()
             .flat_map(|batch| batch.iter())
@@ -1133,6 +1252,13 @@ impl ShardedQueryEngine {
                 .par_iter_mut()
                 .zip(batches.par_iter())
                 .try_for_each(|(engine, batch)| {
+                    // Seed every shard at the earliest timestamp before any
+                    // shard processes its first event. Otherwise a skewed
+                    // first batch can give lanes different window starts,
+                    // preventing their states from merging at the same end.
+                    if let Some(batch_start) = batch_start {
+                        engine.advance_to(batch_start)?;
+                    }
                     for event in batch {
                         engine.process(event)?;
                     }
@@ -1154,7 +1280,7 @@ impl ShardedQueryEngine {
         for output in self
             .shards
             .iter_mut()
-            .flat_map(QueryEngine::take_window_outputs)
+            .flat_map(QueryEngine::take_window_states)
         {
             let key = (
                 output.query_name,
@@ -1203,7 +1329,7 @@ impl ShardedQueryEngine {
         for output in self
             .shards
             .iter()
-            .map(QueryEngine::current_window_outputs)
+            .map(QueryEngine::current_window_states)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
@@ -1222,16 +1348,7 @@ impl ShardedQueryEngine {
         }
         let mut exports = Vec::new();
         for ((query_name, _, _), state) in merged {
-            for (component, bytes) in state
-                .state
-                .to_snapshots(state.window_start_nanos, state.window_end_nanos)
-            {
-                exports.push(SnapshotExport {
-                    query_name: query_name.clone(),
-                    component,
-                    bytes,
-                });
-            }
+            exports.extend(state.snapshot_exports(&query_name));
         }
         Ok(exports)
     }
@@ -1501,6 +1618,43 @@ mod tests {
     }
 
     #[test]
+    fn sharded_sliding_windows_align_with_a_skewed_first_batch() {
+        let yaml =
+            "name: c\nwindow: {size: 60s, slide: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";
+        let query = parse_query_yaml(yaml).unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, 2).unwrap();
+
+        engine
+            .process_shard_batches(&[
+                vec![event(0, "10.0.0.1", "10.0.0.2", 80, 100)],
+                vec![event(30, "10.0.0.3", "10.0.0.4", 80, 100)],
+            ])
+            .unwrap();
+        engine
+            .process_shard_batches(&[
+                vec![event(40, "10.0.0.1", "10.0.0.2", 80, 100)],
+                vec![event(40, "10.0.0.3", "10.0.0.4", 80, 100)],
+            ])
+            .unwrap();
+
+        let estimates = engine.take_estimates().unwrap();
+        let window = estimates
+            .iter()
+            .filter(|estimate| estimate.window_end_nanos == 40_000_000_000)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            window.len(),
+            1,
+            "skewed first batch emitted duplicate windows"
+        );
+        assert_eq!(window[0].window_start_nanos, 0);
+        assert_eq!(window[0].estimate, 2.0);
+        assert_eq!(window[0].update_count, 2);
+    }
+
+    #[test]
     fn sharded_engine_rejects_zero_shards() {
         let query = parse_query_yaml(
             "name: c\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n",
@@ -1582,22 +1736,30 @@ mod tests {
         };
 
         let mut single = QueryEngine::new(vec![planned.clone()], hash).unwrap();
+        let mut single_estimates = Vec::new();
         for item in &events {
             single.process(item).unwrap();
+            if single.pending_windows_full() {
+                single_estimates.extend(single.take_estimates());
+            }
         }
         single.finish().unwrap();
-        let expected = signature(single.take_estimates());
+        single_estimates.extend(single.take_estimates());
+        let expected = signature(single_estimates);
 
         for strategy in [ShardStrategy::Flow, ShardStrategy::RoundRobin] {
             let mut sharded = ShardedQueryEngine::new(vec![planned.clone()], hash, 7).unwrap();
+            let mut sharded_estimates = Vec::new();
             for batch in events.chunks(73) {
                 sharded
                     .process_batch_with_strategy(batch, strategy)
                     .unwrap();
+                sharded_estimates.extend(sharded.take_estimates().unwrap());
             }
             sharded.finish().unwrap();
+            sharded_estimates.extend(sharded.take_estimates().unwrap());
             assert_eq!(
-                signature(sharded.take_estimates().unwrap()),
+                signature(sharded_estimates),
                 expected,
                 "{strategy:?} sharding changed query results"
             );
@@ -1742,13 +1904,14 @@ mod tests {
         far.ts_nanos = 7_300_000_000 * 1_000_000_000;
         let started = std::time::Instant::now();
         eng.process(&far).unwrap();
+        let mut est = eng.take_estimates();
         eng.finish().unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "gap advance took {:?}",
             started.elapsed()
         );
-        let est = eng.take_estimates();
+        est.extend(eng.take_estimates());
         // The pre-gap window flushed with the old host; the final window
         // contains only the post-gap event.
         let last_end = est.iter().map(|e| e.window_end_nanos).max().unwrap();
@@ -1756,6 +1919,37 @@ mod tests {
             assert_eq!(e.group[0].1, "10.0.0.9");
         }
         assert!(est.iter().any(|e| e.group[0].1 == "10.0.0.1"));
+    }
+
+    #[test]
+    fn far_future_gap_emits_every_decaying_trailing_window() {
+        let mut engine = engine_for(
+            "name: c\nwindow: {size: 60s, slide: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n",
+        );
+        for second in (0..=50).step_by(10) {
+            engine
+                .process(&event(second, "10.0.0.1", "10.0.0.2", 80, 100))
+                .unwrap();
+        }
+        let _ = engine.take_estimates();
+
+        engine
+            .process(&event(1_000, "10.0.0.1", "10.0.0.2", 80, 100))
+            .unwrap();
+        let trailing = engine.take_estimates();
+        let observed = trailing
+            .iter()
+            .map(|estimate| {
+                (
+                    estimate.window_end_nanos / 1_000_000_000,
+                    estimate.estimate as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed,
+            vec![(60, 6), (70, 5), (80, 4), (90, 3), (100, 2), (110, 1)]
+        );
     }
 
     #[test]
@@ -1772,12 +1966,13 @@ mod tests {
         let t = 1_000_000u64; // seconds; far beyond the window
         eng.process(&event(t, "10.0.0.7", "10.0.0.2", 80, 700))
             .unwrap();
+        let mut est = eng.take_estimates();
         // One slide earlier than t: out of order but within the 60s window.
         eng.process(&event(t - 10, "10.0.0.8", "10.0.0.2", 80, 800))
             .unwrap();
         eng.finish().unwrap();
         assert_eq!(eng.late_events(), 0, "in-window event counted as late");
-        let est = eng.take_estimates();
+        est.extend(eng.take_estimates());
         let last_end = est.iter().map(|e| e.window_end_nanos).max().unwrap();
         let final_hosts: Vec<&str> = est
             .iter()
@@ -1786,6 +1981,41 @@ mod tests {
             .collect();
         assert!(final_hosts.contains(&"10.0.0.7"), "{final_hosts:?}");
         assert!(final_hosts.contains(&"10.0.0.8"), "{final_hosts:?}");
+    }
+
+    #[test]
+    fn completed_window_buffer_is_bounded_and_retryable() {
+        let yaml = "name: bounded_output\nwindow: {size: 30s, slide: 10s}\n\
+                    groupBy: [protocol]\nmeasure: {type: count}\n";
+        let query = parse_query_yaml(yaml).unwrap();
+        let hash = HashSpec::new(7);
+        let planned = plan(query, &hash).unwrap();
+        assert_eq!(planned.physical.pending_window_capacity, 3);
+        let memory_limit = planned.physical.estimated_memory_bytes;
+        let mut engine = QueryEngine::new(vec![planned], hash).unwrap();
+
+        for second in [0, 10, 20, 30] {
+            engine
+                .process(&event(second, "10.0.0.1", "10.0.0.2", 80, 100))
+                .unwrap();
+        }
+        assert_eq!(engine.pending_window_count(), 3);
+        assert!(engine.pending_windows_full());
+        assert!(engine.sketch_memory_bytes() as u64 <= memory_limit);
+
+        let before = engine.events_processed();
+        let blocked = engine
+            .process(&event(40, "10.0.0.1", "10.0.0.2", 80, 100))
+            .unwrap_err();
+        assert!(matches!(blocked, SketchError::Backpressure(_)), "{blocked}");
+        assert_eq!(engine.events_processed(), before);
+        assert_eq!(engine.pending_window_count(), 3);
+
+        assert_eq!(engine.take_estimates().len(), 3);
+        engine
+            .process(&event(40, "10.0.0.1", "10.0.0.2", 80, 100))
+            .unwrap();
+        assert_eq!(engine.events_processed(), before + 1);
     }
 
     /// Build a planned query and an engine on `seed` for the WindowState
@@ -1920,8 +2150,9 @@ mod tests {
         }
         eng.process(&event(105, "10.0.0.9", "10.0.0.2", 80, 1))
             .unwrap();
+        let mut est = eng.take_estimates();
         eng.finish().unwrap();
-        let est = eng.take_estimates();
+        est.extend(eng.take_estimates());
         // The final window (ending 110s) must not contain the old burst.
         let last_end = est.iter().map(|e| e.window_end_nanos).max().unwrap();
         for e in est.iter().filter(|e| e.window_end_nanos == last_end) {

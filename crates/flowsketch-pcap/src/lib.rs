@@ -12,7 +12,7 @@ use flowsketch_core::{Direction, FlowEvent};
 pub mod parse;
 pub mod writer;
 
-pub use parse::parse_packet;
+pub use parse::{parse_packet, parse_packet_with_wire_len};
 pub use writer::PcapWriter;
 
 pub type BorrowedPacket<'a> = (u64, u32, &'a [u8]);
@@ -25,6 +25,8 @@ pub enum PcapError {
     BadMagic(u32),
     #[error("truncated pcap record")]
     Truncated,
+    #[error("pcap record has an out-of-range sub-second timestamp")]
+    InvalidTimestamp,
 }
 
 /// Link types FlowSketch can parse.
@@ -128,6 +130,12 @@ impl<R: Read> PcapReader<R> {
         if caplen > 256 * 1024 {
             return Err(PcapError::Truncated);
         }
+        if u64::from(origlen) < caplen as u64 {
+            return Err(PcapError::Truncated);
+        }
+        if ts_subsec >= 1_000_000_000 / self.subsec_to_nanos {
+            return Err(PcapError::InvalidTimestamp);
+        }
         data.resize(caplen, 0);
         self.reader
             .read_exact(data)
@@ -150,7 +158,7 @@ impl<R: Read> PcapReader<R> {
             match self.next_packet_into(data)? {
                 None => return Ok(None),
                 Some((ts_nanos, origlen, data)) => {
-                    if let Some(mut ev) = parse_packet(self.linktype, data) {
+                    if let Some(mut ev) = parse_packet_with_wire_len(self.linktype, data, origlen) {
                         ev.ts_nanos = ts_nanos;
                         // Bytes on the wire, not bytes captured.
                         if ev.bytes == 0 {
@@ -233,6 +241,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_out_of_range_subsecond_timestamp() {
+        let mut bytes = Vec::new();
+        PcapWriter::new(&mut bytes)
+            .unwrap()
+            .write_udp_packet(
+                1_700_000_000_000_000_000,
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+                1234,
+                53,
+                64,
+            )
+            .unwrap();
+        // Global header is 24 bytes; record timestamp sub-seconds starts at
+        // byte 28. PcapWriter emits nanosecond-resolution files.
+        bytes[28..32].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+        let mut reader = PcapReader::new(Cursor::new(bytes)).unwrap();
+        assert!(matches!(
+            reader.next_packet(),
+            Err(PcapError::InvalidTimestamp)
+        ));
+    }
+
+    #[test]
     fn full_payload_writer_emits_wire_sized_frames() {
         let mut compact = Vec::new();
         PcapWriter::new(&mut compact)
@@ -271,7 +303,7 @@ mod tests {
             .next_packet()
             .unwrap()
             .unwrap();
-        assert_eq!(compact_len, 118);
+        assert_eq!(compact_len, 1_254);
         assert_eq!(compact_frame.len(), 118);
         assert_eq!(full_len, 1_254);
         assert_eq!(full_frame.len(), 1_254);

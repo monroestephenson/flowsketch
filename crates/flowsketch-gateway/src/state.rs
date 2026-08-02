@@ -132,10 +132,10 @@ impl GatewayState {
         nodes.retain(|_, per_node| !per_node.is_empty());
     }
 
-    /// Merge each query's freshest common window across nodes and emit
-    /// cluster-level estimates. Only nodes whose snapshot covers exactly
-    /// the chosen window bounds participate (README §17.3: same window
-    /// boundaries or no merge); stragglers are surfaced via the
+    /// Merge each query's freshest common window across nodes for diagnostics
+    /// and complete-cluster export. Only nodes whose snapshot covers exactly
+    /// the chosen window bounds participate (same window boundaries or no
+    /// merge); stragglers are surfaced via the
     /// `nodes_merged` vs `nodes_known` gauges instead of silently blended.
     pub fn merged(&self) -> Vec<MergedQuery> {
         let mut nodes = self.nodes.lock().unwrap();
@@ -216,8 +216,13 @@ impl GatewayState {
     /// gateway health.
     pub fn render_metrics(&self) -> String {
         let merged = self.merged();
+        // Fail closed: a freshest-window subset is useful for diagnosing
+        // skew, but publishing it under the ordinary cluster estimate name
+        // would silently undercount. Health gauges below expose the partial
+        // merge while estimates resume only when every live node agrees.
         let estimates: Vec<SketchEstimate> = merged
             .iter()
+            .filter(|m| m.nodes_merged == m.nodes_known)
             .flat_map(|m| m.estimates.iter().cloned())
             .collect();
         let info: BTreeMap<String, QueryExportInfo> = self
@@ -266,6 +271,18 @@ impl GatewayState {
             body.push_str(&format!(
                 "flowsketch_gateway_nodes_known{{query=\"{}\"}} {}\n",
                 m.query_name, m.nodes_known
+            ));
+        }
+        body.push_str(
+            "# HELP flowsketch_gateway_merge_complete Whether every live node was included in \
+             the exported window; incomplete merges suppress cluster estimates.\n\
+             # TYPE flowsketch_gateway_merge_complete gauge\n",
+        );
+        for m in &merged {
+            body.push_str(&format!(
+                "flowsketch_gateway_merge_complete{{query=\"{}\"}} {}\n",
+                m.query_name,
+                usize::from(m.nodes_merged == m.nodes_known)
             ));
         }
         body.push_str(
@@ -433,6 +450,13 @@ mod tests {
             m.nodes_merged, 2,
             "partial-window straggler must not displace the established full-window nodes"
         );
+
+        let metrics = state.render_metrics();
+        assert!(metrics.contains("flowsketch_gateway_merge_complete{query=\"scanners\"} 0"));
+        assert!(
+            !metrics.contains("flowsketch_estimate{query=\"scanners\""),
+            "partial cluster estimate was exported: {metrics}"
+        );
     }
 
     #[test]
@@ -451,5 +475,23 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].window_end_nanos, 70_000_000_000);
         assert_eq!(merged[0].nodes_merged, 1);
+        let metrics = state.render_metrics();
+        assert!(metrics.contains("flowsketch_gateway_merge_complete{query=\"scanners\"} 0"));
+        assert!(!metrics.contains("flowsketch_estimate{query=\"scanners\""));
+    }
+
+    #[test]
+    fn complete_merge_exports_cluster_estimates() {
+        let state = GatewayState::new(
+            vec![plan_for(0)],
+            HashSpec::new(0),
+            Duration::from_secs(300),
+        );
+        state.apply_batch(&batch_for("node-a", &[0, 10, 20, 30, 40, 50], 0));
+        state.apply_batch(&batch_for("node-b", &[0, 10, 20, 30, 40, 50], 0));
+
+        let metrics = state.render_metrics();
+        assert!(metrics.contains("flowsketch_gateway_merge_complete{query=\"scanners\"} 1"));
+        assert!(metrics.contains("flowsketch_estimate{query=\"scanners\""));
     }
 }

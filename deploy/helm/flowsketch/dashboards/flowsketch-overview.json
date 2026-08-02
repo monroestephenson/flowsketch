@@ -399,6 +399,13 @@
           "legendFormat": "late events",
           "range": true,
           "refId": "E"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_agent_invalid_timestamps_total{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"}[$__rate_interval]))",
+          "legendFormat": "invalid timestamps",
+          "range": true,
+          "refId": "F"
         }
       ],
       "title": "Loss and queue pressure",
@@ -409,7 +416,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Kernel-selected AF_PACKET fan-out lane throughput. Idle lanes under representative multi-flow traffic can indicate RSS/queue/fan-out configuration problems.",
+      "description": "Kernel-selected AF_PACKET fan-out lane throughput. Fan-out agents should report flowsketch_agent_af_packet_queue_local_handoff=1 and 65,536 total lane channel slots. Idle lanes under representative multi-flow traffic can indicate RSS/queue/fan-out configuration problems.",
       "fieldConfig": {
         "defaults": {
           "color": {

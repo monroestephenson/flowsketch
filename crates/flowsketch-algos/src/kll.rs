@@ -323,7 +323,7 @@ mod tests {
             let v = s.quantile(q).unwrap() as f64;
             let true_rank = (v + 1.0) / n as f64;
             assert!(
-                (true_rank - q).abs() <= 3.0 * eps,
+                (true_rank - q).abs() <= eps,
                 "q={q}: got value {v} (rank {true_rank}), eps {eps}"
             );
         }
@@ -359,7 +359,7 @@ mod tests {
             let v = a.quantile(q).unwrap() as f64;
             let true_rank = (v + 1.0) / n as f64;
             assert!(
-                (true_rank - q).abs() <= 4.0 * eps,
+                (true_rank - q).abs() <= eps,
                 "merged q={q}: value {v} rank {true_rank}"
             );
         }
@@ -441,6 +441,6 @@ mod tests {
         }
         let median = s.quantile(0.5).unwrap();
         let r = s.rank(median);
-        assert!((r - 0.5).abs() < 3.0 * s.rank_error(), "rank of median {r}");
+        assert!((r - 0.5).abs() < s.rank_error(), "rank of median {r}");
     }
 }

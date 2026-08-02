@@ -7,6 +7,10 @@ the items below as the gate to broad production rollout.
 ## Build and release
 
 - Build immutable container images from `Dockerfile`.
+- Run `scripts/linux-container-capture-smoke.sh <image>` and verify the
+  non-root AF_PACKET process has exactly NET_RAW effective and captures live
+  container traffic, then exits successfully after SIGTERM; rendered
+  capability lists alone are not evidence.
 - Pin image tags in Kubernetes manifests or Helm values.
 - Run CI on Linux and macOS.
 - Run `cargo fmt --all --check`.
@@ -24,6 +28,9 @@ the items below as the gate to broad production rollout.
 - Confirm the capture interface name on each node type.
 - Grant only `CAP_NET_RAW`; `scripts/linux-afpacket-live-smoke.sh` exercises
   this least-privilege mode on a veth pair and network namespace.
+- Run `scripts/linux-afpacket-fanout-smoke.sh` to verify HASH/RX_QUEUE
+  queue-local handoff, capture/runtime affinity, exact lane accounting, and
+  fail-closed pinning before enabling fan-out on a target host.
 - Run `scripts/linux-m4-live-validation.sh` first on an isolated veth pair,
   then with two isolated cabled 10 GbE ports and the hardware gate enabled;
   see `docs/m4-validation.md`.
@@ -32,11 +39,14 @@ the items below as the gate to broad production rollout.
   - `flowsketch_agent_packets_seen_total`
   - `flowsketch_agent_packets_parsed_total`
   - `flowsketch_agent_packets_unparsed_total`
+  - `flowsketch_agent_invalid_timestamps_total`
   - `flowsketch_agent_events_processed_total`
   - `flowsketch_agent_kernel_dropped_packets_total`
   - `flowsketch_agent_kernel_queue_freezes_total`
   - `flowsketch_agent_dropped_events_total`
   - `flowsketch_agent_late_events_total`
+  - `flowsketch_agent_af_packet_queue_local_handoff`
+  - `flowsketch_agent_af_packet_lane_channel_capacity`
   - gateway rejected snapshots and merged-node counts
 
 ## Capacity testing
@@ -80,9 +90,9 @@ flowsketch bench --trace /data/caida-or-mawi.pcap \
 ```
 
 Repeat with `round-robin` to quantify elephant-flow shard skew. Neither mode
-is a live-NIC result. Production rollout still requires dedicated hardware
-replay, direct RX-queue ingestion, target-host validation of the optional CPU
-affinity configuration, and zero unexplained drops.
+is a live-NIC result. Queue-local RX-queue ingestion is implemented, but
+production rollout still requires dedicated hardware replay, target-host
+validation of CPU affinity and queue placement, and zero unexplained drops.
 
 ## Kubernetes
 
@@ -118,6 +128,10 @@ affinity configuration, and zero unexplained drops.
   gateway restart. Expect a brief absence of merged estimates.
 - Keep gateway and agent hash seeds and query plans compatible. Rejected
   snapshots must stop after a coordinated rollout completes.
+- FSK1 version 2 and hash-family version 2 are a coordinated compatibility
+  boundary. Do not expect mixed v1/v2 agents, gateways, or offline snapshots
+  to merge; drain or archive old snapshots and roll the single gateway before
+  completing the agent rollout.
 - Use immutable images and `helm upgrade --atomic --wait`; preserve the prior
   values, manifests, image digest, and query ConfigMaps for rollback.
 - Follow `docs/runbook.md` for preflight, recovery gates, and rollback.
@@ -131,6 +145,6 @@ affinity configuration, and zero unexplained drops.
 - Alert on ring drops, parse errors, userspace drops, and explicit fallback.
 - Keep fallback disabled unless the deployment intentionally grants NET_RAW
   and accepts an AF_PACKET downgrade.
-- XDP, queue-local lane-to-worker channels, and physical high-rate comparison
-  remain future work. AF_PACKET HASH/RX_QUEUE kernel fan-out and direct
-  lane-to-shard mapping are implemented and VM-gated.
+- XDP and physical high-rate comparison remain future work. AF_PACKET
+  HASH/RX_QUEUE kernel fan-out, queue-local lane-to-worker channels, and
+  fail-closed capture/runtime affinity are implemented and VM-gated.

@@ -32,7 +32,13 @@ labels before enabling strict default-deny policy.
 ## Capture privileges
 
 The DaemonSet uses `hostNetwork: true` and adds only `NET_RAW`, which is
-required for AF_PACKET. It does not run a fully privileged container.
+required for AF_PACKET. The image's AF_PACKET-specific entrypoint carries
+`cap_net_raw=ep`; the pod permits that exec-time file-capability transition
+inside a `drop: [ALL]` / `add: [NET_RAW]` bounding set. This is why the agent
+container has `allowPrivilegeEscalation: true`: setting it to false enables
+`no_new_privs`, leaving a non-root process with zero effective capabilities.
+The pod remains non-root and is not a privileged container. The gateway keeps
+`allowPrivilegeEscalation: false` and drops every capability.
 
 The default interface is `eth0` in `flowsketch-agent-config`. Change it to
 the node interface that carries the traffic you want to observe.
@@ -41,6 +47,9 @@ The fixed Kustomize baseline intentionally remains AF_PACKET. Use the Helm
 chart with `agent.source=ebpf` for the tc collector; it renders BPF,
 NET_ADMIN, and PERFMON instead of NET_RAW and points at the object embedded in
 the production image. Enabling its explicit AF_PACKET fallback adds NET_RAW.
+The image provides separate eBPF-only and eBPF-with-fallback capability
+entrypoints so a source never receives capabilities outside its rendered
+bounding set.
 Qualify the node kernel and container runtime with
 `scripts/linux-ebpf-live-smoke.sh` before rollout.
 
@@ -67,7 +76,7 @@ kubectl apply -k deploy/kubernetes/monitoring
 
 It installs a PodMonitor for host-networked agents, a ServiceMonitor for the
 gateway, and PrometheusRule alerts for AF_PACKET/eBPF/userspace packet drops,
-eBPF parse errors/fallback, late events, readiness, OTLP failures, gateway push
+eBPF parse errors/fallback, invalid timestamps, late events, readiness, OTLP failures, gateway push
 failures, rejected snapshots, and persistent merge gaps. Install the
 `monitoring.coreos.com` CRDs before applying this pack. Operator deployments
 that select monitors or rules by labels may require an environment-specific

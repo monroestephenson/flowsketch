@@ -10,11 +10,10 @@ use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 
 use flowsketch_algos::{
-    CountMinSketch, CountSketch, ExactCounter, HyperLogLog, MisraGries, SpaceSaving,
+    CountMinSketch, CountSketch, ExactCounter, HllMap, HyperLogLog, MisraGries, SpaceSaving,
 };
 use flowsketch_core::hash::{HashSpec, SplitMixRng};
-use flowsketch_core::FlowEvent;
-use flowsketch_core::Sketch;
+use flowsketch_core::{FlowEvent, Sketch, SketchError};
 use flowsketch_ir::parse_query_yaml;
 use flowsketch_pcap::PcapReader;
 use flowsketch_planner::{plan, Plan};
@@ -25,6 +24,7 @@ pub enum Algo {
     CountMin,
     CountSketch,
     Hll,
+    HllMap,
     SpaceSaving,
     MisraGries,
 }
@@ -170,10 +170,14 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
         core_budget,
         ..
     } = cfg;
+    if keys == 0 {
+        bail!("--keys must be positive");
+    }
     let name = match algo {
         Algo::CountMin => "count-min",
         Algo::CountSketch => "count-sketch",
         Algo::Hll => "hll",
+        Algo::HllMap => "hllmap",
         Algo::SpaceSaving => "spacesaving",
         Algo::MisraGries => "misra-gries",
     };
@@ -197,11 +201,16 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
     }
     let key_bytes: Vec<[u8; 8]> = (0..keys).map(|i| i.to_le_bytes()).collect();
 
+    if matches!(algo, Algo::HllMap) {
+        return run_synthetic_hllmap(&key_ids, &key_bytes, profile, avg_packet_bytes, core_budget);
+    }
+
     let hash = HashSpec::new(1);
     let mut sketch: Box<dyn Sketch> = match algo {
         Algo::CountMin => Box::new(CountMinSketch::for_error(0.0001, 0.01, false, hash)?),
         Algo::CountSketch => Box::new(CountSketch::new(1 << 15, 5, hash)?),
         Algo::Hll => Box::new(HyperLogLog::new(14, hash)?),
+        Algo::HllMap => unreachable!("HLLMap uses its two-dimensional benchmark path"),
         Algo::SpaceSaving => Box::new(SpaceSaving::new(4096, hash)?),
         Algo::MisraGries => Box::new(MisraGries::new(4096, hash)?),
     };
@@ -249,6 +258,7 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
                 (est - distinct).abs() / distinct
             );
         }
+        Algo::HllMap => unreachable!("HLLMap uses its two-dimensional benchmark path"),
         Algo::SpaceSaving | Algo::MisraGries => {
             let truth_top: Vec<(Vec<u8>, u64)> = exact.top_k(100);
             let hits = truth_top
@@ -268,6 +278,58 @@ fn run_synthetic(cfg: BenchConfig) -> Result<()> {
             println!("accuracy: ARE over truth top-{samples} = {are:.4}");
         }
     }
+    Ok(())
+}
+
+fn run_synthetic_hllmap(
+    key_ids: &[u64],
+    key_bytes: &[[u8; 8]],
+    profile: Option<Profile>,
+    avg_packet_bytes: u64,
+    core_budget: Option<f64>,
+) -> Result<()> {
+    // Matches the public scanner example: p=12 (~1.6% RSE) and preferred
+    // retention headroom of up to 2,000 groups.
+    let max_keys = key_bytes.len().clamp(1, 2_000);
+    let mut sketch = HllMap::new(max_keys, 12, HashSpec::new(1))?;
+    let mut truth = vec![0u64; key_bytes.len()];
+    let started = Instant::now();
+    for (sequence, &id) in key_ids.iter().enumerate() {
+        let item = (sequence as u64).to_le_bytes();
+        sketch.insert(&key_bytes[id as usize], &item);
+        truth[id as usize] += 1;
+    }
+    let elapsed = started.elapsed();
+    let updates_per_second = key_ids.len() as f64 / elapsed.as_secs_f64().max(1e-9);
+    println!(
+        "updates:  {} in {:.3}s -> {:.2}M updates/s/core",
+        key_ids.len(),
+        elapsed.as_secs_f64(),
+        updates_per_second / 1e6
+    );
+    print_l3_capacity(updates_per_second, avg_packet_bytes as f64);
+    let projections =
+        print_profile_projection(profile, avg_packet_bytes as f64, updates_per_second);
+    enforce_core_budget(&projections, core_budget)?;
+    println!(
+        "memory:   {} (retained_keys={}/{} evictions={})",
+        flowsketch_planner::format_bytes(sketch.memory_bytes() as u64),
+        sketch.len(),
+        max_keys,
+        sketch.evicted_keys()
+    );
+
+    let entries = sketch.entries();
+    let mut relative_error = 0.0;
+    for (key, estimate) in &entries {
+        let id = u64::from_le_bytes(key.as_slice().try_into().expect("benchmark key is u64"));
+        let exact = truth[id as usize] as f64;
+        relative_error += (estimate - exact).abs() / exact.max(1.0);
+    }
+    let average = relative_error / entries.len().max(1) as f64;
+    println!(
+        "accuracy: retained-group ARE={average:.4}; retention is bounded and low-cardinality groups may be evicted"
+    );
     Ok(())
 }
 
@@ -294,17 +356,49 @@ fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
     let mut first_ts = None;
     let mut last_ts = None;
     let mut packet_buf = Vec::with_capacity(2048);
+    let mut estimates_len = 0usize;
     while let Some(event) = reader.next_event_into(&mut packet_buf)? {
         first_ts.get_or_insert(event.ts_nanos);
         last_ts = Some(event.ts_nanos);
         total_l3_bytes += event.bytes as u64;
         events += 1;
         if let Some(engine) = &mut engine {
-            engine.process(&event).context("sketch update failed")?;
+            loop {
+                match engine.process(&event) {
+                    Ok(()) => break,
+                    Err(SketchError::Backpressure(_)) => {
+                        let drained = engine.take_estimates();
+                        if drained.is_empty() {
+                            bail!(
+                                "runtime reported output backpressure without a drainable window"
+                            );
+                        }
+                        estimates_len += drained.len();
+                    }
+                    Err(error) => return Err(error).context("sketch update failed"),
+                }
+            }
+            if engine.pending_windows_full() {
+                estimates_len += engine.take_estimates().len();
+            }
         }
     }
     if let Some(engine) = &mut engine {
-        engine.finish().context("final window flush failed")?;
+        loop {
+            match engine.finish() {
+                Ok(()) => break,
+                Err(SketchError::Backpressure(_)) => {
+                    let drained = engine.take_estimates();
+                    if drained.is_empty() {
+                        bail!(
+                            "runtime reported final-output backpressure without a drainable window"
+                        );
+                    }
+                    estimates_len += drained.len();
+                }
+                Err(error) => return Err(error).context("final window flush failed"),
+            }
+        }
     }
     let elapsed = started.elapsed();
     let wall_eps = events as f64 / elapsed.as_secs_f64().max(1e-9);
@@ -342,10 +436,10 @@ fn run_trace(cfg: BenchConfig, trace: &PathBuf) -> Result<()> {
     let projections = print_profile_projection(cfg.profile, avg_packet_bytes, wall_eps);
     enforce_core_budget(&projections, cfg.core_budget)?;
     if let Some(engine) = &mut engine {
-        let estimates = engine.take_estimates();
+        estimates_len += engine.take_estimates().len();
         println!(
             "runtime: estimates={} sketch_memory={} late_events={}",
-            estimates.len(),
+            estimates_len,
             flowsketch_planner::format_bytes(engine.sketch_memory_bytes() as u64),
             engine.late_events()
         );

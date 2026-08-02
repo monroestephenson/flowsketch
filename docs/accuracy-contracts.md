@@ -11,11 +11,20 @@ contracts mean.
 ### `additive-overestimate` (Count-Min: `count`, `sum`)
 
 Estimates **never underestimate**. With width `w = ceil(e/epsilon)` and
-depth `d = ceil(ln(1/delta))`, the overestimate exceeds `epsilon * N`
-(N = total weight in the window) with probability at most `delta`.
+depth `d = ceil(ln(1/(delta - 2^-64)))`, the overestimate exceeds
+`epsilon * N` (N = total weight in the window) with probability at most
+`delta` under the seeded row-hash model. The reported failure probability is
+`e^-d + 2^-64`; requests at or below the finite-hash floor are rejected.
 Emitted bounds: `upper = estimate`, `lower = max(estimate - epsilon*N, 0)`,
 `confidence = 1 - delta`. Conservative update is enabled by default, which
 only reduces overestimation.
+
+Hash-family version 2 replaced arithmetic double hashing with nonlinear,
+domain-separated row mixing. This removes the all-row signature aliases that
+made additional depth ineffective. The probability is over the configured
+hash family/seed model, not a cryptographic guarantee against an attacker who
+knows a fixed seed; rotate to an unpredictable common seed when keys are
+adversarial, and keep the same seed on every node that must merge.
 
 Enumeration caveat: groups are enumerated through a SpaceSaving key tracker
 sized at 4x `export.maxSeries`; only the heaviest tracked groups are
@@ -38,14 +47,20 @@ preserved (verified by tests).
 
 Relative standard error is `1.04 / sqrt(2^precision)` (~1.6% at the
 default precision 12). Emitted bounds are ±2 standard errors
-(`confidence = 0.95`). `epsilon` in the query is interpreted as this
-relative standard error, and the planner picks the smallest precision that
-meets it.
+(`confidence = 0.95`, using the normal approximation). `epsilon` in the query
+is interpreted as this relative standard error, and the planner picks the
+smallest precision that meets it. Small cardinalities stay in an exact sparse
+hash set; dense sketches use Ertl's improved raw estimator, including through
+the former linear-counting transition. Transition-range coverage is tested
+across independent seeds.
 
 HLLMap (grouped distinct counts) adds a second approximation: key
-retention is bounded by `max_keys` (4x `export.maxSeries`, clamped to
-[1024, 65536]). When full, the key with the smallest estimated cardinality
-is evicted, so **low-fan-out groups may be dropped under pressure**;
+retention is bounded by `max_keys`. The planner prefers 4x
+`export.maxSeries` (clamped to [1024, 65536]) but reduces that headroom when
+the declared resident-memory budget requires it, never below the export cap.
+When full, the key with the smallest estimated cardinality is evicted using a
+stable key tie-break, so identical streams and merges retain identical sets.
+Therefore **low-fan-out groups may be dropped under pressure**;
 high-fan-out groups — the ones fan-out queries exist to find — are
 strongly favored. Evictions are counted and exposed.
 
@@ -73,7 +88,9 @@ Sketches merge only if algorithm, version, hash family, seed, and all
 parameters match. This is enforced by `SketchCompatibility` on every merge
 and covered by tests; incompatible merges return errors rather than silently
 producing garbage. The `FSK1` snapshot format carries all of this metadata
-so merges across processes/nodes are validated the same way.
+so merges across processes/nodes are validated the same way. The current wire
+format is FSK1 version 2 with hash-family version 2; it requires a coordinated
+agent/gateway rollout and intentionally rejects version-1 snapshots.
 
 ## Verifying the contracts
 

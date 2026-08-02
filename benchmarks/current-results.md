@@ -29,6 +29,35 @@ Result:
 Interpretation: the sketch update loop itself is not the 100 Gb/s blocker for
 large packets.
 
+## HLLMap grouped-cardinality loop
+
+Measured on 2026-08-02 from the release binary in the x86_64 Linux 6.8 Colima
+validation VM. The benchmark uses precision 12 and a 2,000-key retention cap,
+matching the preferred shape of the public scanner query. Each event supplies
+a distinct inner item.
+
+```bash
+flowsketch bench --algo hll-map --events 2000000 --keys 100000 --dist uniform
+flowsketch bench --algo hll-map --events 2000000 --keys 100000 --dist zipf
+flowsketch bench --algo hll-map --events 2000000 --keys 2000 --dist uniform
+```
+
+Results from isolated sequential runs:
+
+| workload | throughput/core | retained memory | evictions | retained-group ARE |
+| --- | ---: | ---: | ---: | ---: |
+| 100k uniform groups (saturated churn) | 2.80M updates/s | 776.2 KiB | 1,958,119 | 0.0012 |
+| 100k Zipf groups (saturated churn) | 5.43M updates/s | 3.3 MiB | 835,252 | 0.0251 |
+| 2k uniform groups (no eviction) | 9.90M updates/s | 8.1 MiB | 0 | 0.0091 |
+
+This is not comparable to the 19.26M Count-Min hot-loop result above:
+HLLMap hashes two dimensions, retains up to 2,000 independent cardinality
+states, and may perform deterministic eviction. Sparse HLL storage and a
+lazy deterministic eviction heap remove the former dense-allocation and
+full-rescore cliffs, but saturated key churn remains materially slower than
+steady state and must be capacity-tested with the expected source-cardinality
+distribution.
+
 ## Generated pcap plus runtime
 
 Trace command:

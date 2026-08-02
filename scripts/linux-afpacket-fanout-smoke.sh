@@ -4,8 +4,8 @@ umask 077
 
 # Exercise Linux PACKET_FANOUT_HASH and PACKET_FANOUT_QM on a multi-queue
 # veth pair. The test proves that capture lanes are independently threaded,
-# pinned when requested, mapped directly into runtime shards, and exactly
-# accounted at both aggregate and per-lane levels.
+# pinned when requested, handed to permanently paired queue-local runtime
+# workers, and exactly accounted at both aggregate and per-lane levels.
 
 BIN="${1:-target/release/flowsketch}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,8 +73,8 @@ if (( REQUESTED_LANES < 2 || REQUESTED_LANES > 16 )); then
   echo "FLOWSKETCH_FANOUT_LANES must be between 2 and 16" >&2
   exit 2
 fi
-if (( PORT_BASE < 1024 || PORT_BASE > 65533 )); then
-  echo "FLOWSKETCH_FANOUT_PORT_BASE must be between 1024 and 65533" >&2
+if (( PORT_BASE < 1024 || PORT_BASE > 65532 )); then
+  echo "FLOWSKETCH_FANOUT_PORT_BASE must be between 1024 and 65532" >&2
   exit 2
 fi
 
@@ -214,10 +214,13 @@ EOF
     "http://127.0.0.1:$port/readyz" >/dev/null
 
   capture_threads=0
+  runtime_threads=0
   for _ in $(seq 1 200); do
     capture_threads="$({ grep -l '^fs-capture-[0-9][0-9]*$' \
       "/proc/$AGENT_PID/task/"*/comm 2>/dev/null || true; } | wc -l | tr -d ' ')"
-    (( capture_threads == LANES )) && break
+    runtime_threads="$({ grep -l '^fs-runtime-[0-9][0-9]*$' \
+      "/proc/$AGENT_PID/task/"*/comm 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    (( capture_threads == LANES && runtime_threads == LANES )) && break
     kill -0 "$AGENT_PID" 2>/dev/null || break
     sleep 0.05
   done
@@ -226,12 +229,22 @@ EOF
     cat "$LOG" >&2
     return 1
   fi
+  if (( runtime_threads != LANES )); then
+    echo "$mode started $runtime_threads/$LANES queue-local runtime threads" >&2
+    cat "$LOG" >&2
+    return 1
+  fi
 
   for ((lane = 0; lane < LANES; lane++)); do
     expected_cpu="${CAPTURE_CPUS[$lane]}"
-    actual_cpu="$(thread_cpu "fs-capture-$lane")"
-    [[ "$actual_cpu" == "$expected_cpu" ]] || {
-      echo "$mode capture lane $lane affinity is $actual_cpu, expected $expected_cpu" >&2
+    capture_cpu="$(thread_cpu "fs-capture-$lane")"
+    [[ "$capture_cpu" == "$expected_cpu" ]] || {
+      echo "$mode capture lane $lane affinity is $capture_cpu, expected $expected_cpu" >&2
+      return 1
+    }
+    runtime_cpu="$(thread_cpu "fs-runtime-$lane")"
+    [[ "$runtime_cpu" == "$expected_cpu" ]] || {
+      echo "$mode runtime lane $lane affinity is $runtime_cpu, expected $expected_cpu" >&2
       return 1
     }
   done
@@ -313,15 +326,24 @@ EOF
     return 1
   }
   [[ "$(metric_value flowsketch_agent_af_packet_fanout_lanes <<<"$metrics")" == "$LANES" ]]
+  [[ "$(metric_value flowsketch_agent_af_packet_queue_local_handoff <<<"$metrics")" == 1 ]]
   [[ "$(metric_value flowsketch_agent_capture_ring_bytes <<<"$metrics")" == \
     "$((RING_BLOCK_SIZE_BYTES * RING_BLOCK_COUNT * LANES))" ]]
   [[ "$(metric_value flowsketch_agent_capture_ring_blocks <<<"$metrics")" == \
     "$((RING_BLOCK_COUNT * LANES))" ]]
+  channel_capacity_sum=0
   for ((lane = 0; lane < LANES; lane++)); do
+    lane_capacity="$(lane_value flowsketch_agent_af_packet_lane_channel_capacity "$lane" <<<"$metrics")"
+    (( lane_capacity > 0 ))
+    channel_capacity_sum=$((channel_capacity_sum + lane_capacity))
     grep -Fqx \
       "flowsketch_agent_capture_cpu_affinity{lane=\"$lane\",cpu=\"${CAPTURE_CPUS[$lane]}\"} 1" \
       <<<"$metrics"
+    grep -Fqx \
+      "flowsketch_agent_runtime_cpu_affinity{worker=\"$lane\",cpu=\"${CAPTURE_CPUS[$lane]}\"} 1" \
+      <<<"$metrics"
   done
+  [[ "$channel_capacity_sum" == 65536 ]]
   if [[ "$require_all_lanes" == true ]] && (( active_lanes != LANES )); then
     echo "$mode used $active_lanes/$LANES capture lanes" >&2
     return 1
@@ -381,4 +403,41 @@ grep -Fq \
   exit 1
 }
 
-echo "Linux AF_PACKET fan-out smoke passed for HASH/RX_QUEUE and fail-closed lane affinity"
+INVALID_RUNTIME_CPUS=("${CAPTURE_CPUS[@]}")
+INVALID_RUNTIME_CPUS[INVALID_LANE]="$DISALLOWED_CPU"
+invalid_runtime_cpu_list="$(IFS=,; echo "[${INVALID_RUNTIME_CPUS[*]}]")"
+cat >"$CONFIG" <<EOF
+agent:
+  nodeName: linux-fanout-invalid-runtime-affinity
+  listen: 127.0.0.1:$((PORT_BASE + 3))
+  runtimeShards: $LANES
+  cpuAffinity:
+    captureCpus: $cpu_list
+    runtimeCpus: $invalid_runtime_cpu_list
+  source:
+    kind: af_packet
+    interface: $HOST_IF
+    ringBlockSizeBytes: $RING_BLOCK_SIZE_BYTES
+    ringBlockCount: $RING_BLOCK_COUNT
+    fanoutMode: hash
+    fanoutGroup: 47003
+queries:
+  - file: $ROOT/examples/queries/top-talkers.yaml
+EOF
+: >"$LOG"
+if timeout 10 "$CAP_BIN" agent --config "$CONFIG" >"$LOG" 2>&1; then
+  invalid_status=0
+else
+  invalid_status=$?
+fi
+if (( invalid_status == 0 || invalid_status == 124 )); then
+  echo "fan-out runtime affinity failure was not fail-closed (status $invalid_status)" >&2
+  exit 1
+fi
+grep -Fq \
+  "cannot pin runtime worker $INVALID_LANE to CPU $DISALLOWED_CPU" "$LOG" || {
+  cat "$LOG" >&2
+  exit 1
+}
+
+echo "Linux AF_PACKET fan-out smoke passed for HASH/RX_QUEUE, queue-local handoff, and fail-closed affinity"

@@ -50,8 +50,13 @@ defaults allocate 64 MiB per lane. Increase the block count only after
 measuring kernel drops and container memory on the target node; the chart and
 agent reject aggregate rings above 1 GiB. `rx_queue` maps skb queue IDs to
 same-numbered runtime shards; `hash` uses Linux packet hashing and works on
-virtual/single-queue devices. Both require `flow` dispatch and at least two
-runtime shards. A shorter retire timeout reduces latency for
+virtual/single-queue devices. Both require the `flow` shard strategy and at
+least two runtime shards. Each lane feeds a dedicated same-numbered runtime-worker
+channel; the fixed 65,536 event slots are divided across lanes. Verify the
+queue-local handoff and per-lane channel-capacity metrics after rollout. A
+zero `fanoutGroup` asks Linux to allocate a network-namespace-unique group;
+use a nonzero value only when an externally coordinated stable ID is required.
+A shorter retire timeout reduces latency for
 quiet interfaces, while a longer timeout reduces block turnover.
 
 ## tc eBPF source
@@ -75,6 +80,14 @@ source is `ebpf`. The host kernel must support BPF ring buffers (Linux 5.8+),
 the container runtime/seccomp profile must permit the BPF operations, and the
 specific kernel/runtime pair should pass `scripts/linux-ebpf-live-smoke.sh`
 before rollout. Current validation evidence is x86_64 Linux 6.8.
+
+The production image has separate file-capability entrypoints for AF_PACKET,
+eBPF-only, and eBPF with fallback. The chart selects the matching entrypoint
+and exact `drop: [ALL]` / `add: [...]` bounding set. The non-root agent sets
+`allowPrivilegeEscalation: true` solely because Kubernetes otherwise applies
+`no_new_privs` and suppresses file capabilities; the gateway remains
+`allowPrivilegeEscalation: false` with all capabilities dropped. Validate the
+actual image/runtime path with `scripts/linux-container-capture-smoke.sh`.
 
 ## Prometheus Operator
 

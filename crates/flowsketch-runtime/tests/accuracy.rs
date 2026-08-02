@@ -128,16 +128,16 @@ fn distinct_count_tracks_exact_fanout() {
     for e in &estimates {
         let truth = exact[&e.group[0].1].len() as f64;
         let rel = (e.estimate - truth).abs() / truth;
-        // precision 12 => ~1.6% std error; assert within 5 sigma.
+        // The published interval is the user-facing 95% contract.
         assert!(
-            rel < 0.082,
+            rel < 2.0 * 0.0163,
             "{}: estimate {} vs truth {} (rel {rel})",
             e.group[0].1,
             e.estimate,
             truth
         );
-        assert!(e.lower_bound.unwrap() <= truth * 1.02);
-        assert!(e.upper_bound.unwrap() >= truth * 0.98);
+        assert!(e.lower_bound.unwrap() <= truth);
+        assert!(e.upper_bound.unwrap() >= truth);
     }
 }
 
@@ -168,7 +168,7 @@ fn counter_estimates_never_underestimate() {
     let estimates = engine.take_estimates();
     assert!(!estimates.is_empty());
 
-    let slack = 0.001 * total as f64 * std::f64::consts::E; // eps * N with CM width rounding
+    let slack = 0.001 * total as f64;
     for e in &estimates {
         let truth = exact[&e.group[0].1] as f64;
         assert!(e.estimate >= truth, "count-min underestimated");

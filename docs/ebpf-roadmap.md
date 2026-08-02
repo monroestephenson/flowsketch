@@ -21,6 +21,12 @@ The kernel ABI remains the native-endian 56-byte `EbpfFlowEvent` record in
 counter count, and record size; a mismatch fails the source rather than
 decoding unknown bytes.
 
+The ABI timestamp is `bpf_ktime_get_ns()` (`CLOCK_MONOTONIC`), not epoch time.
+The agent samples `CLOCK_MONOTONIC` and `CLOCK_REALTIME` around every ring poll
+and converts records to Unix nanoseconds before they enter windowing or OTLP.
+This keeps eBPF and AF_PACKET events in the same clock domain while refreshing
+the offset after wall-clock corrections.
+
 ## Packet parser
 
 The verifier-safe C program handles:
@@ -150,8 +156,8 @@ performance claims.
 
 ## Next phases
 
-1. Give each implemented AF_PACKET RSS/RX-queue lane a queue-local channel to
-   its pinned runtime worker, removing the shared coordinator bottleneck.
+1. Qualify the implemented queue-local AF_PACKET path with physical NIC replay
+   and publish throughput, loss, CPU, convergence, and p99 evidence.
 2. Implement an XDP producer for the same event/accounting contract.
 3. Compare AF_PACKET, tc, and XDP on identical real traces and physical NICs.
 4. Publish a kernel, architecture, container-runtime, and upgrade validation

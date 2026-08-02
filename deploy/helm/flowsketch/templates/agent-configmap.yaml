@@ -63,5 +63,13 @@ data:
     set -eu
     sed "s|\${NODE_NAME}|${NODE_NAME}|g" \
       /etc/flowsketch/config/agent.yaml.template > /tmp/flowsketch-agent.yaml
-    exec /usr/local/bin/flowsketch agent --config /tmp/flowsketch-agent.yaml
+    {{- if eq .Values.agent.source "ebpf" }}
+    {{- if .Values.agent.ebpf.fallbackToAfPacket }}
+    exec /usr/local/libexec/flowsketch-agent-ebpf-fallback agent --config /tmp/flowsketch-agent.yaml
+    {{- else }}
+    exec /usr/local/libexec/flowsketch-agent-ebpf agent --config /tmp/flowsketch-agent.yaml
+    {{- end }}
+    {{- else }}
+    exec /usr/local/libexec/flowsketch-agent-afpacket agent --config /tmp/flowsketch-agent.yaml
+    {{- end }}
 {{- end }}

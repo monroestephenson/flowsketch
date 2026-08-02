@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,9 +23,28 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Accept connections until the process is terminated.
 pub fn serve(listener: TcpListener, state: Arc<GatewayState>) -> std::io::Result<()> {
+    serve_until(listener, state, Arc::new(AtomicBool::new(false)))
+}
+
+/// Accept connections until `shutdown` is requested. A nonblocking listener
+/// keeps termination latency bounded even when the gateway is idle.
+pub fn serve_until(
+    listener: TcpListener,
+    state: Arc<GatewayState>,
+    shutdown: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    listener.set_nonblocking(true)?;
     let active_connections = Arc::new(AtomicUsize::new(0));
-    for stream in listener.incoming() {
-        let stream = stream?;
+    while !shutdown.load(Ordering::Acquire) {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if !try_acquire_connection(&active_connections) {
             let _ = respond(stream, 503, "text/plain", "server busy\n");
             continue;

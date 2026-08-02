@@ -67,7 +67,10 @@ spec:
               hostPort: {{ .Values.agent.hostPort }}
               {{- end }}
           securityContext:
-            allowPrivilegeEscalation: false
+            # Required only so exec can activate the image's matching file
+            # capabilities. The exact drop/add bounding set below prevents
+            # acquisition of any capability not selected for this source.
+            allowPrivilegeEscalation: true
             capabilities:
               {{- if eq .Values.agent.source "ebpf" }}
               add: ["BPF", "NET_ADMIN", "PERFMON"{{ if .Values.agent.ebpf.fallbackToAfPacket }}, "NET_RAW"{{ end }}]

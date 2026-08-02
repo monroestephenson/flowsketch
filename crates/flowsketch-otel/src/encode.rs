@@ -1,8 +1,10 @@
 //! `SketchEstimate` -> OTLP JSON (the protobuf-JSON mapping of
 //! `ExportMetricsServiceRequest`).
 //!
-//! Naming follows README §13.2: metrics are
-//! `network.flowsketch.<unit>.estimated` gauges, resource attributes carry
+//! The export naming contract uses
+//! `network.flowsketch.<unit>.estimated` gauges plus separate
+//! `.lower_bound`, `.upper_bound`, and `.confidence` gauges when available;
+//! resource attributes carry
 //! `service.name`/`host.name`, and metric attributes carry the query
 //! metadata (`flowsketch.query.name`, `flowsketch.algorithm`,
 //! `flowsketch.window`, `flowsketch.error.kind`) plus group labels mapped
@@ -63,8 +65,8 @@ pub fn encode_estimates(estimates: &[SketchEstimate], opts: &EncodeOptions) -> O
         return None;
     }
 
-    // unit -> data points
-    let mut by_unit: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    // Full metric name -> (description, data points).
+    let mut by_metric: BTreeMap<String, (&'static str, Vec<Value>)> = BTreeMap::new();
     for e in estimates {
         let meta = opts.queries.get(&e.query_name);
         let unit = meta
@@ -85,30 +87,62 @@ pub fn encode_estimates(estimates: &[SketchEstimate], opts: &EncodeOptions) -> O
 
         // u64 nanos exceed JSON safe integers; the OTLP JSON mapping
         // represents 64-bit ints as strings.
-        let mut point = json!({
-            "timeUnixNano": e.window_end_nanos.to_string(),
-            "startTimeUnixNano": e.window_start_nanos.to_string(),
-            "asDouble": e.estimate,
-            "attributes": attributes,
-        });
-        if let (Some(lo), Some(hi)) = (e.lower_bound, e.upper_bound) {
-            // Bounds ride along as exemplar-free attributes would be lossy;
-            // OTLP has no native bound fields on gauges, so expose them as
-            // additional attributes only when present.
-            point["attributes"].as_array_mut().unwrap().extend([
-                kv("flowsketch.bound.lower", &format!("{lo}")),
-                kv("flowsketch.bound.upper", &format!("{hi}")),
-            ]);
+        let point = |value: f64| {
+            json!({
+                "timeUnixNano": e.window_end_nanos.to_string(),
+                "startTimeUnixNano": e.window_start_nanos.to_string(),
+                "asDouble": value,
+                "attributes": attributes.clone(),
+            })
+        };
+        let base_name = format!("network.flowsketch.{unit}.estimated");
+        by_metric
+            .entry(base_name.clone())
+            .or_insert_with(|| {
+                (
+                    "Approximate telemetry estimate from a bounded-memory sketch.",
+                    Vec::new(),
+                )
+            })
+            .1
+            .push(point(e.estimate));
+
+        // OTLP gauge attributes define series identity. Numeric bounds must
+        // therefore be data-point values in stable companion metrics, never
+        // continuously varying string attributes on the estimate series.
+        for (suffix, description, value) in [
+            (
+                "lower_bound",
+                "Lower error bound for the corresponding FlowSketch estimate.",
+                e.lower_bound,
+            ),
+            (
+                "upper_bound",
+                "Upper error bound for the corresponding FlowSketch estimate.",
+                e.upper_bound,
+            ),
+            (
+                "confidence",
+                "Confidence level for the corresponding FlowSketch error interval.",
+                e.confidence,
+            ),
+        ] {
+            if let Some(value) = value {
+                by_metric
+                    .entry(format!("{base_name}.{suffix}"))
+                    .or_insert_with(|| (description, Vec::new()))
+                    .1
+                    .push(point(value));
+            }
         }
-        by_unit.entry(unit).or_default().push(point);
     }
 
-    let metrics: Vec<Value> = by_unit
+    let metrics: Vec<Value> = by_metric
         .into_iter()
-        .map(|(unit, data_points)| {
+        .map(|(name, (description, data_points))| {
             json!({
-                "name": format!("network.flowsketch.{unit}.estimated"),
-                "description": "Approximate telemetry estimate from a bounded-memory sketch.",
+                "name": name,
+                "description": description,
                 "gauge": { "dataPoints": data_points },
             })
         })
@@ -183,7 +217,13 @@ mod tests {
         )];
         let doc = encode_estimates(&es, &options()).unwrap();
 
-        let metric = &doc["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
+        let metrics = doc["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap();
+        let metric = metrics
+            .iter()
+            .find(|metric| metric["name"] == "network.flowsketch.bytes.estimated")
+            .unwrap();
         assert_eq!(metric["name"], "network.flowsketch.bytes.estimated");
         let point = &metric["gauge"]["dataPoints"][0];
         assert_eq!(point["asDouble"], 1234.0);
@@ -207,6 +247,22 @@ mod tests {
         assert_eq!(attrs["source.address"], "10.0.0.1");
         assert_eq!(attrs["destination.port"], "443");
         assert_eq!(attrs["network.protocol.name"], "tcp");
+        assert!(!attrs.contains_key("flowsketch.bound.lower"));
+        assert!(!attrs.contains_key("flowsketch.bound.upper"));
+
+        let companion_value = |suffix: &str| {
+            metrics
+                .iter()
+                .find(|metric| {
+                    metric["name"] == format!("network.flowsketch.bytes.estimated.{suffix}")
+                })
+                .unwrap()["gauge"]["dataPoints"][0]["asDouble"]
+                .as_f64()
+                .unwrap()
+        };
+        assert_eq!(companion_value("lower_bound"), 1233.0);
+        assert_eq!(companion_value("upper_bound"), 1235.0);
+        assert_eq!(companion_value("confidence"), 0.95);
 
         let resource = &doc["resourceMetrics"][0]["resource"]["attributes"];
         assert!(

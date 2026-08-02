@@ -1,5 +1,5 @@
 //! HyperLogLog (Flajolet et al. 2007) cardinality estimation with 64-bit
-//! hashes and small-range linear counting.
+//! hashes and Ertl's bias-corrected improved raw estimator.
 //!
 //! Error model: relative standard error ~ `1.04 / sqrt(2^precision)`.
 //! With 64-bit hashes there is no practical large-range correction needed.
@@ -13,13 +13,29 @@ use flowsketch_core::{Sketch, SketchCompatibility, SketchError};
 pub const ALGORITHM: &str = "hll";
 pub const MIN_PRECISION: u8 = 4;
 pub const MAX_PRECISION: u8 = 18;
+const STORAGE_SPARSE: u8 = 0;
+const STORAGE_DENSE: u8 = 1;
+const SPARSE_MEMORY_FRACTION: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct HyperLogLog {
     precision: u8,
     hash: HashSpec,
-    registers: Vec<u8>, // 2^precision registers
+    storage: RegisterStorage,
     updates: u64,
+}
+
+/// Keep small cardinalities as an exact, sorted set of 64-bit hashes. This
+/// avoids allocating and clearing a dense register array for every low-fanout
+/// HLLMap key. The sparse representation converts before its allocation can
+/// exceed the dense array's byte count, so the planner's worst-case memory
+/// contract remains valid.
+#[derive(Debug, Clone)]
+enum RegisterStorage {
+    Empty,
+    Singleton(u64),
+    Sparse(Vec<u64>),
+    Dense(Vec<u8>),
 }
 
 impl HyperLogLog {
@@ -32,7 +48,7 @@ impl HyperLogLog {
         Ok(HyperLogLog {
             precision,
             hash,
-            registers: vec![0; 1 << precision],
+            storage: RegisterStorage::Empty,
             updates: 0,
         })
     }
@@ -56,38 +72,112 @@ impl HyperLogLog {
     pub fn insert(&mut self, key: &[u8]) {
         self.updates += 1;
         let h = hash64(key, self.hash.seed);
-        let idx = (h >> (64 - self.precision)) as usize;
-        // rho: position of the leftmost 1-bit in the remaining bits.
-        let remaining = h << self.precision;
-        let rho = (remaining.leading_zeros() + 1).min(64 - self.precision as u32 + 1) as u8;
-        if rho > self.registers[idx] {
-            self.registers[idx] = rho;
+        self.insert_hash(h);
+    }
+
+    fn insert_hash(&mut self, hash: u64) {
+        let precision = self.precision;
+        let sparse_limit = sparse_limit(precision);
+        match &mut self.storage {
+            RegisterStorage::Empty => {
+                self.storage = RegisterStorage::Singleton(hash);
+                return;
+            }
+            RegisterStorage::Singleton(existing) if *existing == hash => return,
+            RegisterStorage::Singleton(existing) if sparse_limit > 1 => {
+                let mut hashes = vec![*existing, hash];
+                hashes.sort_unstable();
+                self.storage = RegisterStorage::Sparse(hashes);
+                return;
+            }
+            RegisterStorage::Singleton(_) => {}
+            RegisterStorage::Sparse(hashes) => match hashes.binary_search(&hash) {
+                Ok(_) => return,
+                Err(position) if hashes.len() < sparse_limit => {
+                    hashes.insert(position, hash);
+                    return;
+                }
+                Err(_) => {}
+            },
+            RegisterStorage::Dense(registers) => {
+                update_register(registers, precision, hash);
+                return;
+            }
+        }
+
+        self.ensure_dense();
+        let RegisterStorage::Dense(registers) = &mut self.storage else {
+            unreachable!("ensure_dense always creates dense storage");
+        };
+        update_register(registers, precision, hash);
+    }
+
+    fn ensure_dense(&mut self) {
+        if matches!(self.storage, RegisterStorage::Dense(_)) {
+            return;
+        }
+        let sparse = match std::mem::replace(
+            &mut self.storage,
+            RegisterStorage::Dense(vec![0; 1 << self.precision]),
+        ) {
+            RegisterStorage::Empty => Vec::new(),
+            RegisterStorage::Singleton(hash) => vec![hash],
+            RegisterStorage::Sparse(hashes) => hashes,
+            RegisterStorage::Dense(_) => unreachable!(),
+        };
+        let RegisterStorage::Dense(registers) = &mut self.storage else {
+            unreachable!();
+        };
+        for hash in sparse {
+            update_register(registers, self.precision, hash);
+        }
+    }
+
+    #[cfg(test)]
+    fn dense_registers(&self) -> Vec<u8> {
+        match &self.storage {
+            RegisterStorage::Dense(registers) => registers.clone(),
+            RegisterStorage::Empty => vec![0; 1 << self.precision],
+            RegisterStorage::Singleton(hash) => {
+                let mut registers = vec![0; 1 << self.precision];
+                update_register(&mut registers, self.precision, *hash);
+                registers
+            }
+            RegisterStorage::Sparse(hashes) => {
+                let mut registers = vec![0; 1 << self.precision];
+                for &hash in hashes {
+                    update_register(&mut registers, self.precision, hash);
+                }
+                registers
+            }
         }
     }
 
     pub fn cardinality(&self) -> f64 {
-        let m = self.registers.len() as f64;
-        let alpha = match self.registers.len() {
-            16 => 0.673,
-            32 => 0.697,
-            64 => 0.709,
-            n => 0.7213 / (1.0 + 1.079 / n as f64),
+        let registers = match &self.storage {
+            RegisterStorage::Empty => return 0.0,
+            RegisterStorage::Singleton(_) => return 1.0,
+            RegisterStorage::Sparse(hashes) => return hashes.len() as f64,
+            RegisterStorage::Dense(registers) => registers,
         };
-        let mut sum = 0.0f64;
-        let mut zeros = 0usize;
-        for &r in &self.registers {
-            sum += 1.0 / (1u64 << r) as f64;
-            if r == 0 {
-                zeros += 1;
-            }
+        let m = registers.len() as f64;
+        let q = 64usize - self.precision as usize;
+        let mut counts = [0usize; 66];
+        for &register in registers {
+            counts[register as usize] += 1;
         }
-        let raw = alpha * m * m / sum;
-        if raw <= 2.5 * m && zeros > 0 {
-            // Small-range correction: linear counting.
-            m * (m / zeros as f64).ln()
-        } else {
-            raw
+
+        // Ertl's improved raw estimator corrects both the empty-register and
+        // saturated-register ranges without empirical bias tables. This also
+        // removes the severe bias discontinuity around the old 2.5*m switch
+        // from linear counting to the original raw estimator.
+        let mut denominator = m * ertl_tau(1.0 - counts[q + 1] as f64 / m);
+        for rank in (1..=q).rev() {
+            denominator = 0.5 * (denominator + counts[rank] as f64);
         }
+        denominator += m * ertl_sigma(counts[0] as f64 / m);
+        const ALPHA_INFINITY: f64 = 0.721_347_520_444_481_7;
+        ALPHA_INFINITY * m * m / denominator
     }
 
     fn params_hash(&self) -> u64 {
@@ -97,9 +187,30 @@ impl HyperLogLog {
     pub fn to_snapshot(&self, window_start_nanos: u64, window_end_nanos: u64) -> Vec<u8> {
         let mut params = Writer::new();
         params.u8(self.precision);
-        let mut payload = Writer::with_capacity(self.registers.len() + 8);
+        let mut payload = Writer::new();
         payload.u64(self.updates);
-        payload.bytes(&self.registers);
+        match &self.storage {
+            RegisterStorage::Empty => {
+                payload.u8(STORAGE_SPARSE);
+                payload.u32(0);
+            }
+            RegisterStorage::Singleton(hash) => {
+                payload.u8(STORAGE_SPARSE);
+                payload.u32(1);
+                payload.u64(*hash);
+            }
+            RegisterStorage::Sparse(hashes) => {
+                payload.u8(STORAGE_SPARSE);
+                payload.u32(hashes.len() as u32);
+                for &hash in hashes {
+                    payload.u64(hash);
+                }
+            }
+            RegisterStorage::Dense(registers) => {
+                payload.u8(STORAGE_DENSE);
+                payload.bytes(registers);
+            }
+        }
         write_snapshot(
             &SnapshotHeader {
                 version: SNAPSHOT_VERSION,
@@ -131,20 +242,111 @@ impl HyperLogLog {
         }
         let mut r = Reader::new(&payload);
         let updates = r.u64()?;
-        let registers = r.take(1usize << precision)?.to_vec();
-        let max_register = 64 - precision + 1;
-        if let Some(&register) = registers.iter().find(|&&register| register > max_register) {
-            return Err(SketchError::Snapshot(format!(
-                "hll snapshot register must be <= {max_register} for precision {precision}, \
-                 got {register}"
-            )));
+        let storage = match r.u8()? {
+            STORAGE_SPARSE => {
+                let count = r.u32()? as usize;
+                let sparse_limit = sparse_limit(precision);
+                if count > sparse_limit {
+                    return Err(SketchError::Snapshot(format!(
+                        "hll sparse hash count {count} exceeds limit {sparse_limit}"
+                    )));
+                }
+                r.check_count(count, std::mem::size_of::<u64>())?;
+                let mut hashes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let hash = r.u64()?;
+                    if hashes.last().is_some_and(|previous| *previous >= hash) {
+                        return Err(SketchError::Snapshot(
+                            "hll sparse hashes must be strictly sorted and unique".into(),
+                        ));
+                    }
+                    hashes.push(hash);
+                }
+                match hashes.as_slice() {
+                    [] => RegisterStorage::Empty,
+                    [hash] => RegisterStorage::Singleton(*hash),
+                    _ => RegisterStorage::Sparse(hashes),
+                }
+            }
+            STORAGE_DENSE => {
+                let registers = r.take(1usize << precision)?.to_vec();
+                let max_register = 64 - precision + 1;
+                if let Some(&register) = registers.iter().find(|&&register| register > max_register)
+                {
+                    return Err(SketchError::Snapshot(format!(
+                        "hll snapshot register must be <= {max_register} for precision \
+                         {precision}, got {register}"
+                    )));
+                }
+                RegisterStorage::Dense(registers)
+            }
+            encoding => {
+                return Err(SketchError::Snapshot(format!(
+                    "unknown hll storage encoding {encoding}"
+                )))
+            }
+        };
+        if r.remaining() != 0 {
+            return Err(SketchError::Snapshot(
+                "trailing bytes in hll snapshot payload".into(),
+            ));
         }
         Ok(HyperLogLog {
             precision,
             hash: header.hash,
-            registers,
+            storage,
             updates,
         })
+    }
+}
+
+fn sparse_limit(precision: u8) -> usize {
+    ((1usize << precision) / (SPARSE_MEMORY_FRACTION * std::mem::size_of::<u64>())).max(1)
+}
+
+fn update_register(registers: &mut [u8], precision: u8, hash: u64) {
+    let idx = (hash >> (64 - precision)) as usize;
+    // rho: position of the leftmost 1-bit in the remaining bits.
+    let remaining = hash << precision;
+    let rho = (remaining.leading_zeros() + 1).min(64 - precision as u32 + 1) as u8;
+    if rho > registers[idx] {
+        registers[idx] = rho;
+    }
+}
+
+/// Small-cardinality correction from Ertl's improved raw estimator.
+fn ertl_sigma(mut x: f64) -> f64 {
+    if x == 1.0 {
+        return f64::INFINITY;
+    }
+    let mut z = x;
+    let mut scale = 1.0;
+    loop {
+        x *= x;
+        let previous = z;
+        z += x * scale;
+        scale += scale;
+        if z == previous {
+            return z;
+        }
+    }
+}
+
+/// Saturated-register correction from Ertl's improved raw estimator.
+fn ertl_tau(mut x: f64) -> f64 {
+    if x == 0.0 || x == 1.0 {
+        return 0.0;
+    }
+    let mut z = 1.0 - x;
+    let mut scale = 1.0;
+    loop {
+        x = x.sqrt();
+        let previous = z;
+        scale *= 0.5;
+        z -= (1.0 - x).powi(2) * scale;
+        if z == previous {
+            return z / 3.0;
+        }
     }
 }
 
@@ -160,9 +362,24 @@ impl Sketch for HyperLogLog {
     fn merge_from(&mut self, other: &Self) -> Result<(), SketchError> {
         self.compatibility()
             .ensure_matches(&other.compatibility())?;
-        for (a, b) in self.registers.iter_mut().zip(other.registers.iter()) {
-            if *b > *a {
-                *a = *b;
+        match &other.storage {
+            RegisterStorage::Empty => {}
+            RegisterStorage::Singleton(hash) => self.insert_hash(*hash),
+            RegisterStorage::Sparse(hashes) => {
+                for &hash in hashes {
+                    self.insert_hash(hash);
+                }
+            }
+            RegisterStorage::Dense(theirs) => {
+                self.ensure_dense();
+                let RegisterStorage::Dense(mine) = &mut self.storage else {
+                    unreachable!();
+                };
+                for (a, b) in mine.iter_mut().zip(theirs) {
+                    if *b > *a {
+                        *a = *b;
+                    }
+                }
             }
         }
         self.updates += other.updates;
@@ -170,11 +387,21 @@ impl Sketch for HyperLogLog {
     }
 
     fn memory_bytes(&self) -> usize {
-        self.registers.len() + std::mem::size_of::<Self>()
+        let storage = match &self.storage {
+            RegisterStorage::Empty | RegisterStorage::Singleton(_) => 0,
+            RegisterStorage::Sparse(hashes) => hashes.capacity() * std::mem::size_of::<u64>(),
+            RegisterStorage::Dense(registers) => registers.capacity(),
+        };
+        storage + std::mem::size_of::<Self>()
     }
 
     fn reset(&mut self) {
-        self.registers.fill(0);
+        match &mut self.storage {
+            RegisterStorage::Empty => {}
+            RegisterStorage::Singleton(_) => self.storage = RegisterStorage::Empty,
+            RegisterStorage::Sparse(hashes) => hashes.clear(),
+            RegisterStorage::Dense(registers) => registers.fill(0),
+        }
         self.updates = 0;
     }
 
@@ -204,7 +431,11 @@ mod tests {
             h.insert(format!("item-{i}").as_bytes()); // duplicates ignored
         }
         let est = h.cardinality();
-        assert!((est - 100.0).abs() < 5.0, "estimate {est}");
+        let relative = (est - 100.0).abs() / 100.0;
+        assert!(
+            relative <= 2.0 * h.relative_error(),
+            "estimate {est}, relative error {relative}"
+        );
     }
 
     #[test]
@@ -216,8 +447,41 @@ mod tests {
         }
         let est = h.cardinality();
         let rel = (est - n as f64).abs() / n as f64;
-        // 1.04/sqrt(4096) ~ 1.6%; allow 3 sigma.
-        assert!(rel < 3.0 * h.relative_error(), "relative error {rel}");
+        assert!(rel <= 2.0 * h.relative_error(), "relative error {rel}");
+    }
+
+    #[test]
+    fn transition_range_intervals_are_not_systematically_biased() {
+        const TRIALS: u64 = 64;
+        const TRUTH: u64 = 41_000;
+        let mut covered = 0u64;
+        let mut signed_relative_error = 0.0;
+        for seed in 0..TRIALS {
+            let mut h = HyperLogLog::new(14, HashSpec::new(seed)).unwrap();
+            for item in 0..TRUTH {
+                h.insert(&item.to_le_bytes());
+            }
+            let estimate = h.cardinality();
+            let relative = (estimate - TRUTH as f64) / TRUTH as f64;
+            signed_relative_error += relative;
+            if relative.abs() <= 2.0 * h.relative_error() {
+                covered += 1;
+            }
+        }
+
+        let mean_bias = signed_relative_error / TRIALS as f64;
+        assert!(
+            mean_bias.abs()
+                < 0.5
+                    * HyperLogLog::new(14, HashSpec::new(0))
+                        .unwrap()
+                        .relative_error(),
+            "transition-range mean relative bias {mean_bias}"
+        );
+        assert!(
+            covered >= 58,
+            "only {covered}/{TRIALS} nominal 95% intervals covered truth"
+        );
     }
 
     #[test]
@@ -236,7 +500,7 @@ mod tests {
             }
         }
         a.merge_from(&b).unwrap();
-        assert_eq!(a.registers, union.registers);
+        assert_eq!(a.dense_registers(), union.dense_registers());
     }
 
     #[test]
@@ -255,6 +519,21 @@ mod tests {
         let h2 = HyperLogLog::from_snapshot(&h.to_snapshot(0, 1)).unwrap();
         assert_eq!(h.cardinality(), h2.cardinality());
         assert_eq!(h.update_count(), h2.update_count());
+    }
+
+    #[test]
+    fn sparse_snapshot_round_trips_exact_cardinality() {
+        let mut h = HyperLogLog::new(14, HashSpec::new(17)).unwrap();
+        for i in 0..500u64 {
+            h.insert(&i.to_le_bytes());
+        }
+        assert!(matches!(h.storage, RegisterStorage::Sparse(_)));
+        assert_eq!(h.cardinality(), 500.0);
+        assert!(h.memory_bytes() <= (1 << h.precision()) + std::mem::size_of::<HyperLogLog>());
+
+        let restored = HyperLogLog::from_snapshot(&h.to_snapshot(0, 1)).unwrap();
+        assert!(matches!(restored.storage, RegisterStorage::Sparse(_)));
+        assert_eq!(restored.cardinality(), 500.0);
     }
 
     #[test]
@@ -284,6 +563,7 @@ mod tests {
         params.u8(MIN_PRECISION);
         let mut payload = Writer::new();
         payload.u64(0);
+        payload.u8(STORAGE_DENSE);
         payload.bytes(&[u8::MAX; 1 << MIN_PRECISION]);
         let bytes = write_snapshot(
             &SnapshotHeader {

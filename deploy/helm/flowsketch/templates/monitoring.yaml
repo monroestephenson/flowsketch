@@ -99,6 +99,12 @@ spec:
           annotations:
             summary: FlowSketch rejected late events
             description: Events arrived before the earliest open runtime window.
+        - alert: FlowSketchInvalidTimestamps
+          expr: increase(flowsketch_agent_invalid_timestamps_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch quarantined invalid live timestamps
+            description: AF_PACKET or normalized eBPF timestamps fell outside the five-minute realtime trust window.
         - alert: FlowSketchOtlpExportFailures
           expr: increase(flowsketch_agent_otlp_export_failures_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
           labels: {severity: {{ .Values.monitoring.rules.severity }}}

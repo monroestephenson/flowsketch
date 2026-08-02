@@ -1,4 +1,4 @@
-# FlowSketch cluster gateway configuration (README Phase 7).
+# FlowSketch cluster gateway configuration.
 #
 # Agents push their current window's sketch snapshots here; the gateway
 # validates merge compatibility, combines them across nodes, and serves

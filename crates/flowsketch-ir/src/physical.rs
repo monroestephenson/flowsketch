@@ -59,6 +59,7 @@ impl PhysicalSketch {
     /// bytes. Keyed structures assume an average key of `avg_key_bytes`.
     pub fn estimated_memory_bytes(&self, avg_key_bytes: usize) -> u64 {
         const HASH_ENTRY_OVERHEAD: u64 = 48;
+        const EVICTION_HEAP_ENTRY_OVERHEAD: u64 = 32;
         match self {
             PhysicalSketch::CountMin { width, depth, .. } => (width * depth) as u64 * 8 + 64,
             PhysicalSketch::CountSketch { width, depth } => (width * depth) as u64 * 8 + 64,
@@ -71,7 +72,10 @@ impl PhysicalSketch {
                 precision,
             } => {
                 *max_keys as u64
-                    * ((1u64 << precision) + avg_key_bytes as u64 + HASH_ENTRY_OVERHEAD)
+                    * ((1u64 << precision)
+                        + 2 * avg_key_bytes as u64
+                        + HASH_ENTRY_OVERHEAD
+                        + EVICTION_HEAP_ENTRY_OVERHEAD)
                     + 64
             }
             // KLL stores ~3k items across geometrically-capped levels.

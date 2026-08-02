@@ -46,7 +46,9 @@ spec:
               containerPort: 9464
               hostPort: 9464
           securityContext:
-            allowPrivilegeEscalation: false
+            # Allows the AF_PACKET entrypoint's cap_net_raw file capability
+            # to activate; the bounding set remains NET_RAW-only.
+            allowPrivilegeEscalation: true
             capabilities:
               add: ["NET_RAW"]
               drop: ["ALL"]

@@ -111,8 +111,13 @@ EOF
 
 stop_gateway() {
   if [ -n "$GATEWAY_PID" ]; then
-    kill "$GATEWAY_PID" 2>/dev/null || true
-    wait "$GATEWAY_PID" 2>/dev/null || true
+    kill "$GATEWAY_PID" 2>/dev/null ||
+      fail "gateway exited before SIGTERM could be delivered"
+    wait "$GATEWAY_PID" 2>/dev/null ||
+      fail "gateway did not exit successfully after SIGTERM"
+    grep -q 'flowsketch gateway graceful shutdown complete' \
+      "$TMP/gateway-$GATEWAY_RUN.log" ||
+      fail "gateway did not report a completed graceful shutdown"
     GATEWAY_PID=
   fi
 }
@@ -201,4 +206,5 @@ assert_nodes
 
 metrics=$(curl -fsS --max-time 2 "$URL/metrics")
 printf '%s\n' "$metrics" | grep -E 'flowsketch_gateway_(nodes_merged|pushes_total|snapshots_rejected_total)'
-echo "gateway restart smoke passed: compatible state repopulated twice and incompatible state failed closed"
+stop_gateway
+echo "gateway restart smoke passed: compatible state repopulated twice, incompatible state failed closed, and every SIGTERM was graceful"

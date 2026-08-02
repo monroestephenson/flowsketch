@@ -16,22 +16,34 @@ const ETHERTYPE_QINQ: u16 = 0x88A8;
 /// caller to fill). Returns `None` for frames that are not IPv4/IPv6 or use
 /// an unsupported link type.
 pub fn parse_packet(link: u32, data: &[u8]) -> Option<FlowEvent> {
+    parse_packet_with_wire_len(link, data, u32::try_from(data.len()).ok()?)
+}
+
+/// Parse a possibly snaplen-truncated capture. `wire_len` is the packet's
+/// original link-layer length from the capture boundary (pcap record or
+/// TPACKET header). Network-layer length fields must fit inside it, while the
+/// captured bytes must contain every header this parser inspects.
+pub fn parse_packet_with_wire_len(link: u32, data: &[u8], wire_len: u32) -> Option<FlowEvent> {
+    let wire_len = usize::try_from(wire_len).ok()?;
+    if data.len() > wire_len {
+        return None;
+    }
     match link {
-        linktype::ETHERNET => parse_ethernet(data),
-        linktype::RAW_IP => parse_ip(data),
+        linktype::ETHERNET => parse_ethernet(data, wire_len),
+        linktype::RAW_IP => parse_ip(data, wire_len),
         linktype::LINUX_SLL => {
             // 16-byte SLL header; EtherType in the last two bytes.
             if data.len() < 16 {
                 return None;
             }
             let ethertype = u16::from_be_bytes([data[14], data[15]]);
-            parse_l3(ethertype, &data[16..])
+            parse_l3(ethertype, &data[16..], wire_len.checked_sub(16)?)
         }
         _ => None,
     }
 }
 
-fn parse_ethernet(data: &[u8]) -> Option<FlowEvent> {
+fn parse_ethernet(data: &[u8], wire_len: usize) -> Option<FlowEvent> {
     if data.len() < 14 {
         return None;
     }
@@ -47,26 +59,26 @@ fn parse_ethernet(data: &[u8]) -> Option<FlowEvent> {
             offset += 4;
         }
     }
-    parse_l3(ethertype, &data[offset..])
+    parse_l3(ethertype, &data[offset..], wire_len.checked_sub(offset)?)
 }
 
-fn parse_l3(ethertype: u16, data: &[u8]) -> Option<FlowEvent> {
+fn parse_l3(ethertype: u16, data: &[u8], wire_len: usize) -> Option<FlowEvent> {
     match ethertype {
-        ETHERTYPE_IPV4 => parse_ipv4(data),
-        ETHERTYPE_IPV6 => parse_ipv6(data),
+        ETHERTYPE_IPV4 => parse_ipv4(data, wire_len),
+        ETHERTYPE_IPV6 => parse_ipv6(data, wire_len),
         _ => None,
     }
 }
 
-fn parse_ip(data: &[u8]) -> Option<FlowEvent> {
+fn parse_ip(data: &[u8], wire_len: usize) -> Option<FlowEvent> {
     match data.first()? >> 4 {
-        4 => parse_ipv4(data),
-        6 => parse_ipv6(data),
+        4 => parse_ipv4(data, wire_len),
+        6 => parse_ipv6(data, wire_len),
         _ => None,
     }
 }
 
-fn parse_ipv4(data: &[u8]) -> Option<FlowEvent> {
+fn parse_ipv4(data: &[u8], wire_len: usize) -> Option<FlowEvent> {
     if data.len() < 20 || data[0] >> 4 != 4 {
         return None;
     }
@@ -74,7 +86,10 @@ fn parse_ipv4(data: &[u8]) -> Option<FlowEvent> {
     if ihl < 20 || data.len() < ihl {
         return None;
     }
-    let total_len = u16::from_be_bytes([data[2], data[3]]) as u32;
+    let total_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if total_len < ihl || total_len > wire_len {
+        return None;
+    }
     let protocol = data[9];
     let src = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
     let dst = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
@@ -82,7 +97,8 @@ fn parse_ipv4(data: &[u8]) -> Option<FlowEvent> {
     let frag = u16::from_be_bytes([data[6], data[7]]);
     let fragment_offset = frag & 0x1FFF;
     let l4 = if fragment_offset == 0 {
-        parse_l4(protocol, &data[ihl..])
+        let captured_end = total_len.min(data.len());
+        parse_l4(protocol, &data[ihl..captured_end], total_len - ihl)?
     } else {
         // Non-first fragment: no L4 header present.
         L4Info::default()
@@ -95,59 +111,80 @@ fn parse_ipv4(data: &[u8]) -> Option<FlowEvent> {
         dst_port: l4.dst_port,
         protocol,
         tcp_flags: l4.tcp_flags,
-        bytes: total_len,
+        bytes: total_len as u32,
         packets: 1,
         ..FlowEvent::default()
     })
 }
 
-fn parse_ipv6(data: &[u8]) -> Option<FlowEvent> {
+fn parse_ipv6(data: &[u8], wire_len: usize) -> Option<FlowEvent> {
     if data.len() < 40 || data[0] >> 4 != 6 {
         return None;
     }
-    let payload_len = u16::from_be_bytes([data[4], data[5]]) as u32;
+    let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
+    // IPv6 jumbograms need the Hop-by-Hop Jumbo Payload option and are not
+    // supported by either capture parser.
+    if payload_len == 0 {
+        return None;
+    }
+    let packet_len = 40usize.checked_add(payload_len)?;
+    if packet_len > wire_len {
+        return None;
+    }
     let mut next_header = data[6];
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(&data[8..24]).unwrap());
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&data[24..40]).unwrap());
 
-    // Walk common extension headers to find the transport header.
+    // Walk the same bounded extension-header set as the tc parser. Every
+    // offset must fit both the declared packet and the captured prefix.
     let mut offset = 40usize;
     let mut l4 = L4Info::default();
-    for _ in 0..8 {
+    let mut non_first_fragment = false;
+    for _ in 0..6 {
         match next_header {
-            0 | 43 | 60 => {
-                // Hop-by-hop, routing, destination options:
-                // [next_header, hdr_ext_len (8-byte units, excl. first 8)].
-                if data.len() < offset + 8 {
-                    break;
+            0 | 43 | 51 | 60 => {
+                let fixed_end = offset.checked_add(8)?;
+                if fixed_end > packet_len || fixed_end > data.len() {
+                    return None;
                 }
-                let len = 8 + data[offset + 1] as usize * 8;
+                let len = if next_header == 51 {
+                    (data[offset + 1] as usize + 2).checked_mul(4)?
+                } else {
+                    8usize.checked_add(data[offset + 1] as usize * 8)?
+                };
+                let next_offset = offset.checked_add(len)?;
+                if len < 8 || next_offset > packet_len || next_offset > data.len() {
+                    return None;
+                }
                 next_header = data[offset];
-                offset += len;
+                offset = next_offset;
             }
             44 => {
-                // Fragment header: fixed 8 bytes. Only the first fragment
-                // carries the L4 header.
-                if data.len() < offset + 8 {
-                    break;
+                let next_offset = offset.checked_add(8)?;
+                if next_offset > packet_len || next_offset > data.len() {
+                    return None;
                 }
                 let frag_offset = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) >> 3;
-                let nh = data[offset];
-                offset += 8;
+                next_header = data[offset];
+                offset = next_offset;
                 if frag_offset != 0 {
-                    next_header = nh;
+                    non_first_fragment = true;
                     break;
                 }
-                next_header = nh;
             }
             _ => {
-                // A truncated capture may cut the transport header off; the
-                // L3 facts (addresses, protocol, bytes) are still valid, so
-                // degrade to portless info rather than dropping the packet.
-                l4 = parse_l4(next_header, data.get(offset..).unwrap_or(&[]));
+                let captured_end = packet_len.min(data.len());
+                l4 = parse_l4(
+                    next_header,
+                    data.get(offset..captured_end)?,
+                    packet_len.checked_sub(offset)?,
+                )?;
                 break;
             }
         }
+    }
+    if matches!(next_header, 0 | 43 | 44 | 51 | 60) && !non_first_fragment {
+        return None;
     }
 
     Some(FlowEvent {
@@ -157,7 +194,7 @@ fn parse_ipv6(data: &[u8]) -> Option<FlowEvent> {
         dst_port: l4.dst_port,
         protocol: next_header,
         tcp_flags: l4.tcp_flags,
-        bytes: 40 + payload_len,
+        bytes: packet_len as u32,
         packets: 1,
         ..FlowEvent::default()
     })
@@ -170,33 +207,37 @@ struct L4Info {
     tcp_flags: u8,
 }
 
-fn parse_l4(protocol: u8, data: &[u8]) -> L4Info {
+fn parse_l4(protocol: u8, data: &[u8], wire_len: usize) -> Option<L4Info> {
     match protocol {
         6 => {
-            // TCP: ports at 0..4, flags at byte 13.
-            if data.len() >= 14 {
-                L4Info {
-                    src_port: u16::from_be_bytes([data[0], data[1]]),
-                    dst_port: u16::from_be_bytes([data[2], data[3]]),
-                    tcp_flags: data[13],
-                }
-            } else {
-                L4Info::default()
+            if data.len() < 14 {
+                return None;
             }
+            let header_len = usize::from(data[12] >> 4) * 4;
+            if header_len < 20 || header_len > wire_len || header_len > data.len() {
+                return None;
+            }
+            Some(L4Info {
+                src_port: u16::from_be_bytes([data[0], data[1]]),
+                dst_port: u16::from_be_bytes([data[2], data[3]]),
+                tcp_flags: data[13],
+            })
         }
         17 => {
-            // UDP: ports at 0..4.
-            if data.len() >= 8 {
-                L4Info {
-                    src_port: u16::from_be_bytes([data[0], data[1]]),
-                    dst_port: u16::from_be_bytes([data[2], data[3]]),
-                    tcp_flags: 0,
-                }
-            } else {
-                L4Info::default()
+            if data.len() < 8 {
+                return None;
             }
+            let udp_len = u16::from_be_bytes([data[4], data[5]]) as usize;
+            if udp_len < 8 || udp_len > wire_len {
+                return None;
+            }
+            Some(L4Info {
+                src_port: u16::from_be_bytes([data[0], data[1]]),
+                dst_port: u16::from_be_bytes([data[2], data[3]]),
+                tcp_flags: 0,
+            })
         }
-        _ => L4Info::default(),
+        _ => Some(L4Info::default()),
     }
 }
 
@@ -261,9 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_with_truncated_extension_header_keeps_l3_facts() {
-        // Regression: a hop-by-hop header whose length points past the
-        // captured bytes used to drop the whole packet; L3 facts survive.
+    fn ipv6_with_truncated_extension_header_is_rejected() {
         let mut f = Vec::new();
         f.extend_from_slice(&[0u8; 12]); // MACs
         f.extend_from_slice(&0x86DDu16.to_be_bytes());
@@ -280,12 +319,39 @@ mod tests {
         f.push(3); // hdr ext len
         f.extend_from_slice(&[0; 6]);
 
-        let e = parse_packet(linktype::ETHERNET, &f).expect("packet dropped");
-        assert_eq!(e.src_ip.to_string(), "2001:db8::1");
-        assert_eq!(e.dst_ip.to_string(), "2001:db8::2");
-        assert_eq!(e.protocol, 6);
-        assert_eq!((e.src_port, e.dst_port), (0, 0)); // ports unknowable
-        assert_eq!(e.bytes, 140);
+        assert!(parse_packet(linktype::ETHERNET, &f).is_none());
+    }
+
+    #[test]
+    fn attacker_controlled_ip_lengths_cannot_inflate_byte_counts() {
+        let mut inflated_v4 = ipv4_tcp_frame();
+        inflated_v4[16..18].copy_from_slice(&1_500u16.to_be_bytes());
+        assert!(parse_packet(linktype::ETHERNET, &inflated_v4).is_none());
+
+        let mut undersized_v4 = ipv4_tcp_frame();
+        undersized_v4[16..18].copy_from_slice(&10u16.to_be_bytes());
+        assert!(parse_packet(linktype::ETHERNET, &undersized_v4).is_none());
+
+        let mut inflated_v6 = vec![0u8; 14 + 40];
+        inflated_v6[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        inflated_v6[14] = 0x60;
+        inflated_v6[18..20].copy_from_slice(&1_000u16.to_be_bytes());
+        inflated_v6[20] = 59; // no next header
+        assert!(parse_packet(linktype::ETHERNET, &inflated_v6).is_none());
+    }
+
+    #[test]
+    fn snaplen_truncation_uses_original_wire_bound() {
+        let full = ipv4_tcp_frame();
+        let captured = &full[..34]; // Ethernet + complete IPv4 header only.
+        assert!(parse_packet_with_wire_len(linktype::ETHERNET, captured, 54).is_none());
+
+        // All inspected headers are present, while the payload is truncated.
+        let mut captured = full;
+        captured[16..18].copy_from_slice(&1_500u16.to_be_bytes());
+        let event = parse_packet_with_wire_len(linktype::ETHERNET, &captured, 1_514)
+            .expect("valid snaplen-truncated packet rejected");
+        assert_eq!(event.bytes, 1_500);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of the `fsk1` hash family. Bump on any change to the mixing
 /// functions below; sketches with different hash versions must not merge.
-pub const HASH_VERSION: u16 = 1;
+pub const HASH_VERSION: u16 = 2;
 
 /// Named hash families. Only `fsk1` exists today; the enum keeps the wire
 /// format honest about which function produced an index.
@@ -106,9 +106,10 @@ pub fn hash64(bytes: &[u8], seed: u64) -> u64 {
     splitmix64(h)
 }
 
-/// Per-row derived hashes for multi-row sketches (Count-Min, CountSketch),
-/// using the Kirsch–Mitzenmacher construction: `h_i(x) = h1(x) + i * h2(x)`.
-/// One pass over the key bytes yields indexes for every row.
+/// Per-row derived hashes for multi-row sketches (Count-Min, CountSketch).
+/// One pass over the key bytes yields a 128-bit base digest; nonlinear,
+/// domain-separated mixing then avoids the arithmetic row correlations of
+/// double hashing while keeping row selection independent of table width.
 #[derive(Debug, Clone, Copy)]
 pub struct RowHashes {
     h1: u64,
@@ -127,14 +128,16 @@ impl RowHashes {
     /// Column index for `row` in a table of `width` columns.
     #[inline]
     pub fn index(&self, row: usize, width: usize) -> usize {
-        let h = self.h1.wrapping_add((row as u64).wrapping_mul(self.h2));
+        let domain = splitmix64((row as u64) ^ 0xD6E8_FEB8_6659_FD93);
+        let h = splitmix64(self.h1 ^ self.h2.rotate_left((row as u32 % 63) + 1) ^ domain);
         (h % width as u64) as usize
     }
 
     /// A +1/-1 sign for `row`, independent of the index bits (CountSketch).
     #[inline]
     pub fn sign(&self, row: usize) -> i64 {
-        let s = splitmix64(self.h1 ^ (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.h2);
+        let domain = splitmix64((row as u64) ^ 0xA409_3822_299F_31D0);
+        let s = splitmix64(self.h1 ^ self.h2.rotate_right((row as u32 % 63) + 1) ^ domain);
         if s & 1 == 1 {
             1
         } else {

@@ -10,7 +10,10 @@ on:
       - "scripts/linux-m4-live-validation.sh"
       - "scripts/linux-ebpf-live-smoke.sh"
       - "scripts/linux-cpu-affinity-smoke.sh"
+      - "scripts/linux-container-capture-smoke.sh"
       - "scripts/build-ebpf.sh"
+      - "Dockerfile"
+      - "deploy/**"
       - "crates/**"
       - "examples/**"
       - "Cargo.toml"
@@ -24,7 +27,10 @@ on:
       - "scripts/linux-m4-live-validation.sh"
       - "scripts/linux-ebpf-live-smoke.sh"
       - "scripts/linux-cpu-affinity-smoke.sh"
+      - "scripts/linux-container-capture-smoke.sh"
       - "scripts/build-ebpf.sh"
+      - "Dockerfile"
+      - "deploy/**"
       - "crates/**"
       - "examples/**"
       - "Cargo.toml"
@@ -47,9 +53,13 @@ jobs:
           sudo apt-get install -y clang iproute2 libbpf-dev libcap2-bin linux-tools-generic tcpreplay
       - name: Build release CLI
         run: cargo build --locked --release -p flowsketch-cli
+      - name: Build production container
+        run: docker build --tag flowsketch:linux-live .
+      - name: Non-root container captures with its exact file capability
+        run: scripts/linux-container-capture-smoke.sh flowsketch:linux-live
       - name: AF_PACKET live smoke on veth
         run: bash scripts/linux-afpacket-live-smoke.sh target/release/flowsketch
-      - name: AF_PACKET HASH/RX_QUEUE fan-out, affinity, and lane accounting
+      - name: AF_PACKET queue-local HASH/RX_QUEUE fan-out and lane accounting
         run: bash scripts/linux-afpacket-fanout-smoke.sh target/release/flowsketch
       - name: Linux capture/runtime CPU-affinity smoke
         run: bash scripts/linux-cpu-affinity-smoke.sh target/release/flowsketch

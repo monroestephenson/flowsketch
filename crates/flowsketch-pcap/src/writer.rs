@@ -47,13 +47,18 @@ impl<W: Write> PcapWriter<W> {
         self.packets_written
     }
 
-    fn write_record(&mut self, ts_nanos: u64, frame: &[u8]) -> Result<(), PcapError> {
+    fn write_record(
+        &mut self,
+        ts_nanos: u64,
+        original_len: u32,
+        frame: &[u8],
+    ) -> Result<(), PcapError> {
         self.writer
             .write_all(&((ts_nanos / 1_000_000_000) as u32).to_le_bytes())?;
         self.writer
             .write_all(&((ts_nanos % 1_000_000_000) as u32).to_le_bytes())?;
         self.writer.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&(frame.len() as u32).to_le_bytes())?;
+        self.writer.write_all(&original_len.to_le_bytes())?;
         self.writer.write_all(frame)?;
         self.packets_written += 1;
         Ok(())
@@ -72,8 +77,9 @@ impl<W: Write> PcapWriter<W> {
         payload_len: u32,
     ) -> Result<(), PcapError> {
         let l4 = tcp_header(src_port, dst_port, tcp_flags);
+        let original_len = original_frame_len(src, dst, l4.len(), payload_len);
         let frame = build_frame(src, dst, 6, &l4, payload_len, self.max_written_payload);
-        self.write_record(ts_nanos, &frame)
+        self.write_record(ts_nanos, original_len, &frame)
     }
 
     /// Write a UDP packet with `payload_len` zero payload bytes.
@@ -87,9 +93,24 @@ impl<W: Write> PcapWriter<W> {
         payload_len: u32,
     ) -> Result<(), PcapError> {
         let l4 = udp_header(src_port, dst_port, payload_len as u16);
+        let original_len = original_frame_len(src, dst, l4.len(), payload_len);
         let frame = build_frame(src, dst, 17, &l4, payload_len, self.max_written_payload);
-        self.write_record(ts_nanos, &frame)
+        self.write_record(ts_nanos, original_len, &frame)
     }
+}
+
+fn original_frame_len(src: IpAddr, dst: IpAddr, l4_len: usize, payload_len: u32) -> u32 {
+    let requested_payload = usize::try_from(payload_len).unwrap_or(usize::MAX);
+    let len = match (src, dst) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => {
+            14 + 20 + l4_len + requested_payload.min(65_535usize.saturating_sub(20 + l4_len))
+        }
+        (IpAddr::V6(_), IpAddr::V6(_)) => {
+            14 + 40 + l4_len + requested_payload.min(65_535usize.saturating_sub(l4_len))
+        }
+        _ => 14 + 20 + l4_len,
+    };
+    len as u32
 }
 
 fn tcp_header(src_port: u16, dst_port: u16, flags: u8) -> Vec<u8> {

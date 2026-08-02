@@ -46,8 +46,10 @@ pub mod direction {
 /// Stable native-endian representation of one ring-buffer record.
 ///
 /// The kernel program must convert network-order ports to host order before
-/// emission. Field order deliberately avoids implicit padding; both the C and
-/// Rust definitions must remain exactly `EBPF_FLOW_EVENT_SIZE` bytes.
+/// emission. `ts_nanos` is `bpf_ktime_get_ns()` in the kernel monotonic clock
+/// domain, never Unix epoch time; userspace must normalize it before building
+/// a `FlowEvent`. Field order deliberately avoids implicit padding; both the C
+/// and Rust definitions must remain exactly `EBPF_FLOW_EVENT_SIZE` bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfFlowEvent {
@@ -123,12 +125,76 @@ pub enum EbpfError {
     UnsupportedIpVersion(u8),
     #[error("unsupported traffic direction {0}")]
     UnsupportedDirection(u8),
+    #[error("cannot sample Linux clocks: {0}")]
+    ClockSample(String),
+    #[error("eBPF monotonic timestamp {0} cannot be represented as Unix nanoseconds")]
+    TimestampOutOfRange(u64),
 }
 
-impl TryFrom<EbpfFlowEvent> for FlowEvent {
-    type Error = EbpfError;
+/// Conversion between `bpf_ktime_get_ns()` and Unix epoch nanoseconds. The
+/// offset is refreshed by userspace so wall-clock corrections do not leave a
+/// long-running collector permanently skewed.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelClockConverter {
+    realtime_minus_monotonic: i128,
+}
 
-    fn try_from(event: EbpfFlowEvent) -> Result<Self, Self::Error> {
+impl KernelClockConverter {
+    pub fn from_samples(monotonic_nanos: u64, realtime_nanos: u64) -> Self {
+        Self {
+            realtime_minus_monotonic: i128::from(realtime_nanos) - i128::from(monotonic_nanos),
+        }
+    }
+
+    pub fn to_unix_nanos(self, monotonic_nanos: u64) -> Result<u64, EbpfError> {
+        let unix = i128::from(monotonic_nanos) + self.realtime_minus_monotonic;
+        u64::try_from(unix).map_err(|_| EbpfError::TimestampOutOfRange(monotonic_nanos))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn sample() -> Result<Self, EbpfError> {
+        let before = clock_nanos(libc::CLOCK_MONOTONIC)?;
+        let realtime = clock_nanos(libc::CLOCK_REALTIME)?;
+        let after = clock_nanos(libc::CLOCK_MONOTONIC)?;
+        let midpoint = before.saturating_add(after.saturating_sub(before) / 2);
+        Ok(Self::from_samples(midpoint, realtime))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clock_nanos(clock: libc::clockid_t) -> Result<u64, EbpfError> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime initializes the provided timespec on success.
+    if unsafe { libc::clock_gettime(clock, &mut value) } != 0 {
+        return Err(EbpfError::ClockSample(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    if value.tv_sec < 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        return Err(EbpfError::ClockSample(format!(
+            "clock {clock} returned invalid timespec {}.{:09}",
+            value.tv_sec, value.tv_nsec
+        )));
+    }
+    let seconds = u64::try_from(value.tv_sec)
+        .map_err(|_| EbpfError::ClockSample("negative clock seconds".into()))?;
+    let nanos = u64::try_from(value.tv_nsec)
+        .map_err(|_| EbpfError::ClockSample("negative clock nanoseconds".into()))?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|base| base.checked_add(nanos))
+        .ok_or_else(|| EbpfError::ClockSample("clock nanoseconds overflow u64".into()))
+}
+
+impl EbpfFlowEvent {
+    /// Validate this kernel record and build a `FlowEvent` with a timestamp
+    /// already normalized to Unix epoch nanoseconds.
+    pub fn try_into_flow_event(self, unix_ts_nanos: u64) -> Result<FlowEvent, EbpfError> {
+        let event = self;
+
         let src_ip = match event.ip_version {
             4 => std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 event.src_ip[12],
@@ -156,7 +222,7 @@ impl TryFrom<EbpfFlowEvent> for FlowEvent {
             other => return Err(EbpfError::UnsupportedDirection(other)),
         };
         Ok(FlowEvent {
-            ts_nanos: event.ts_nanos,
+            ts_nanos: unix_ts_nanos,
             src_ip,
             dst_ip,
             src_port: event.src_port,
@@ -195,12 +261,13 @@ mod tests {
             tcp_flags: 0x12,
             direction: direction::INGRESS,
         };
-        let flow = FlowEvent::try_from(ev).unwrap();
+        let flow = ev.try_into_flow_event(1_700_000_000_000_000_000).unwrap();
         assert_eq!(flow.src_ip.to_string(), "10.0.0.1");
         assert_eq!(flow.dst_ip.to_string(), "10.0.0.2");
         assert_eq!(flow.dst_port, 443);
         assert_eq!(flow.interface_index, 2);
         assert_eq!(flow.direction, Direction::Ingress);
+        assert_eq!(flow.ts_nanos, 1_700_000_000_000_000_000);
     }
 
     #[test]
@@ -218,7 +285,32 @@ mod tests {
             tcp_flags: 0,
             direction: direction::UNKNOWN,
         };
-        assert!(FlowEvent::try_from(ev).is_err());
+        assert!(ev.try_into_flow_event(1).is_err());
+    }
+
+    #[test]
+    fn monotonic_clock_conversion_produces_epoch_time() {
+        let converter =
+            KernelClockConverter::from_samples(5_000_000_000, 1_700_000_000_000_000_000);
+        assert_eq!(
+            converter.to_unix_nanos(6_000_000_000).unwrap(),
+            1_700_000_001_000_000_000
+        );
+        let underflow = KernelClockConverter::from_samples(10, 0);
+        assert!(matches!(
+            underflow.to_unix_nanos(0),
+            Err(EbpfError::TimestampOutOfRange(0))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sampled_clock_conversion_is_contemporary() {
+        let converter = KernelClockConverter::sample().unwrap();
+        let monotonic = clock_nanos(libc::CLOCK_MONOTONIC).unwrap();
+        let converted = converter.to_unix_nanos(monotonic).unwrap();
+        let realtime = clock_nanos(libc::CLOCK_REALTIME).unwrap();
+        assert!(converted.abs_diff(realtime) < 1_000_000_000);
     }
 
     #[test]
@@ -271,7 +363,7 @@ mod tests {
         encoded[55] = 99;
         let event = EbpfFlowEvent::decode_ne(&encoded).unwrap();
         assert!(matches!(
-            FlowEvent::try_from(event),
+            event.try_into_flow_event(1),
             Err(EbpfError::UnsupportedDirection(99))
         ));
     }

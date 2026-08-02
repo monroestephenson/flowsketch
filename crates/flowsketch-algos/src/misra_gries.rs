@@ -99,10 +99,11 @@ impl MisraGries {
     fn trim_to_capacity(&mut self) {
         while self.counters.len() > self.capacity {
             let excess = self.counters.len() - self.capacity;
-            // Remove the `excess+1`-th smallest count from everything.
+            // Remove at least `excess` counters by subtracting the
+            // `excess`-th smallest count from everything.
             let mut counts: Vec<u64> = self.counters.values().copied().collect();
             counts.sort_unstable();
-            let dec = counts[excess];
+            let dec = counts[excess - 1];
             self.counters.retain(|_, c| {
                 let d = (*c).min(dec);
                 *c -= d;
@@ -285,6 +286,28 @@ mod tests {
             let k = String::from_utf8(key).unwrap();
             assert!(c <= exact[&k], "{k}: merged count exceeds truth");
         }
+    }
+
+    #[test]
+    fn merge_trim_does_not_discard_an_extra_counter() {
+        let hash = HashSpec::new(1);
+        let mut a = MisraGries::new(4, hash).unwrap();
+        for (key, count) in [(b"a", 1), (b"b", 2), (b"c", 3), (b"d", 4)] {
+            a.counters.insert(key.to_vec(), count);
+            a.total_weight += count;
+        }
+        let mut b = MisraGries::new(4, hash).unwrap();
+        b.counters.insert(b"e".to_vec(), 100);
+        b.total_weight = 100;
+
+        a.merge_from(&b).unwrap();
+
+        assert_eq!(a.len(), 4);
+        assert_eq!(a.get(b"a"), None);
+        assert_eq!(a.get(b"b"), Some(1));
+        assert_eq!(a.get(b"c"), Some(2));
+        assert_eq!(a.get(b"d"), Some(3));
+        assert_eq!(a.get(b"e"), Some(99));
     }
 
     #[test]

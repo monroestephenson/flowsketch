@@ -3,7 +3,8 @@
 //!
 //! Error model: point estimates never underestimate; with width `w` and
 //! depth `d`, the overestimate exceeds `(e / w) * N` (N = total weight) with
-//! probability at most `e^-d`. Optional conservative update reduces
+//! probability at most `e^-d` under the seeded, domain-separated row-hash
+//! model. Optional conservative update reduces
 //! overestimation for skewed streams at the cost of losing linearity
 //! (conservative sketches still merge, but merged estimates may be slightly
 //! larger than a single-node sketch over the same stream).
@@ -15,6 +16,9 @@ use flowsketch_core::snapshot::{
 use flowsketch_core::{Sketch, SketchCompatibility, SketchError};
 
 pub const ALGORITHM: &str = "count-min";
+/// Conservative confidence floor for the finite base digest used to derive
+/// row hashes. More rows cannot honestly claim failure below this value.
+pub const HASH_FAILURE_FLOOR: f64 = 1.0 / 18_446_744_073_709_551_616.0;
 
 #[derive(Debug, Clone)]
 pub struct CountMinSketch {
@@ -68,8 +72,13 @@ impl CountMinSketch {
                 "epsilon and delta must be in (0, 1)".into(),
             ));
         }
+        if delta <= HASH_FAILURE_FLOOR {
+            return Err(SketchError::InvalidParam(format!(
+                "count-min delta must exceed the fsk1 hash confidence floor {HASH_FAILURE_FLOOR}"
+            )));
+        }
         let width = (std::f64::consts::E / epsilon).ceil() as usize;
-        let depth = (1.0 / delta).ln().ceil().max(1.0) as usize;
+        let depth = (1.0 / (delta - HASH_FAILURE_FLOOR)).ln().ceil().max(1.0) as usize;
         Ok((width, depth))
     }
 
@@ -88,7 +97,9 @@ impl CountMinSketch {
         std::f64::consts::E / self.width as f64
     }
     pub fn delta(&self) -> f64 {
-        (-(self.depth as f64)).exp()
+        // A 64-bit base-digest collision aliases every row, so confidence
+        // cannot honestly exceed that floor even as depth grows.
+        (-(self.depth as f64)).exp() + HASH_FAILURE_FLOOR
     }
     pub fn total_weight(&self) -> u64 {
         self.total_weight
@@ -398,7 +409,41 @@ mod tests {
                 violations += 1;
             }
         }
-        // Expected violation rate <= delta (1%); allow slack for test stability.
-        assert!(violations as f64 <= n_keys as f64 * 0.05);
+        let allowed = (n_keys as f64 * s.delta()).ceil() as usize;
+        assert!(
+            violations <= allowed,
+            "{violations} violations exceed delta-derived allowance {allowed}"
+        );
+    }
+
+    #[test]
+    fn nonlinear_rows_break_double_hash_signature_aliases() {
+        let hash = HashSpec::new(0xC0FFEE);
+        let width = 128usize;
+        let depth = 32usize;
+        let heavy = b"elephant";
+        let legacy_signature = |key: &[u8]| {
+            let h1 = flowsketch_core::hash::hash64(key, hash.seed);
+            let h2 = flowsketch_core::hash::hash64(key, hash.seed ^ 0xA5A5_A5A5_5A5A_5A5A) | 1;
+            (h1 % width as u64, h2 % width as u64)
+        };
+        let heavy_signature = legacy_signature(heavy);
+        let alias = (0..200_000u32)
+            .map(|index| format!("candidate-{index}"))
+            .find(|candidate| legacy_signature(candidate.as_bytes()) == heavy_signature)
+            .expect("deterministic search did not find a legacy double-hash alias");
+
+        // Under h1 + row*h2, matching this two-number signature aliases all
+        // 32 rows, so one heavy key violates the advertised e^-32 bound for
+        // the light key. The v2 nonlinear domain separation must break it.
+        let mut sketch = CountMinSketch::new(width, depth, false, hash).unwrap();
+        sketch.update(heavy, 1_000_000);
+        sketch.update(alias.as_bytes(), 1);
+        let estimate = sketch.estimate_u64(alias.as_bytes());
+        let slack = (sketch.epsilon() * sketch.total_weight() as f64).ceil() as u64;
+        assert!(
+            estimate <= 1 + slack,
+            "legacy signature alias still violates the bound: estimate={estimate}, slack={slack}"
+        );
     }
 }
