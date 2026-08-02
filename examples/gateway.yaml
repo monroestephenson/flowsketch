@@ -17,6 +17,7 @@ gateway:
   seed: 0            # must match agent.seed on every pushing agent
   staleAfterMs: 300000  # forget nodes that stop pushing for 5 minutes
   maxNodes: 128       # hard bound on retained live node identities
+  maxRetainedSketchBytes: 402653184  # hard retained sketch-state budget
 queries:
   - file: queries/top-talkers.yaml
   - file: queries/suspected-scanners.yaml

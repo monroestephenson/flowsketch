@@ -13,16 +13,14 @@
 //! | `heavy_hitters(v) by G`            | SpaceSaving                       |
 //! | `distinct_count(f) by G`           | HLLMap                            |
 //! | `distinct_count(f)` (no group)     | HyperLogLog                       |
-//! | `entropy`, `quantile`              | rejected (not in v0)              |
+//! | `entropy(f)` (no group)            | SpaceSaving + HyperLogLog         |
+//! | `quantile(f)` (no group)           | KLL                               |
 
 use thiserror::Error;
 
 use flowsketch_core::hash::HashSpec;
 use flowsketch_ir::logical::{humanize_nanos, LogicalQuery, Measure};
 use flowsketch_ir::physical::PhysicalSketch;
-
-/// Assumed average encoded group-key size for memory estimation.
-const AVG_KEY_BYTES: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -69,6 +67,9 @@ pub struct PhysicalPlan {
     /// Estimated resident memory across open buckets, bounded completed
     /// windows, and one transient merge scratch copy.
     pub estimated_memory_bytes: u64,
+    /// Estimated memory of one mergeable window state. The estimate uses
+    /// worst-case canonical key lengths, not traffic averages.
+    pub estimated_state_memory_bytes: u64,
     /// Upper bound on exported series per flush.
     pub export_series_upper_bound: usize,
     pub error_kind: ErrorKind,
@@ -92,6 +93,7 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
     let pending_window_capacity = buckets;
     let resident_sketches = buckets as u64 + pending_window_capacity as u64 + 1;
     let max_series = query.export.max_series;
+    let key_bytes = maximum_stored_key_bytes(&query);
 
     let reject = |reason: String| PlanError::Rejected {
         name: query.name.clone(),
@@ -198,7 +200,7 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
                 // output, and merge scratch. This keeps the useful default
                 // query executable without pretending pending output is free.
                 let per_key_bytes = (1u64 << precision)
-                    + 2 * AVG_KEY_BYTES as u64
+                    + 2 * key_bytes as u64
                     + 48 // HashMap entry/allocation allowance
                     + 32; // deterministic eviction-heap entry
                 let per_sketch_budget = query.max_memory_bytes / resident_sketches;
@@ -306,7 +308,7 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
     // the operation is lossless, then require the consumer to drain before
     // accepting more output. Account for open buckets, pending states, and
     // one transient scratch copy used while merging a window.
-    let per_bucket = sketch.estimated_memory_bytes(AVG_KEY_BYTES);
+    let per_bucket = sketch.estimated_memory_bytes(key_bytes);
     let estimated_memory_bytes = per_bucket * resident_sketches;
     if estimated_memory_bytes > query.max_memory_bytes {
         return Err(reject(format!(
@@ -338,12 +340,29 @@ pub fn plan(query: LogicalQuery, hash: &HashSpec) -> Result<Plan, PlanError> {
             window_buckets: buckets,
             pending_window_capacity,
             estimated_memory_bytes,
+            estimated_state_memory_bytes: per_bucket,
             export_series_upper_bound: series_bound,
             error_kind,
             error_contract,
             warnings,
         },
     })
+}
+
+fn maximum_stored_key_bytes(query: &LogicalQuery) -> usize {
+    let fields: &[flowsketch_core::Field] = match &query.measure {
+        Measure::Entropy { field } => std::slice::from_ref(field),
+        Measure::Quantile { .. } => &[],
+        Measure::DistinctCount { .. }
+        | Measure::Count
+        | Measure::Sum { .. }
+        | Measure::HeavyHitters { .. } => &query.group_by,
+    };
+    fields
+        .iter()
+        .map(|field| field.max_encoded_len())
+        .sum::<usize>()
+        .saturating_add(fields.len().saturating_sub(1))
 }
 
 fn count_min_dimensions(epsilon: f64, delta: f64) -> Result<(usize, usize), String> {
@@ -460,6 +479,10 @@ pub fn explain(plan: &Plan) -> String {
         "  estimated memory: {} (budget {})\n",
         format_bytes(p.estimated_memory_bytes),
         format_bytes(q.max_memory_bytes)
+    ));
+    out.push_str(&format!(
+        "  mergeable state:  {}\n",
+        format_bytes(p.estimated_state_memory_bytes)
     ));
     out.push_str(&format!(
         "  export series upper bound: {}\n",

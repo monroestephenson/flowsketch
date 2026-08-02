@@ -205,6 +205,38 @@
           "legendFormat": "sketch memory",
           "range": false,
           "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(flowsketch_agent_sketch_memory_capacity_bytes{flowsketch_release=~\"${release:regex}\",instance=~\"${instance:regex}\"})",
+          "instant": true,
+          "legendFormat": "sketch ceiling",
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(flowsketch_gateway_retained_sketch_bytes{flowsketch_release=~\"${release:regex}\"})",
+          "instant": true,
+          "legendFormat": "gateway retained",
+          "range": false,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(flowsketch_gateway_retained_sketch_capacity_bytes{flowsketch_release=~\"${release:regex}\"})",
+          "instant": true,
+          "legendFormat": "gateway ceiling",
+          "range": false,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(flowsketch_gateway_merge_cache_sketch_bytes{flowsketch_release=~\"${release:regex}\"})",
+          "instant": true,
+          "legendFormat": "gateway merge cache",
+          "range": false,
+          "refId": "E"
         }
       ],
       "title": "Sketch memory",
@@ -907,6 +939,13 @@
           "legendFormat": "rejected snapshots",
           "range": true,
           "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(flowsketch_gateway_sketch_budget_rejections_total{flowsketch_release=~\"${release:regex}\"}[$__rate_interval]))",
+          "legendFormat": "sketch-budget rejects",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "Gateway push outcomes",

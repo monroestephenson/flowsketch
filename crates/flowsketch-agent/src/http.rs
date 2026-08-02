@@ -113,10 +113,14 @@ fn route(method: &str, path: &str, state: &PublishedState) -> (u16, &'static str
         "/readyz" => {
             if state.source_error.lock().unwrap().is_some() {
                 (503, "text/plain", "capture source failed\n".into())
-            } else if state.ready.load(Ordering::Acquire) {
+            } else if state.ready.load(Ordering::Acquire)
+                && state.capture_ready.load(Ordering::Acquire)
+            {
                 (200, "text/plain", "ready\n".into())
+            } else if !state.capture_ready.load(Ordering::Acquire) {
+                (503, "text/plain", "capture source starting\n".into())
             } else {
-                (503, "text/plain", "starting\n".into())
+                (503, "text/plain", "runtime starting\n".into())
             }
         }
         "/metrics" => {
@@ -137,6 +141,7 @@ fn route(method: &str, path: &str, state: &PublishedState) -> (u16, &'static str
                         "errorKind": q.error_kind,
                         "errorContract": q.error_contract,
                         "estimatedMemoryBytes": q.estimated_memory_bytes,
+                        "estimatedStateMemoryBytes": q.estimated_state_memory_bytes,
                         "maxSeries": q.max_series,
                     })
                 })
@@ -265,10 +270,12 @@ mod tests {
     }
 
     #[test]
-    fn readiness_fails_after_capture_source_error() {
-        let state = PublishedState::new(&[], 1, None, 0);
+    fn readiness_requires_runtime_and_capture_then_fails_after_source_error() {
+        let state = PublishedState::new(&[], 1, 1024 * 1024, None, 0);
         assert_eq!(route("GET", "/readyz", &state).0, 503);
         state.ready.store(true, Ordering::Release);
+        assert_eq!(route("GET", "/readyz", &state).0, 503);
+        state.capture_ready.store(true, Ordering::Release);
         assert_eq!(route("GET", "/readyz", &state).0, 200);
         *state.source_error.lock().unwrap() = Some("attach failed".into());
         assert_eq!(route("GET", "/readyz", &state).0, 503);

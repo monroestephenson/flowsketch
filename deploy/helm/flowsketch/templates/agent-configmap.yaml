@@ -10,21 +10,22 @@ data:
   agent.yaml.template: |
     agent:
       nodeName: ${NODE_NAME}
-      listen: 0.0.0.0:{{ .Values.agent.listenPort }}
-      seed: {{ .Values.agent.seed }}
-      flushIntervalMs: {{ .Values.agent.flushIntervalMs }}
-      runtimeShards: {{ .Values.agent.runtimeShards }}
-      runtimeBatchSize: {{ .Values.agent.runtimeBatchSize }}
+      listen: 0.0.0.0:{{ int64 .Values.agent.listenPort }}
+      seed: {{ int64 .Values.agent.seed }}
+      flushIntervalMs: {{ int64 .Values.agent.flushIntervalMs }}
+      runtimeShards: {{ int64 .Values.agent.runtimeShards }}
+      runtimeBatchSize: {{ int64 .Values.agent.runtimeBatchSize }}
+      maxSketchMemoryBytes: {{ int64 .Values.agent.maxSketchMemoryBytes }}
       runtimeShardStrategy: {{ .Values.agent.runtimeShardStrategy }}
       {{- if .Values.agent.cpuAffinity.enabled }}
       cpuAffinity:
         captureCpus:
           {{- range .Values.agent.cpuAffinity.captureCpus }}
-          - {{ . }}
+          - {{ int64 . }}
           {{- end }}
         runtimeCpus:
           {{- range .Values.agent.cpuAffinity.runtimeCpus }}
-          - {{ . }}
+          - {{ int64 . }}
           {{- end }}
       {{- end }}
       source:
@@ -32,14 +33,14 @@ data:
         interface: {{ .Values.agent.interface }}
         {{- if eq .Values.agent.source "ebpf" }}
         objectPath: {{ .Values.agent.ebpf.objectPath }}
-        ringBufferBytes: {{ .Values.agent.ebpf.ringBufferBytes }}
+        ringBufferBytes: {{ int64 .Values.agent.ebpf.ringBufferBytes }}
         fallbackToAfPacket: {{ .Values.agent.ebpf.fallbackToAfPacket }}
         {{- else }}
-        ringBlockSizeBytes: {{ .Values.agent.ringBlockSizeBytes }}
-        ringBlockCount: {{ .Values.agent.ringBlockCount }}
-        blockRetireTimeoutMs: {{ .Values.agent.blockRetireTimeoutMs }}
+        ringBlockSizeBytes: {{ int64 .Values.agent.ringBlockSizeBytes }}
+        ringBlockCount: {{ int64 .Values.agent.ringBlockCount }}
+        blockRetireTimeoutMs: {{ int64 .Values.agent.blockRetireTimeoutMs }}
         fanoutMode: {{ .Values.agent.fanoutMode }}
-        fanoutGroup: {{ .Values.agent.fanoutGroup }}
+        fanoutGroup: {{ int64 .Values.agent.fanoutGroup }}
         {{- end }}
     queries:
       {{- range $name, $_ := .Values.queries }}
@@ -50,12 +51,12 @@ data:
       {{- if and .Values.gateway.enabled .Values.agent.gatewayPush.enabled }}
       gateway:
         endpoint: http://{{ include "flowsketch.fullname" . }}-gateway:{{ .Values.gateway.listenPort }}
-        intervalMs: {{ .Values.agent.gatewayPush.intervalMs }}
+        intervalMs: {{ int64 .Values.agent.gatewayPush.intervalMs }}
       {{- end }}
       {{- if .Values.agent.otlp.enabled }}
       otlp:
         endpoint: {{ required "agent.otlp.endpoint is required when OTLP is enabled" .Values.agent.otlp.endpoint }}
-        intervalMs: {{ .Values.agent.otlp.intervalMs }}
+        intervalMs: {{ int64 .Values.agent.otlp.intervalMs }}
       {{- end }}
     {{- end }}
   start-agent.sh: |

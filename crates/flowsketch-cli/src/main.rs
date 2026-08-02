@@ -241,9 +241,10 @@ fn main() -> Result<()> {
             let cfg = flowsketch_agent::AgentConfig::from_file(&config)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             eprintln!(
-                "flowsketch agent starting: node={} queries={} source={:?}",
+                "flowsketch agent starting: node={} queries={} maxSketchMemoryBytes={} source={:?}",
                 cfg.node_name,
                 cfg.query_files.len(),
+                cfg.max_sketch_memory_bytes,
                 cfg.source
             );
             let shutdown = install_shutdown_flag()?;
@@ -256,9 +257,12 @@ fn main() -> Result<()> {
             let cfg = flowsketch_gateway::GatewayConfig::from_file(&config)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             eprintln!(
-                "flowsketch gateway starting: queries={} staleAfterMs={}",
+                "flowsketch gateway starting: queries={} staleAfterMs={} maxNodes={} \
+                 maxRetainedSketchBytes={}",
                 cfg.query_files.len(),
-                cfg.stale_after_ms
+                cfg.stale_after_ms,
+                cfg.max_nodes,
+                cfg.max_retained_sketch_bytes
             );
             let shutdown = install_shutdown_flag()?;
             let result = flowsketch_gateway::run_until(cfg, Arc::clone(&shutdown), |addr| {

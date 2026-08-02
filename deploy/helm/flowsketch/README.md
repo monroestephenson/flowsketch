@@ -28,6 +28,7 @@ agent:
   fanoutGroup: 0
   runtimeShards: 8
   runtimeBatchSize: 8192
+  maxSketchMemoryBytes: 1073741824
   runtimeShardStrategy: flow
   cpuAffinity:
     enabled: true
@@ -37,7 +38,10 @@ agent:
 
 `flow` preserves directional 5-tuple affinity. `round_robin` balances packets
 across mergeable sketch shards when elephant flows overload individual queues.
-Sketch memory grows approximately with `runtimeShards`.
+Sketch memory grows approximately with `runtimeShards`. At startup the agent
+sums every plan estimate across all shards and fails closed if it exceeds
+`maxSketchMemoryBytes`; keep that value below the pod memory limit with room
+for capture rings, event channels, exporters, and allocator overhead.
 CPU affinity is opt-in and fails closed if a requested logical CPU is outside
 the container's allowed cpuset. `runtimeCpus` must contain one unique CPU per
 runtime shard; `captureCpus` must contain one CPU per AF_PACKET fan-out lane
@@ -124,10 +128,12 @@ The current gateway keeps merge state in memory and is intentionally limited
 to one replica. Its Deployment uses `Recreate` to prevent split state during
 upgrades. Running agents repopulate compatible state after restart; CI verifies
 that behavior and verifies that incompatible state fails closed with
-`scripts/gateway-restart-smoke.sh`. `gateway.maxNodes` defaults to 128 and is a
-hard admission limit across all queries; size it against every query's planned
-state and alert on the retained/capacity gauges before raising it. Gateway HA
-requires a sharding or replicated-state design, not a larger replica count.
+`scripts/gateway-restart-smoke.sh`. `gateway.maxNodes` defaults to 128, while
+`gateway.maxRetainedSketchBytes` defaults to 384 MiB and rejects a valid state
+before retaining it would cross that byte ceiling. Size both below the pod
+limit with room for the fixed merge cache, bounded request bodies, and process
+overhead; alert on both retained/capacity pairs before raising either. Gateway
+HA requires a sharding or replicated-state design, not a larger replica count.
 
 ## HTTP trust boundary
 

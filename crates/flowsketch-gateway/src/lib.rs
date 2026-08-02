@@ -70,6 +70,7 @@ pub fn run_until(
         HashSpec::new(config.seed),
         config.stale_after(),
         config.max_nodes,
+        config.max_retained_sketch_bytes,
     ));
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|e| GatewayError::Http(format!("cannot bind {}: {e}", config.listen)))?;

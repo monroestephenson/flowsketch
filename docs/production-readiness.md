@@ -45,6 +45,8 @@ the items below as the gate to broad production rollout.
   - `flowsketch_agent_kernel_queue_freezes_total`
   - `flowsketch_agent_dropped_events_total`
   - `flowsketch_agent_late_events_total`
+  - `flowsketch_agent_capture_ready`
+  - `flowsketch_agent_ready`
   - `flowsketch_agent_af_packet_queue_local_handoff`
   - `flowsketch_agent_af_packet_lane_channel_capacity`
   - gateway rejected snapshots, node admission/body-budget rejections,
@@ -109,6 +111,9 @@ validation of CPU affinity and queue placement, and zero unexplained drops.
   Grafana sidecar ConfigMap, then route every bundled alert to the procedures
   in `docs/runbook.md`.
 - Tune resource requests/limits from benchmark data.
+- Set `agent.maxSketchMemoryBytes` below the agent pod limit with headroom for
+  capture rings and queues; set `gateway.maxRetainedSketchBytes` below the
+  gateway pod limit with headroom for merge caches and bounded upload buffers.
 - Consider node selectors/tolerations for high-throughput nodes.
 
 ## Security

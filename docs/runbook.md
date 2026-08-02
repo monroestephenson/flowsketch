@@ -177,7 +177,9 @@ granted.
 Read both `/healthz` and `/readyz` and inspect the agent log. Common causes are
 an absent/renamed interface, missing capability, invalid CPU affinity, eBPF
 verification or attachment failure, and a capture thread that failed after
-startup. Compare the pod's node, interface, cpuset, kernel, and config with a
+startup. `flowsketch_agent_capture_ready == 0` distinguishes a source that has
+not finished opening, binding, or attaching from a runtime that is still
+starting. Compare the pod's node, interface, cpuset, kernel, and config with a
 healthy node. A restart without fixing the source is not remediation.
 
 ### FlowSketchLateEvents
@@ -206,6 +208,17 @@ FlowSketch intentionally accepts only plain `http://` OTLP endpoints; the
 supported trust boundary is a local collector that applies TLS and credentials
 on outward traffic.
 
+### FlowSketchAgentSketchMemoryHigh
+
+Compare `flowsketch_agent_sketch_memory_bytes` with
+`flowsketch_agent_sketch_memory_capacity_bytes`, then inspect each query's
+`flowsketch explain` output and the configured shard count. Startup already
+rejects an aggregate planner estimate above `agent.maxSketchMemoryBytes`; a
+high live ratio means there is little modeling or allocator headroom. Reduce
+query retention/accuracy or shards before raising the ceiling, and preserve
+separate room under the pod limit for capture rings, event queues, exporters,
+and process overhead.
+
 ### FlowSketchGatewayPushFailures
 
 Check gateway readiness, service endpoints, DNS, and NetworkPolicy/CNI behavior
@@ -231,6 +244,17 @@ all queries. Confirm that node names are stable and unique, then compare
 agent identity configuration problem. Increase `maxNodes` only after sizing
 the planner-bounded state for every configured query at the larger node count;
 stale identities leave automatically after `staleAfterMs`.
+
+### FlowSketchGatewaySketchBudgetRejected / SketchMemoryHigh
+
+Compare `flowsketch_gateway_retained_sketch_bytes` with
+`flowsketch_gateway_retained_sketch_capacity_bytes` and inspect `/v1/nodes`
+for the largest query/node states. The gateway rejects a valid incoming state
+before retention would cross `gateway.maxRetainedSketchBytes`; it does not
+evict a healthy node to make room for a newer identity. Check unexpected node
+churn and query-plan growth first. Raise the byte ceiling only with headroom
+under the pod limit for the fixed merge cache, up to 128 MiB of admitted raw
+request bodies, decoded request state, and normal process overhead.
 
 ### FlowSketchGatewayBodyBudgetExhausted
 
@@ -305,7 +329,8 @@ not in the gateway.
 3. Run `scripts/validate-deploy.sh`, the workspace tests, the gateway restart
    smoke, and the applicable Linux capture gates against the candidate.
 4. Render the exact production values with `helm template` and review
-   capabilities, host networking, interface, CPUs, ring sizes, resources,
+   capabilities, host networking, interface, CPUs, ring sizes, aggregate
+   sketch budgets, resources,
    monitoring selectors, NetworkPolicy, image tag, seed, and queries.
 5. Qualify the candidate on a dedicated node class or staging release before
    the fleet. A separate canary must use non-conflicting host ports, fan-out

@@ -34,7 +34,7 @@ pub const MAX_ENTRIES: usize = 4_096;
 pub const MAX_NODE_NAME_BYTES: usize = 253;
 /// Query and component identifiers come from local plans and are never
 /// expected to be remotely supplied blobs.
-pub const MAX_QUERY_NAME_BYTES: usize = 256;
+pub use flowsketch_ir::MAX_QUERY_NAME_BYTES;
 pub const MAX_COMPONENT_NAME_BYTES: usize = 128;
 
 /// One component snapshot inside a push batch.

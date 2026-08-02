@@ -8,6 +8,7 @@
 //!   flushIntervalMs: 1000
 //!   runtimeShards: 4
 //!   runtimeBatchSize: 4096
+//!   maxSketchMemoryBytes: 1073741824
 //!   cpuAffinity:              # optional, Linux only
 //!     captureCpus: [0]
 //!     runtimeCpus: [1, 2, 3, 4]
@@ -24,6 +25,7 @@
 //!   - file: examples/queries/top-talkers.yaml
 //! ```
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -188,6 +190,9 @@ const MIN_EBPF_RING_BYTES: u32 = 64 * 1024;
 const MAX_EBPF_RING_BYTES: u32 = 1024 * 1024 * 1024;
 const MAX_LINUX_CPU_ID: usize = 1023;
 const MAX_LINUX_INTERFACE_NAME_BYTES: usize = 15;
+pub const DEFAULT_MAX_SKETCH_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_MAX_SKETCH_MEMORY_BYTES: u64 = 1024 * 1024;
+const MAX_MAX_SKETCH_MEMORY_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 pub(crate) const fn default_ring_block_size_bytes() -> u32 {
     1024 * 1024
@@ -215,6 +220,10 @@ pub struct AgentConfig {
     pub runtime_shards: usize,
     /// Maximum events dispatched to the runtime worker pool at once.
     pub runtime_batch_size: usize,
+    /// Hard preflight ceiling for the aggregate planner estimate across all
+    /// queries and runtime shards. Capture rings and event channels are
+    /// configured and bounded separately.
+    pub max_sketch_memory_bytes: u64,
     pub runtime_shard_strategy: RuntimeShardStrategy,
     pub cpu_affinity: Option<CpuAffinityConfig>,
     pub source: SourceConfig,
@@ -259,6 +268,18 @@ impl AgentConfig {
             return Err(AgentError::Config(
                 "agent.runtimeBatchSize must be between 1 and 65536".into(),
             ));
+        }
+        let max_sketch_memory_bytes = raw
+            .agent
+            .max_sketch_memory_bytes
+            .unwrap_or(DEFAULT_MAX_SKETCH_MEMORY_BYTES);
+        if !(MIN_MAX_SKETCH_MEMORY_BYTES..=MAX_MAX_SKETCH_MEMORY_BYTES)
+            .contains(&max_sketch_memory_bytes)
+        {
+            return Err(AgentError::Config(format!(
+                "agent.maxSketchMemoryBytes must be between {MIN_MAX_SKETCH_MEMORY_BYTES} and \
+                 {MAX_MAX_SKETCH_MEMORY_BYTES}"
+            )));
         }
         let runtime_shard_strategy = raw
             .agent
@@ -319,6 +340,7 @@ impl AgentConfig {
             flush_interval_ms: raw.agent.flush_interval_ms.unwrap_or(1_000).max(10),
             runtime_shards,
             runtime_batch_size,
+            max_sketch_memory_bytes,
             runtime_shard_strategy,
             cpu_affinity,
             source: raw.agent.source,
@@ -364,6 +386,7 @@ impl AgentConfig {
     pub fn load_plans(&self) -> Result<Vec<Plan>, AgentError> {
         let hash = HashSpec::new(self.seed);
         let mut plans = Vec::with_capacity(self.query_files.len());
+        let mut names = BTreeSet::new();
         for file in &self.query_files {
             let yaml = std::fs::read_to_string(file)
                 .map_err(|e| AgentError::Config(format!("cannot read {}: {e}", file.display())))?;
@@ -371,7 +394,31 @@ impl AgentConfig {
                 .map_err(|e| AgentError::Config(format!("{}: {e}", file.display())))?;
             let planned = plan(query, &hash)
                 .map_err(|e| AgentError::Config(format!("{}: {e}", file.display())))?;
+            if !names.insert(planned.query.name.clone()) {
+                return Err(AgentError::Config(format!(
+                    "duplicate query name {:?}; every configured query name must be unique",
+                    planned.query.name
+                )));
+            }
             plans.push(planned);
+        }
+        let per_shard_bytes = plans.iter().try_fold(0u64, |total, planned| {
+            total.checked_add(planned.physical.estimated_memory_bytes)
+        });
+        let aggregate_bytes = per_shard_bytes
+            .and_then(|bytes| bytes.checked_mul(self.runtime_shards as u64))
+            .ok_or_else(|| {
+                AgentError::Config(
+                    "aggregate planned sketch memory overflows the supported byte range".into(),
+                )
+            })?;
+        if aggregate_bytes > self.max_sketch_memory_bytes {
+            return Err(AgentError::Config(format!(
+                "aggregate planned sketch memory is {aggregate_bytes} bytes across {} runtime \
+                 shard(s), exceeding agent.maxSketchMemoryBytes={}; reduce queries or shards, \
+                 loosen query accuracy, or raise the process budget",
+                self.runtime_shards, self.max_sketch_memory_bytes
+            )));
         }
         Ok(plans)
     }
@@ -584,6 +631,12 @@ struct RawAgent {
     runtime_batch_size: Option<usize>,
     #[serde(
         default,
+        rename = "maxSketchMemoryBytes",
+        alias = "max_sketch_memory_bytes"
+    )]
+    max_sketch_memory_bytes: Option<u64>,
+    #[serde(
+        default,
         rename = "runtimeShardStrategy",
         alias = "runtime_shard_strategy"
     )]
@@ -614,6 +667,7 @@ agent:
   flushIntervalMs: 250
   runtimeShards: 4
   runtimeBatchSize: 8192
+  maxSketchMemoryBytes: 2147483648
   runtimeShardStrategy: round_robin
   cpuAffinity:
     captureCpus: [0]
@@ -632,6 +686,7 @@ queries:
         assert_eq!(cfg.flush_interval_ms, 250);
         assert_eq!(cfg.runtime_shards, 4);
         assert_eq!(cfg.runtime_batch_size, 8192);
+        assert_eq!(cfg.max_sketch_memory_bytes, 2_147_483_648);
         assert_eq!(cfg.runtime_shard_strategy, RuntimeShardStrategy::RoundRobin);
         assert_eq!(
             cfg.cpu_affinity,
@@ -672,6 +727,7 @@ queries:
         assert_eq!(cfg.listen, "127.0.0.1:9464");
         assert_eq!(cfg.runtime_shards, 1);
         assert_eq!(cfg.runtime_batch_size, 4096);
+        assert_eq!(cfg.max_sketch_memory_bytes, DEFAULT_MAX_SKETCH_MEMORY_BYTES);
         assert_eq!(cfg.runtime_shard_strategy, RuntimeShardStrategy::Flow);
         assert!(cfg.cpu_affinity.is_none());
     }
@@ -882,5 +938,51 @@ queries:
             "agent:\n  runtimeBatchSize: 65537\n  source: {kind: pcap, path: x.pcap}\nqueries:\n  - file: q.yaml\n"
         )
         .is_err());
+        for bytes in [
+            MIN_MAX_SKETCH_MEMORY_BYTES - 1,
+            MAX_MAX_SKETCH_MEMORY_BYTES + 1,
+        ] {
+            let yaml = format!(
+                "agent:\n  maxSketchMemoryBytes: {bytes}\n  source: {{kind: pcap, path: x.pcap}}\nqueries:\n  - file: q.yaml\n"
+            );
+            assert!(AgentConfig::from_yaml(&yaml).is_err(), "accepted {bytes}");
+        }
+    }
+
+    #[test]
+    fn load_plans_rejects_duplicate_names_and_aggregate_memory_over_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "flowsketch-agent-plan-budget-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let query = dir.join("query.yaml");
+        std::fs::write(
+            &query,
+            "name: bounded\nwindow: {size: 60s, slide: 10s}\ngroupBy: [src.ip]\n\
+             measure: {type: heavy_hitters, value: bytes, limit: 100}\n\
+             resources: {maxMemory: 64MiB}\n",
+        )
+        .unwrap();
+
+        let duplicate = AgentConfig::from_yaml(&format!(
+            "agent:\n  source: {{kind: pcap, path: x.pcap}}\nqueries:\n  - file: '{}'\n  - file: '{}'\n",
+            query.display(),
+            query.display()
+        ))
+        .unwrap();
+        let error = duplicate.load_plans().unwrap_err().to_string();
+        assert!(error.contains("duplicate query name"), "{error}");
+
+        let over_budget = AgentConfig::from_yaml(&format!(
+            "agent:\n  runtimeShards: 2\n  maxSketchMemoryBytes: 1048576\n  source: {{kind: pcap, path: x.pcap}}\nqueries:\n  - file: '{}'\n",
+            query.display()
+        ))
+        .unwrap();
+        let error = over_budget.load_plans().unwrap_err().to_string();
+        assert!(error.contains("aggregate planned sketch memory"), "{error}");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

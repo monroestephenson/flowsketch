@@ -19,6 +19,8 @@ jq -e '
   and (.panels | length >= 10)
   and ([.panels[].targets[]?.expr] | any(contains("flowsketch_agent_kernel_dropped_packets_total")))
   and ([.panels[].targets[]?.expr] | any(contains("flowsketch_gateway_nodes_merged")))
+  and ([.panels[].targets[]?.expr] | any(contains("flowsketch_agent_sketch_memory_capacity_bytes")))
+  and ([.panels[].targets[]?.expr] | any(contains("flowsketch_gateway_retained_sketch_bytes")))
 ' "$CHART/dashboards/flowsketch-overview.json" >/dev/null
 
 kubectl kustomize "$ROOT/deploy/kubernetes" >"$TMP/kustomize.yaml"
@@ -59,6 +61,16 @@ grep -q 'runAsNonRoot: true' "$TMP/helm-default.yaml"
 grep -q 'allowPrivilegeEscalation: true' "$TMP/helm-default.yaml"
 grep -q '/usr/local/libexec/flowsketch-agent-afpacket' "$TMP/helm-default.yaml"
 grep -q 'add: \["NET_RAW"\]' "$TMP/helm-default.yaml"
+grep -q 'maxSketchMemoryBytes: 1073741824' "$TMP/helm-default.yaml"
+grep -q 'maxRetainedSketchBytes: 402653184' "$TMP/helm-default.yaml"
+test "$(grep -c 'memory: 2Gi' "$TMP/helm-default.yaml")" -ge 2
+grep -q 'ringBlockSizeBytes: 1048576' "$TMP/helm-default.yaml"
+grep -q 'ringBufferBytes: 16777216' "$TMP/helm-ebpf.yaml"
+if grep -E '^[[:space:]]+(seed|maxSketchMemoryBytes|maxRetainedSketchBytes|ringBlockSizeBytes|ringBufferBytes): [0-9.]+e[+-][0-9]+' \
+  "$TMP/helm-default.yaml" "$TMP/helm-ebpf.yaml"; then
+  echo "Helm rendered an integer config field in scientific notation" >&2
+  exit 1
+fi
 grep -q 'kind: ebpf' "$TMP/helm-ebpf.yaml"
 grep -q 'objectPath: /usr/lib/flowsketch/flowsketch_tc.bpf.o' "$TMP/helm-ebpf.yaml"
 grep -q 'add: \["BPF", "NET_ADMIN", "PERFMON"\]' "$TMP/helm-ebpf.yaml"
@@ -81,12 +93,18 @@ grep -q 'name: monitored-flowsketch-dashboard' "$TMP/helm-monitored.yaml"
 grep -q 'grafana_dashboard: "1"' "$TMP/helm-monitored.yaml"
 grep -q 'flowsketch-overview.json: |' "$TMP/helm-monitored.yaml"
 grep -q 'FlowSketchGatewayMergeGap' "$TMP/helm-monitored.yaml"
+grep -q 'FlowSketchAgentSketchMemoryHigh' "$TMP/helm-monitored.yaml"
+grep -q 'FlowSketchGatewaySketchBudgetRejected' "$TMP/helm-monitored.yaml"
+grep -q 'FlowSketchGatewaySketchMemoryHigh' "$TMP/helm-monitored.yaml"
 grep -q 'FlowSketchOtlpExportFailures' "$TMP/helm-monitored.yaml"
 grep -q 'kind: NetworkPolicy' "$TMP/helm-monitored.yaml"
 grep -q 'runAsNonRoot: true' "$TMP/kustomize.yaml"
 grep -q 'allowPrivilegeEscalation: true' "$TMP/kustomize.yaml"
 grep -q '/usr/local/libexec/flowsketch-agent-afpacket' "$TMP/kustomize.yaml"
 grep -q 'ghcr.io/monroestephenson/flowsketch:0.1.0' "$TMP/kustomize.yaml"
+grep -q 'maxSketchMemoryBytes: 1073741824' "$TMP/kustomize.yaml"
+grep -q 'maxRetainedSketchBytes: 402653184' "$TMP/kustomize.yaml"
+test "$(grep -c 'memory: 2Gi' "$TMP/kustomize.yaml")" -ge 2
 grep -q 'kind: PodMonitor' "$TMP/monitoring.yaml"
 grep -q 'FlowSketchPacketDrops' "$TMP/monitoring.yaml"
 grep -q 'FlowSketchGatewayMergeGap' "$TMP/monitoring.yaml"
@@ -108,6 +126,22 @@ if helm template invalid "$CHART" --set image.tag=latest >"$TMP/invalid" 2>&1; t
 fi
 if helm template invalid "$CHART" --set gateway.replicas=2 >"$TMP/invalid" 2>&1; then
   echo "values schema accepted multiple in-memory gateway replicas" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.seed=9007199254740992 \
+  --set gateway.seed=9007199254740992 >"$TMP/invalid" 2>&1; then
+  echo "values schema accepted a seed above Helm's exact integer range" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set agent.maxSketchMemoryBytes=1048575 >"$TMP/invalid" 2>&1; then
+  echo "values schema accepted an agent sketch-memory ceiling below 1 MiB" >&2
+  exit 1
+fi
+if helm template invalid "$CHART" \
+  --set gateway.maxRetainedSketchBytes=1048575 >"$TMP/invalid" 2>&1; then
+  echo "values schema accepted a gateway retained-sketch ceiling below 1 MiB" >&2
   exit 1
 fi
 if helm template invalid "$CHART" --set gateway.seed=1 >"$TMP/invalid" 2>&1; then

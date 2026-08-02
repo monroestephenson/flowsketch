@@ -28,6 +28,7 @@ agent:
   # Scale after measuring per-shard memory and CPU on the target node.
   runtimeShards: 1
   runtimeBatchSize: 4096
+  maxSketchMemoryBytes: 1073741824
   runtimeShardStrategy: flow
   # Linux high-rate deployments can pin each capture lane and runtime worker.
   # The capture list contains one CPU normally, or one per runtime shard when

@@ -89,7 +89,9 @@ configurable Helm chart can also publish it as a sidecar ConfigMap.
 - Validate the selected AF_PACKET or eBPF capture path on the target CNI,
   kernel, container runtime, and node OS.
 - Pin CPU requests/limits after running `flowsketch bench --trace` on real
-  cluster traffic.
+  cluster traffic. Keep `agent.maxSketchMemoryBytes` and
+  `gateway.maxRetainedSketchBytes` below their pod limits with the headroom
+  described in `docs/runbook.md`.
 - Apply the HTTP trust-boundary and upgrade/recovery procedures in
   `docs/runbook.md`; the built-in endpoints have no TLS or authentication and
   the gateway is a single in-memory writer.

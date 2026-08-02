@@ -135,6 +135,7 @@ pub(crate) fn capture_loop(
         ) {
             Ok(()) => Ok(()),
             Err(error) if fallback_to_af_packet => {
+                state.capture_ready.store(false, Ordering::Release);
                 state.ebpf_fallbacks.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "eBPF capture failed; explicitly configured AF_PACKET fallback is starting: {error}"
@@ -159,6 +160,7 @@ pub(crate) fn capture_loop(
         },
     };
     if let Err(e) = &result {
+        state.capture_ready.store(false, Ordering::Release);
         *state.source_error.lock().unwrap() = Some(e.to_string());
     }
     result
@@ -201,6 +203,7 @@ fn ebpf_loop(
     state
         .ebpf_ring_bytes
         .store(u64::from(ring_buffer_bytes), Ordering::Relaxed);
+    state.capture_ready.store(true, Ordering::Release);
     let mut last_statistics = Instant::now();
 
     loop {
@@ -302,6 +305,7 @@ fn pcap_loop(
         .map_err(|e| AgentError::Source(format!("cannot open {}: {e}", path.display())))?;
     let mut reader = PcapReader::new(std::io::BufReader::new(file))
         .map_err(|e| AgentError::Source(e.to_string()))?;
+    state.capture_ready.store(true, Ordering::Release);
     let mut packet_buf = Vec::with_capacity(2048);
     while !shutdown.load(Ordering::Acquire) {
         let Some(event) = reader
@@ -351,6 +355,7 @@ fn af_packet_loop(
     };
     let sock = af_packet::AfPacketSocket::open(options.interface, settings, None)?;
     record_ring_shape(&sock, 1, state);
+    state.capture_ready.store(true, Ordering::Release);
     af_packet_socket_loop(
         sock,
         options.interface,
@@ -494,6 +499,10 @@ fn af_packet_fanout_loop(
         }
     }
     drop(done_tx);
+    // Every lane socket is bound before worker creation, so reaching this
+    // point means the complete fan-out group is receiving and every reader
+    // thread was spawned successfully.
+    state.capture_ready.store(true, Ordering::Release);
 
     let first = done_rx.recv().map_err(|_| {
         AgentError::Source("all AF_PACKET fan-out lanes ended without reporting status".into())

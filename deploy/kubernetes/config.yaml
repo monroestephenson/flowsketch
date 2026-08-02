@@ -65,6 +65,7 @@ data:
       flushIntervalMs: 1000
       runtimeShards: 1
       runtimeBatchSize: 4096
+      maxSketchMemoryBytes: 1073741824
       runtimeShardStrategy: flow
       # Optional Linux CPU pinning; one CPU per capture lane/runtime shard.
       # cpuAffinity:
@@ -107,6 +108,7 @@ data:
       seed: 0
       staleAfterMs: 300000
       maxNodes: 128
+      maxRetainedSketchBytes: 402653184
     queries:
       - file: /etc/flowsketch/queries/top-talkers.yaml
       - file: /etc/flowsketch/queries/suspected-scanners.yaml

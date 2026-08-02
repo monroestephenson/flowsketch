@@ -111,6 +111,13 @@ spec:
           annotations:
             summary: FlowSketch OTLP exports are failing
             description: At least one agent failed to export metrics to its configured local OpenTelemetry Collector.
+        - alert: FlowSketchAgentSketchMemoryHigh
+          expr: flowsketch_agent_sketch_memory_bytes{flowsketch_release="{{ .Release.Name }}"} / flowsketch_agent_sketch_memory_capacity_bytes{flowsketch_release="{{ .Release.Name }}"} >= 0.9
+          for: 5m
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch agent sketch memory is near its configured ceiling
+            description: Actual sketch-owned memory has remained above 90 percent of agent.maxSketchMemoryBytes for five minutes.
     - name: flowsketch-gateway
       rules:
         - alert: FlowSketchGatewayPushFailures
@@ -131,6 +138,12 @@ spec:
           annotations:
             summary: FlowSketch gateway node capacity is exhausted
             description: At least one new node identity was rejected; raise maxNodes only after validating the gateway memory budget.
+        - alert: FlowSketchGatewaySketchBudgetRejected
+          expr: increase(flowsketch_gateway_sketch_budget_rejections_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch gateway retained-state budget is exhausted
+            description: At least one valid per-query node state was rejected before retention would exceed maxRetainedSketchBytes.
         - alert: FlowSketchGatewayBodyBudgetExhausted
           expr: increase(flowsketch_gateway_body_budget_rejections_total{flowsketch_release="{{ .Release.Name }}"}[10m]) > 0
           labels: {severity: {{ .Values.monitoring.rules.severity }}}
@@ -144,6 +157,13 @@ spec:
           annotations:
             summary: FlowSketch gateway node capacity is nearly full
             description: The gateway has retained at least 90 percent of its configured live-node identities for five minutes.
+        - alert: FlowSketchGatewaySketchMemoryHigh
+          expr: flowsketch_gateway_retained_sketch_bytes{flowsketch_release="{{ .Release.Name }}"} / flowsketch_gateway_retained_sketch_capacity_bytes{flowsketch_release="{{ .Release.Name }}"} >= 0.9
+          for: 5m
+          labels: {severity: {{ .Values.monitoring.rules.severity }}}
+          annotations:
+            summary: FlowSketch gateway retained sketch memory is nearly full
+            description: Per-node retained sketch state has remained above 90 percent of its hard byte budget for five minutes.
         - alert: FlowSketchGatewayMergeGap
           expr: flowsketch_gateway_nodes_known{flowsketch_release="{{ .Release.Name }}"} - flowsketch_gateway_nodes_merged{flowsketch_release="{{ .Release.Name }}"} > 0
           for: 5m

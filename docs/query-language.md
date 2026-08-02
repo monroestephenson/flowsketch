@@ -7,7 +7,7 @@ show exactly what a query will cost and how accurate it will be.
 ## Full example
 
 ```yaml
-name: suspected_scanners        # required; [a-zA-Z0-9_-]+
+name: suspected_scanners        # required; [a-zA-Z0-9_-]+, max 256 bytes
 window:
   size: 60s                     # required; ns/us/ms/s/m/h units
   slide: 10s                    # optional; default = size (tumbling);
@@ -66,6 +66,8 @@ merged at each slide boundary. Estimates are emitted once per slide.
 ## Validation rules
 
 - unknown fields, measure types, and YAML keys are rejected
+- query names are limited to 256 ASCII bytes and must be unique within a process
+- duplicate `groupBy` fields are rejected
 - `size` must be a positive multiple of `slide`
 - `heavy_hitters` requires `groupBy` (the identities being ranked)
 - `distinct_count`'s `field` must not also appear in `groupBy`

@@ -708,7 +708,13 @@ mod tests {
     fn checkpoints_merge_lanes_and_final_checkpoint_drains_every_queue() {
         let hash = HashSpec::new(7);
         let plan = test_plan(&hash);
-        let state = Arc::new(PublishedState::new(std::slice::from_ref(&plan), 2, None, 2));
+        let state = Arc::new(PublishedState::new(
+            std::slice::from_ref(&plan),
+            2,
+            u64::MAX,
+            None,
+            2,
+        ));
         state.enable_snapshot_export(Duration::from_secs(60));
         let (mut runtime, senders) = DirectRuntime::new_with_options(
             std::slice::from_ref(&plan),
@@ -768,7 +774,13 @@ mod tests {
     fn rejects_zero_batch_size_before_starting_workers() {
         let hash = HashSpec::new(7);
         let plan = test_plan(&hash);
-        let state = Arc::new(PublishedState::new(std::slice::from_ref(&plan), 2, None, 2));
+        let state = Arc::new(PublishedState::new(
+            std::slice::from_ref(&plan),
+            2,
+            u64::MAX,
+            None,
+            2,
+        ));
         let error = DirectRuntime::new_with_options(
             &[plan],
             hash,
@@ -792,7 +804,13 @@ mod tests {
     fn full_batches_do_not_dequeue_an_extra_event() {
         let hash = HashSpec::new(7);
         let plan = test_plan(&hash);
-        let state = Arc::new(PublishedState::new(std::slice::from_ref(&plan), 1, None, 1));
+        let state = Arc::new(PublishedState::new(
+            std::slice::from_ref(&plan),
+            1,
+            u64::MAX,
+            None,
+            1,
+        ));
         let (mut runtime, senders) = DirectRuntime::new_with_options(
             &[plan],
             hash,
@@ -821,7 +839,13 @@ mod tests {
     fn snapshot_barrier_aligns_a_lane_that_starts_late() {
         let hash = HashSpec::new(7);
         let plan = test_plan(&hash);
-        let state = Arc::new(PublishedState::new(std::slice::from_ref(&plan), 2, None, 2));
+        let state = Arc::new(PublishedState::new(
+            std::slice::from_ref(&plan),
+            2,
+            u64::MAX,
+            None,
+            2,
+        ));
         state.enable_snapshot_export(Duration::from_secs(60));
         let (mut runtime, senders) = DirectRuntime::new_with_options(
             &[plan],

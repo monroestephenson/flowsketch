@@ -56,8 +56,8 @@ impl PhysicalSketch {
     }
 
     /// Estimated steady-state memory for one instance of this sketch, in
-    /// bytes. Keyed structures assume an average key of `avg_key_bytes`.
-    pub fn estimated_memory_bytes(&self, avg_key_bytes: usize) -> u64 {
+    /// bytes. `key_bytes` is the caller's encoded-key size bound.
+    pub fn estimated_memory_bytes(&self, key_bytes: usize) -> u64 {
         const HASH_ENTRY_OVERHEAD: u64 = 48;
         const EVICTION_HEAP_ENTRY_OVERHEAD: u64 = 32;
         // Stable slot + digest index + indexed-heap position, including
@@ -67,10 +67,10 @@ impl PhysicalSketch {
             PhysicalSketch::CountMin { width, depth, .. } => (width * depth) as u64 * 8 + 64,
             PhysicalSketch::CountSketch { width, depth } => (width * depth) as u64 * 8 + 64,
             PhysicalSketch::SpaceSaving { capacity } => {
-                *capacity as u64 * (avg_key_bytes as u64 + SPACE_SAVING_ENTRY_OVERHEAD) + 128
+                *capacity as u64 * (key_bytes as u64 + SPACE_SAVING_ENTRY_OVERHEAD) + 128
             }
             PhysicalSketch::MisraGries { capacity } => {
-                *capacity as u64 * (avg_key_bytes as u64 + 16 + HASH_ENTRY_OVERHEAD) + 64
+                *capacity as u64 * (key_bytes as u64 + 16 + HASH_ENTRY_OVERHEAD) + 64
             }
             PhysicalSketch::HyperLogLog { precision } => (1u64 << precision) + 64,
             PhysicalSketch::HllMap {
@@ -79,7 +79,7 @@ impl PhysicalSketch {
             } => {
                 *max_keys as u64
                     * ((1u64 << precision)
-                        + 2 * avg_key_bytes as u64
+                        + 2 * key_bytes as u64
                         + HASH_ENTRY_OVERHEAD
                         + EVICTION_HEAP_ENTRY_OVERHEAD)
                     + 64
@@ -88,7 +88,7 @@ impl PhysicalSketch {
             PhysicalSketch::Kll { k } => *k as u64 * 3 * 8 + 64,
             PhysicalSketch::Composite { stages } => stages
                 .iter()
-                .map(|s| s.estimated_memory_bytes(avg_key_bytes))
+                .map(|s| s.estimated_memory_bytes(key_bytes))
                 .sum(),
         }
     }

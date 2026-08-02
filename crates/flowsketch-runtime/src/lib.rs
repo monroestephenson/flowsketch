@@ -3,7 +3,7 @@
 //! sketches from flow events, and emits `SketchEstimate`s when windows
 //! close.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use flowsketch_algos::{CountMinSketch, HllMap, HyperLogLog, KllSketch, SpaceSaving};
 use flowsketch_core::field::{field_value_into, group_key_into};
@@ -823,7 +823,14 @@ impl QueryEngine {
         // Validate every plan is executable up front (fail closed at
         // configuration time, not on the hot path).
         let mut queries = Vec::with_capacity(plans.len());
+        let mut names = BTreeSet::new();
         for plan in plans {
+            if !names.insert(plan.query.name.clone()) {
+                return Err(SketchError::InvalidParam(format!(
+                    "duplicate query name {:?} in runtime",
+                    plan.query.name
+                )));
+            }
             QueryState::build(&plan.physical.sketch, &hash)?;
             queries.push(RunningQuery::new(plan, hash)?);
         }
@@ -1655,6 +1662,34 @@ mod tests {
     }
 
     #[test]
+    fn four_shard_warmup_emits_one_complete_window_without_undercount() {
+        let yaml =
+            "name: c\nwindow: {size: 60s, slide: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";
+        let hash = HashSpec::new(7);
+        let planned = plan(parse_query_yaml(yaml).unwrap(), &hash).unwrap();
+        let mut engine = ShardedQueryEngine::new(vec![planned], hash, 4).unwrap();
+
+        for (second, lane) in [(0, 0), (10, 1), (20, 2), (30, 3), (40, 0), (50, 1)] {
+            let mut batches = vec![Vec::new(); 4];
+            batches[lane].push(event(second, "10.0.0.1", "10.0.0.2", 80, 100));
+            engine.process_shard_batches(&batches).unwrap();
+        }
+        let mut closing = vec![Vec::new(); 4];
+        closing[2].push(event(60, "10.0.0.3", "10.0.0.4", 80, 100));
+        engine.process_shard_batches(&closing).unwrap();
+
+        let estimates = engine.take_estimates().unwrap();
+        let window = estimates
+            .iter()
+            .filter(|estimate| estimate.window_end_nanos == 60_000_000_000)
+            .collect::<Vec<_>>();
+        assert_eq!(window.len(), 1, "shards emitted duplicate window bounds");
+        assert_eq!(window[0].window_start_nanos, 0);
+        assert_eq!(window[0].estimate, 6.0);
+        assert_eq!(window[0].update_count, 6);
+    }
+
+    #[test]
     fn sharded_engine_rejects_zero_shards() {
         let query = parse_query_yaml(
             "name: c\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n",
@@ -1824,11 +1859,12 @@ mod tests {
     }
 
     #[test]
-    fn sharded_engine_rejects_duplicate_query_names() {
+    fn runtimes_reject_duplicate_query_names() {
         let yaml =
             "name: duplicate\nwindow: {size: 10s}\ngroupBy: [protocol]\nmeasure: {type: count}\n";
         let hash = HashSpec::new(7);
         let planned = plan(parse_query_yaml(yaml).unwrap(), &hash).unwrap();
+        assert!(QueryEngine::new(vec![planned.clone(), planned.clone()], hash).is_err());
         assert!(ShardedQueryEngine::new(vec![planned.clone(), planned], hash, 2).is_err());
     }
 

@@ -164,6 +164,13 @@ impl RawQuery {
         if self.name.trim().is_empty() {
             return Err(QueryParseError::Invalid("query name is empty".into()));
         }
+        if self.name.len() > crate::MAX_QUERY_NAME_BYTES {
+            return Err(QueryParseError::Invalid(format!(
+                "query name is {} bytes; maximum is {}",
+                self.name.len(),
+                crate::MAX_QUERY_NAME_BYTES
+            )));
+        }
         if !self
             .name
             .chars()
@@ -203,6 +210,16 @@ impl RawQuery {
             .iter()
             .map(|s| s.parse::<Field>().map_err(QueryParseError::Invalid))
             .collect::<Result<_, _>>()?;
+        let mut unique_group_fields = std::collections::HashSet::new();
+        if let Some(duplicate) = group_by
+            .iter()
+            .copied()
+            .find(|field| !unique_group_fields.insert(*field))
+        {
+            return Err(QueryParseError::Invalid(format!(
+                "groupBy contains duplicate field {duplicate}"
+            )));
+        }
 
         let filter = match self.r#match {
             None => Predicate::default(),
@@ -550,6 +567,15 @@ resources:
 
     #[test]
     fn rejects_bad_queries() {
+        let oversized_name = "q".repeat(crate::MAX_QUERY_NAME_BYTES + 1);
+        assert!(parse_query_yaml(&format!(
+            "name: {oversized_name}\nwindow: {{size: 10s}}\nmeasure: {{type: count}}\n"
+        ))
+        .is_err());
+        assert!(parse_query_yaml(
+            "name: q\nwindow: {size: 10s}\ngroupBy: [src.ip, src.ip]\nmeasure: {type: count}\n"
+        )
+        .is_err());
         // Unknown field
         assert!(parse_query_yaml(
             "name: q\nwindow: {size: 10s}\ngroupBy: [nonsense]\nmeasure: {type: count}\n"

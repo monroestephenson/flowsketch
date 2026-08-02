@@ -11,3 +11,7 @@ pub mod yaml;
 pub use logical::{AlertSpec, ErrorSpec, ExportSpec, LogicalQuery, Measure, Predicate, WindowSpec};
 pub use physical::PhysicalSketch;
 pub use yaml::{parse_query_yaml, QueryParseError};
+
+/// Query identifiers cross process boundaries in FSKB snapshot batches and
+/// appear in metrics labels and snapshot filenames.
+pub const MAX_QUERY_NAME_BYTES: usize = 256;

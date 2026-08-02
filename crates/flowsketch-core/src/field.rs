@@ -55,6 +55,22 @@ impl Field {
         matches!(self, Field::Bytes | Field::Packets)
     }
 
+    /// Maximum number of bytes in this field's canonical display encoding.
+    /// Planner memory bounds use this rather than an average so adversarial
+    /// but valid values (for example full-length IPv6 addresses) cannot make
+    /// keyed sketches exceed their declared key-storage model.
+    pub const fn max_encoded_len(self) -> usize {
+        match self {
+            Field::SrcIp | Field::DstIp => 39,
+            Field::SrcPort | Field::DstPort => 5,
+            Field::Protocol => 6,
+            Field::TcpFlags => 3,
+            Field::Direction => 7,
+            Field::Bytes | Field::Packets | Field::InterfaceIndex => 10,
+            Field::NodeId => 20,
+        }
+    }
+
     /// Extract this field's display value from an event. Display values are
     /// also the canonical key encoding: stable, self-describing, mergeable
     /// across nodes.
@@ -253,5 +269,42 @@ mod tests {
         };
         let key = group_key(&[Field::SrcIp, Field::DstIp, Field::Protocol], &e);
         assert_eq!(split_group_key(&key), vec!["10.0.1.5", "10.0.2.7", "tcp"]);
+    }
+
+    #[test]
+    fn canonical_field_encodings_fit_declared_maxima() {
+        let event = FlowEvent {
+            src_ip: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+            dst_ip: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+            src_port: u16::MAX,
+            dst_port: u16::MAX,
+            protocol: u8::MAX,
+            bytes: u32::MAX,
+            packets: u32::MAX,
+            direction: crate::event::Direction::Unknown,
+            tcp_flags: u8::MAX,
+            interface_index: u32::MAX,
+            node_id: u64::MAX,
+            ..FlowEvent::default()
+        };
+        for field in [
+            Field::SrcIp,
+            Field::DstIp,
+            Field::SrcPort,
+            Field::DstPort,
+            Field::Protocol,
+            Field::TcpFlags,
+            Field::Direction,
+            Field::Bytes,
+            Field::Packets,
+            Field::InterfaceIndex,
+            Field::NodeId,
+        ] {
+            assert!(
+                field.extract(&event).len() <= field.max_encoded_len(),
+                "{} exceeded its declared encoding maximum",
+                field.name()
+            );
+        }
     }
 }

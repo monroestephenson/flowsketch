@@ -24,6 +24,7 @@ pub struct QueryInfo {
     pub error_kind: String,
     pub error_contract: String,
     pub estimated_memory_bytes: u64,
+    pub estimated_state_memory_bytes: u64,
     pub max_series: usize,
     pub window_size_nanos: u64,
     /// Which `network.flowsketch.<unit>.estimated` OTLP metric this query
@@ -48,7 +49,11 @@ pub struct PublishedState {
     pub estimates: Mutex<BTreeMap<String, Vec<SketchEstimate>>>,
 
     pub started: Instant,
+    /// The runtime worker path can accept and publish events.
     pub ready: AtomicBool,
+    /// The configured source completed initialization and is capturing (or,
+    /// for a finite pcap, initialized successfully before replay).
+    pub capture_ready: AtomicBool,
     pub source_done: AtomicBool,
     pub source_error: Mutex<Option<String>>,
 
@@ -72,6 +77,7 @@ pub struct PublishedState {
     pub ebpf_fallbacks: AtomicU64,
     pub ebpf_ring_bytes: AtomicU64,
     pub sketch_memory_bytes: AtomicU64,
+    pub sketch_memory_capacity_bytes: u64,
     pub late_events: AtomicU64,
     pub otlp_exports: AtomicU64,
     pub otlp_failures: AtomicU64,
@@ -115,6 +121,7 @@ impl PublishedState {
     pub fn new(
         plans: &[Plan],
         runtime_shards: usize,
+        max_sketch_memory_bytes: u64,
         cpu_affinity: Option<&CpuAffinityConfig>,
         af_packet_fanout_lanes: usize,
     ) -> Self {
@@ -127,6 +134,7 @@ impl PublishedState {
                 error_kind: p.physical.error_kind.name().to_string(),
                 error_contract: p.physical.error_contract.clone(),
                 estimated_memory_bytes: p.physical.estimated_memory_bytes,
+                estimated_state_memory_bytes: p.physical.estimated_state_memory_bytes,
                 max_series: p.query.export.max_series,
                 window_size_nanos: p.query.window.size_nanos,
                 otlp_unit: otlp_unit(&p.query.measure),
@@ -137,6 +145,7 @@ impl PublishedState {
             estimates: Mutex::new(BTreeMap::new()),
             started: Instant::now(),
             ready: AtomicBool::new(false),
+            capture_ready: AtomicBool::new(false),
             source_done: AtomicBool::new(false),
             source_error: Mutex::new(None),
             events_processed: AtomicU64::new(0),
@@ -159,6 +168,7 @@ impl PublishedState {
             ebpf_fallbacks: AtomicU64::new(0),
             ebpf_ring_bytes: AtomicU64::new(0),
             sketch_memory_bytes: AtomicU64::new(0),
+            sketch_memory_capacity_bytes: max_sketch_memory_bytes,
             late_events: AtomicU64::new(0),
             otlp_exports: AtomicU64::new(0),
             otlp_failures: AtomicU64::new(0),
@@ -531,6 +541,12 @@ impl PublishedState {
             self.runtime_shards
         ));
         out.push_str(&format!(
+            "# HELP flowsketch_agent_sketch_memory_capacity_bytes Configured aggregate planner-memory ceiling across all queries and runtime shards.\n\
+             # TYPE flowsketch_agent_sketch_memory_capacity_bytes gauge\n\
+             flowsketch_agent_sketch_memory_capacity_bytes {}\n",
+            self.sketch_memory_capacity_bytes
+        ));
+        out.push_str(&format!(
             "# HELP flowsketch_agent_af_packet_fanout_lanes Active Linux AF_PACKET kernel fan-out lanes.\n\
              # TYPE flowsketch_agent_af_packet_fanout_lanes gauge\n\
              flowsketch_agent_af_packet_fanout_lanes {}\n",
@@ -631,11 +647,17 @@ impl PublishedState {
              flowsketch_agent_queries_active {}\n",
             self.queries.len()
         ));
+        let engine_ready = self.ready.load(Ordering::Acquire);
+        let capture_ready = self.capture_ready.load(Ordering::Acquire);
         out.push_str(&format!(
-            "# HELP flowsketch_agent_ready Whether the agent engine is ready to process events.\n\
+            "# HELP flowsketch_agent_capture_ready Whether the configured capture source completed initialization.\n\
+             # TYPE flowsketch_agent_capture_ready gauge\n\
+             flowsketch_agent_capture_ready {}\n\
+             # HELP flowsketch_agent_ready Whether both the capture source and runtime engine are ready.\n\
              # TYPE flowsketch_agent_ready gauge\n\
              flowsketch_agent_ready {}\n",
-            u8::from(self.ready.load(Ordering::Acquire))
+            u8::from(capture_ready),
+            u8::from(engine_ready && capture_ready)
         ));
         out.push_str(&format!(
             "# HELP flowsketch_agent_source_done Whether the configured capture source has completed.\n\
@@ -663,7 +685,8 @@ mod tests {
             capture_cpus: vec![0, 5],
             runtime_cpus: vec![1, 2, 3, 4],
         };
-        let state = PublishedState::new(&[], 4, Some(&affinity), 2);
+        let state = PublishedState::new(&[], 4, 1024 * 1024 * 1024, Some(&affinity), 2);
+        state.capture_ready.store(true, Ordering::Release);
         state.packets_seen.store(11, Ordering::Relaxed);
         state.packets_parsed.store(9, Ordering::Relaxed);
         state.packets_unparsed.store(2, Ordering::Relaxed);
@@ -711,6 +734,7 @@ mod tests {
             "flowsketch_agent_ebpf_fallbacks_total 2\n",
             "flowsketch_agent_ebpf_ring_bytes 16777216\n",
             "flowsketch_agent_runtime_shards 4\n",
+            "flowsketch_agent_sketch_memory_capacity_bytes 1073741824\n",
             "flowsketch_agent_af_packet_fanout_lanes 2\n",
             "flowsketch_agent_af_packet_queue_local_handoff 1\n",
             "flowsketch_agent_af_packet_lane_channel_capacity{lane=\"0\"} 32768\n",
@@ -723,6 +747,8 @@ mod tests {
             "flowsketch_agent_af_packet_lane_kernel_dropped_packets_total{lane=\"1\"} 1\n",
             "flowsketch_agent_af_packet_lane_kernel_queue_freezes_total{lane=\"1\"} 2\n",
             "flowsketch_agent_af_packet_lane_userspace_dropped_events_total{lane=\"1\"} 1\n",
+            "flowsketch_agent_capture_ready 1\n",
+            "flowsketch_agent_ready 0\n",
             "flowsketch_agent_cpu_affinity_enabled 1\n",
             "flowsketch_agent_capture_cpu_affinity{lane=\"0\",cpu=\"0\"} 1\n",
             "flowsketch_agent_capture_cpu_affinity{lane=\"1\",cpu=\"5\"} 1\n",

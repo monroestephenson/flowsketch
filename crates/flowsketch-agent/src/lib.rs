@@ -102,6 +102,7 @@ pub fn run_until(
     let published = Arc::new(PublishedState::new(
         &plans,
         config.runtime_shards,
+        config.max_sketch_memory_bytes,
         config.cpu_affinity.as_ref(),
         fanout_lanes,
     ));

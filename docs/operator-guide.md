@@ -79,7 +79,9 @@ than blocking the NIC path. Linux AF_PACKET socket overflow is reported
 separately as `flowsketch_agent_kernel_dropped_packets_total`; the socket
 counters are sampled about once per second even when capture is idle. A
 capture failure flips `/healthz` to 503 while `/metrics` keeps serving the last
-good state.
+good state. `/readyz` and `flowsketch_agent_ready` stay false until both the
+runtime and the configured capture source have initialized, so traffic sent
+after readiness cannot race AF_PACKET bind or eBPF attach.
 
 AF_PACKET and normalized eBPF timestamps must be within five minutes of the
 current realtime clock before they can reach event-time windowing. Outliers
@@ -270,10 +272,12 @@ Semantics and safety:
   cluster `flowsketch_estimate` samples whenever not every live node matches
   the selected window, preventing a partial freshest-node subset from looking
   like a complete cluster total.
-- Gateway memory is bounded: one window state per (query, live node),
-  each within the planner's budget; `gateway.maxNodes` is a hard identity
-  admission limit and nodes that stop pushing are evicted after
-  `staleAfterMs`. Capacity and rejection metrics expose pressure.
+- Gateway memory admission is bounded twice: `gateway.maxNodes` limits live
+  identities and `gateway.maxRetainedSketchBytes` limits the actual
+  sketch-owned bytes retained across per-node windows. A valid push that
+  would cross the byte ceiling is rejected before insertion; stale states
+  release their reservation after `staleAfterMs`. The fixed 16-shard merge
+  cache and bounded HTTP upload buffers are separate, bounded overheads.
 - Accepted pushes update one of 16 deterministic merge-cache shards. A scrape
   merges at most those 16 summaries after a cache miss; unchanged scrapes
   reuse the final merged state instead of re-merging every node sketch.
@@ -291,6 +295,10 @@ Every query has a hard `export.maxSeries` cap (default 1000). When the cap
 truncates output, the `flowsketch_export_series_dropped{query=...}` gauge
 says so. Raw-IP group-by labels produce an explicit plan warning. The
 planner rejects queries whose sketch memory exceeds `resources.maxMemory`.
+The agent then multiplies those estimates by `runtimeShards`, sums every
+configured query, and rejects startup if the result exceeds
+`agent.maxSketchMemoryBytes`. Duplicate query names are rejected before any
+capture thread starts.
 
 ## Privacy posture
 
