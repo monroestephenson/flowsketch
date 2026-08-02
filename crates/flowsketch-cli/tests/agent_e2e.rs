@@ -39,12 +39,16 @@ fn http_get(addr: &str, path: &str) -> Option<(u16, String)> {
 struct AgentUnderTest {
     child: Child,
     addr: String,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for AgentUnderTest {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(stderr_drain) = self.stderr_drain.take() {
+            let _ = stderr_drain.join();
+        }
     }
 }
 
@@ -93,16 +97,23 @@ fn start_agent(dir: &Path) -> AgentUnderTest {
 
     // The agent prints "listening on http://ADDR ..." once bound.
     let stderr = child.stderr.take().unwrap();
-    let mut addr = None;
-    let reader = std::io::BufReader::new(stderr);
+    let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel(1);
     use std::io::BufRead;
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(rest) = line.split("http://").nth(1) {
-            addr = Some(rest.split_whitespace().next().unwrap().to_string());
-            break;
+    let stderr_drain = std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        let mut reported_addr = false;
+        for line in reader.lines().map_while(Result::ok) {
+            if !reported_addr {
+                if let Some(rest) = line.split("http://").nth(1) {
+                    let _ = addr_tx.send(rest.split_whitespace().next().unwrap().to_string());
+                    reported_addr = true;
+                }
+            }
         }
-    }
-    let addr = addr.expect("agent did not report a listen address");
+    });
+    let addr = addr_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("agent did not report a listen address");
 
     // Wait until ready and until the replay has been fully processed.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -117,7 +128,11 @@ fn start_agent(dir: &Path) -> AgentUnderTest {
         assert!(Instant::now() < deadline, "agent never became ready");
         std::thread::sleep(Duration::from_millis(100));
     }
-    AgentUnderTest { child, addr }
+    AgentUnderTest {
+        child,
+        addr,
+        stderr_drain: Some(stderr_drain),
+    }
 }
 
 /// Mock OTLP collector: accepts POSTs on /v1/metrics until dropped,
